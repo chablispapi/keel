@@ -7,12 +7,12 @@ the REPL and the compiler. It is built in four stages, each extending the previo
 |---|---|---|---|
 | 1 | λK₁ | Linear types, functions, `data`, `case`, `Box` | done |
 | 2 | λK₂ | Effects, tail-resumptive handlers, fixed-width checked arithmetic, `Panic`, `Diverge` | done |
-| 3 | λK₃ | Second-class references `&` / `&mut`, elaborated to state passing | planned |
+| 3 | λK₃ | Second-class references `&` / `&mut`, `var`, assignment; elaborated to state passing | done |
 | 4 | λK₄ | `codata`, rank-1 polymorphism, monomorphization | planned |
 
 The executable reference checker and evaluator live in `ref/` (Haskell). Every rule below
-corresponds to a case in `ref/src/Keel/Check.hs` or `ref/src/Keel/Eval.hs`, and the examples in
-§1.6 are the tests in `ref/test/Main.hs`.
+corresponds to a case in `ref/src/Keel/Check.hs`, `Eval.hs` or `Elab.hs`, and the examples in
+each stage's examples section (§1.6, §2.7, §3.6) are the tests in `ref/test/Main.hs`.
 
 ---
 
@@ -506,3 +506,198 @@ All stage 1 examples still hold. Their types now record effects: `inc : i64 →{
 | `handle 1 with Panic {}` | `Unbound` |
 | `1:u8 + 1:i64` | `Mismatch` |
 | `300:u8` | `Mismatch` |
+
+---
+
+## 3. λK₃: second-class references
+
+Stage 3 adds the mutation style chosen in `notes.md` §16: `&` and `&mut` parameters, `var`
+locals and assignment. None of it is new semantics. λK₃ is defined by **elaboration into
+λK₂**: every reference becomes pure state passing, which is the claim "`&mut` is syntax
+sugar over pure code" made precise and executable (`ref/src/Keel/Elab.hs`).
+
+### 3.1 Syntax (additions)
+
+```
+π ::= τ | &τ | &mut τ                  parameter types
+τ ::= … | τ ⊗ τ                         pair (added to the core; the elaboration needs it)
+    | π →ε τ | π ⊸ε τ                   arrows take parameter types
+
+e ::= …
+    | (e, e) | let (x, y) = e in e      pairs (core)
+    | λ(&x:τ). e | λ(&mut x:τ). e        reference parameters
+    | e(&x) | e(&mut x)                 borrows: only as a function argument
+    | var x = e in e                    mutable local
+    | x := e                            assignment, of type Unit
+    | e; e                              sequencing (first part has type Unit)
+```
+
+A **place** is a `&`/`&mut` parameter or a `var`. `&mut` parameters and `var`s are mutable;
+`&` parameters are read-only. Reading a place `x` reads its current value (a copy for `Free`
+types, a move for `Lin` types).
+
+`τ ⊗ σ` has kind `Lin` if either component does. Its typing rules are the standard tensor
+rules (both components used in disjoint contexts; `let (x, y)` binds both, linear ones must
+be used). For sizes and positivity it behaves like a data type with two fields.
+
+### 3.2 Place rules
+
+These rules are what make references *second-class*. They are checked on the λK₃ program
+before elaboration (`checkRefs`):
+
+1. **References stay in parameters** (`RefEscape`). `&τ` and `&mut τ` appear only as the
+   parameter type of an arrow: never as a result, a data field, an operation type or inside
+   a pair. `&x` and `&mut x` appear only as a function argument.
+2. **Assignment needs a mutable place.** `x := e` and `f(&mut x)` require `x` to be a `&mut`
+   parameter or `var` (`NotAPlace` if `x` isn't a place, `NotMutable` if it's a `&` parameter).
+   `f(&x)` requires a place of either kind.
+3. **No capture** (`PlaceCapture`). A λ, λ° or handler clause can't mention any place from
+   outside it. Its only places are its own reference parameter and the `var`s inside it.
+4. **Handled expressions only read outer places** (`PlaceCapture`). Inside
+   `handle e with …`, `e` may read places from outside but not assign or borrow them, because
+   a handler could otherwise observe them mid-update.
+
+**Exclusivity holds by construction.** Every λ has one parameter, and a closure can't
+capture places (rule 3), so a function with a reference parameter must be applied to exactly
+one borrow, and nothing else in scope can reach that place during the call. Two `&mut` to the
+same variable in one call, or reading a place while a call mutates it, can't be written.
+Once functions take several parameters, this becomes an explicit rule (Hylo's law of
+exclusivity).
+
+### 3.3 Elaboration to λK₂
+
+Types:
+
+```
+⟦&τ →ε σ⟧ = ⟦&mut τ →ε σ⟧ = ⟦τ⟧ →ε ⟦σ⟧ ⊗ ⟦τ⟧        (same for ⊸)
+```
+
+A function with a reference parameter returns its result *and* the final value of the
+parameter. `&` is elaborated like `&mut` (pass and return); the place rules forbid assigning
+it, so the returned value is the one passed in, and a later optimization can drop the copy.
+
+Terms are translated left to right, call-by-value, threading the **current name** of each
+place. Each assignment and each borrowing call introduces a fresh name (`x#n`) for the new
+version:
+
+| λK₃ | λK₂ |
+|---|---|
+| `x := e; rest` | `let x#1 = e in rest[x ↦ x#1]` |
+| `var x = e in body` | `let x#1 = e in body[x ↦ x#1]` |
+| `f(&mut x); rest` | `let (r, x#2) = f x#1 in rest[x ↦ x#2]` (r is the call's value) |
+| `λ(&mut x:τ). body` | `λ(x:τ). body'`, where `body'` ends in `(v, x#n)`: the value and the final version of x |
+| `e₁; e₂` | `let _ = e₁ in e₂` |
+
+Subterms that use no references are copied unchanged (with place reads renamed). When a
+later sibling needs elaboration, earlier values are let-bound first, so evaluation order is
+preserved. `if`/`case` branches each receive a copy of the rest of the computation. That is
+correct but can grow exponentially for nested mutating branches; join points fix it when it
+matters.
+
+Example (output of `elaborate`, names as generated):
+
+```
+linear data Counter = Counter(i64)
+def tick : &mut Counter → Unit = λ(&mut c:Counter). case c of Counter(n) → c := Counter(n +% 1)
+main = var k = Counter(0) in tick(&mut k); case k of Counter(v) → v
+```
+
+becomes
+
+```
+def tick : Counter → Unit ⊗ Counter =
+  λ(c:Counter). case c of Counter(n) → let c#0 = Counter(n +% 1) in ((), c#0)
+main = let k#1 = Counter(0) in
+       let (r#2, k#3) = tick k#1 in
+       let seq#4 = r#2 in
+       case k#3 of Counter(v) → v
+```
+
+The elaborated program is then checked by the λK₂ checker (`checkSurface` = place rules,
+then elaborate, then `checkProgram`). Linearity of places is therefore enforced *on the
+elaboration*: a `var` holding a linear value must be moved out before its scope ends
+(`Dropped`), and moving it twice is `Duplicate`.
+
+### 3.4 Semantics
+
+The meaning of a λK₃ program is the meaning of its elaboration. There is no new evaluation
+rule.
+
+### 3.5 Metatheory
+
+**Theorem 6 (elaboration preserves typing).** If a λK₃ program satisfies the place rules and
+its elaboration is well typed in λK₂, all the λK₂ theorems apply to it. Moreover, if `e` is
+well typed in λK₃'s natural typing (places typed by their contents, `x := e` : Unit), then
+`⟦e⟧` is well typed in λK₂ with the translated types.
+
+*Sketch.* Induction on `e`, carrying the map from places to current names. Each translation
+row produces a λK₂ term whose type matches by the type translation above. Fresh names never
+clash (they contain `#`). Linear places are threaded: each version is bound once and consumed
+by the next assignment, borrow or final read. The reference implementation checks the
+elaborated program anyway, so this theorem is checked on every program, not just trusted.
+
+**Theorem 7 (state passing agrees with mutation).** Give λK₃ a direct semantics with a store,
+where places are mutable cells, borrowing passes a cell, and assignment updates it in place.
+For programs satisfying the place rules, evaluating `e` in this store semantics and evaluating
+`⟦e⟧` in λK₂ produce the same result and the same output trace.
+
+*Sketch.* Simulation relation: a store `S` is related to the λK₂ environment that binds each
+place's current name to `S(place)`. Assignment updates the cell / binds the next version; a
+borrowing call passes the cell / passes the value and rebinds the returned version. The place
+rules ensure no other path to the cell exists during the call (no capture, one borrow per call,
+handlers can't touch outer places), so the callee's final cell content equals the value it
+returns. This is the formal content of "mutable value semantics": with second-class references,
+in-place mutation is *unobservable* compared to pure state passing. That is why the compiler is
+free to implement `&mut` as a pointer and update memory in place.
+
+### 3.6 Examples
+
+**Accepted:**
+
+| Program | Result |
+|---|---|
+| `var c = 0 in bump(&mut c); bump(&mut c); c * 10` with `bump(&mut n) = n := n + 1` | `20` |
+| `var k = Counter(0) in tick(&mut k); tick(&mut k); case k of Counter(v) → v` (linear) | `2` |
+| `drain(&mut buf)` over `[72, 105]` under the mock UART (below), then `buf` | `Nil`, output `[72, 105]` |
+| the same written by hand: `drainSP : IntList → Unit ⊗ IntList` | `Nil`, output `[72, 105]` |
+| `var l = [5,6,7] in len(&l)` with a `&` parameter | `3` |
+| `var t = Token in consume t` | `1` |
+
+```
+def drain : &mut IntList →{MMIO, Diverge} Unit = λ(&mut q:IntList). case q of
+  Nil → ()
+  Cons(c, rest) → write(W(0, c)); q := unbox rest; drain(&mut q)
+```
+
+The `drain` / `drainSP` pair is the executable form of Theorem 7: the version with `&mut` and
+the hand-written state-passing version produce the same value and the same output.
+
+**Rejected:**
+
+| Program | Error |
+|---|---|
+| `def f : i64 → &mut i64 = …` | `RefEscape` |
+| `data D = D(&i64)` | `RefEscape` |
+| `var x = 1 in let y = &mut x in 0` | `RefEscape` |
+| `var x = 1 in let g = λ(u:Unit). x in g ()` | `PlaceCapture` |
+| `λ(&x:i64). x := 1` | `NotMutable` |
+| `let y = 1 in y := 2` | `NotAPlace` |
+| `let y = 1 in bump(&mut y)` | `NotAPlace` |
+| `var t = Token in 1` | `Dropped` |
+| `var t = Token in let a = consume t in consume t` | `Duplicate` |
+| `var x = 0 in handle (x := 1) with IO { … }` | `PlaceCapture` |
+| `var x = 0 in handle out(1) with IO { out v → out(x) }` | `PlaceCapture` |
+
+### 3.7 Limitations and open questions
+
+- **One parameter per function.** A function can borrow only one place. `swap(&mut a, &mut b)`
+  needs n-ary functions in the core, and with them an explicit exclusivity rule (§3.2).
+- **`&` on linear values is weak.** `&` is pass-and-return, and reading a linear place moves
+  it, so a function can only pass a `&Lin` value along, not inspect it. Non-consuming reads
+  (for example, reading `Free` fields of a linear value) are future work.
+- **Places are whole variables.** There are no field paths (`r.tail := …`); update a field by
+  rebuilding the value. Field paths are sugar to add later.
+- **Stateful handlers are not covered.** A handler clause can't capture places (rule 3), so a
+  mock device can't keep its own state yet. Handler-owned state (Koka's handler-local `var`)
+  needs either a primitive with its own semantics or a state-passing translation of every
+  operation the handled code performs; this is an open design question.

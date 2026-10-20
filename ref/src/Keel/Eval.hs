@@ -1,5 +1,5 @@
--- | Call-by-value, environment-based evaluator for Keel Core, stages 1–2
--- (spec/core.md §1.4, §2.5). Assumes a well-typed program; stuck states are impossible by
+-- | Call-by-value, environment-based evaluator for Keel Core, stages 1–3
+-- (spec/core.md §1.4, §2.5, §3.4). Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
 module Keel.Eval (Value (..), Outcome (..), evalProgram) where
 
@@ -16,6 +16,7 @@ data Value
   | VClo Env String Term -- ^ ⟨ρ, x, e⟩, for both λ and λ° (linearity is erased)
   | VCon String [Value]
   | VBox Value
+  | VPair Value Value
 
 type Env = M.Map String Value
 
@@ -28,6 +29,7 @@ instance Show Value where
     VCon c [] -> c
     VCon c vs -> c ++ "(" ++ commas (map show vs) ++ ")"
     VBox a -> "box " ++ show a
+    VPair a b -> "(" ++ show a ++ ", " ++ show b ++ ")"
     where
       commas = foldr1 (\a b -> a ++ ", " ++ b)
 
@@ -38,6 +40,7 @@ instance Eq Value where
   VBool a == VBool b = a == b
   VCon c vs == VCon d ws = c == d && vs == ws
   VBox a == VBox b = a == b
+  VPair a b == VPair c d = a == c && b == d
   _ == _ = False
 
 -- | How a program ended. A panic stops the whole program (the reset handler of notes.md §16
@@ -111,6 +114,13 @@ eval hs env tm = case tm of
   Handle _ body clauses ->
     let frame = Handler (M.fromList [(op, (x, e)) | (op, x, e) <- clauses]) env
      in eval (frame : hs) env body
+  Pair a b -> VPair <$> eval hs env a <*> eval hs env b
+  LetPair x y e body -> do
+    v <- eval hs env e
+    case v of
+      VPair a b -> eval hs (M.insert y b (M.insert x a env)) body
+      _ -> stuck "let-pair of a non-pair"
+  _ -> stuck ("surface construct in core: " ++ show tm)
 
 -- | Find the innermost handler for @op@ and run its clause with the handlers *outside* it,
 -- so a clause performing the same operation reaches the next handler out. The clause's value

@@ -1,4 +1,5 @@
--- | Algorithmic type checker for Keel Core, stages 1–2 (spec/core.md §1.2–1.3, §2.2–2.4).
+-- | Algorithmic type checker for Keel Core, stages 1–3 (spec/core.md §1.2–1.3, §2.2–2.4, §3.2).
+-- It checks the core; λK₃ programs are first place-checked and elaborated by "Keel.Elab".
 --
 -- @infer@ implements Γ ⊢ e ⇒ τ ! ε ▷ U: it synthesizes a type, the effect of evaluating the
 -- term, and the set U of linear local variables the term uses.
@@ -26,6 +27,10 @@ data ErrKind
   | NonExhaustive
   | Unhandled
   | BadDecl
+  | RefEscape    -- ^ a reference outside a parameter type or function argument (§3)
+  | NotAPlace    -- ^ assigning to or borrowing something that isn't a place
+  | NotMutable   -- ^ assigning to or &mut-borrowing a read-only place
+  | PlaceCapture -- ^ a closure or handler reaching a place from outside
   deriving (Eq, Show)
 
 data TypeError = TypeError ErrKind String
@@ -56,6 +61,7 @@ kindOf :: Sig -> Ty -> Kind
 kindOf s t = case t of
   TLFun {} -> Lin
   TBox a -> kindOf s a
+  TPair a b | kindOf s a == Lin || kindOf s b == Lin -> Lin
   TData d | Just (True, _) <- M.lookup d (sigData s) -> Lin
   _ -> Free
 
@@ -66,6 +72,7 @@ sub a b = case (a, b) of
   (TFun p e r, TLFun p' e' r') -> fn p e r p' e' r'
   (TLFun p e r, TLFun p' e' r') -> fn p e r p' e' r'
   (TBox x, TBox y) -> sub x y
+  (TPair x y, TPair x' y') -> sub x x' && sub y y'
   _ -> a == b
   where
     fn p e r p' e' r' = sub p' p && e `S.isSubsetOf` e' && sub r r'
@@ -75,6 +82,7 @@ eraseEff t = case t of
   TFun p _ r -> TFun (eraseEff p) S.empty (eraseEff r)
   TLFun p _ r -> TLFun (eraseEff p) S.empty (eraseEff r)
   TBox a -> TBox (eraseEff a)
+  TPair a b -> TPair (eraseEff a) (eraseEff b)
   _ -> t
 
 -- | Report @got@ not fitting @expected@, separating effect-only differences.
@@ -111,21 +119,8 @@ checkProgram (Program decls main) = do
 globalsIn :: M.Map String Ty -> Term -> S.Set String
 globalsIn defs = go
   where
-    go tm = case tm of
-      Var x -> if M.member x defs then S.singleton x else S.empty
-      Prim _ a b -> go a <> go b
-      If c a b -> go c <> go a <> go b
-      Lam _ _ b -> go b
-      LLam _ _ b -> go b
-      App f a -> go f <> go a
-      Let _ e b -> go e <> go b
-      Con _ as -> foldMap go as
-      Case e alts -> go e <> foldMap (\(_, _, b) -> go b) alts
-      Box e -> go e
-      Unbox e -> go e
-      Perform _ e -> go e
-      Handle _ e cs -> go e <> foldMap (\(_, _, b) -> go b) cs
-      _ -> S.empty
+    go (Var x) = if M.member x defs then S.singleton x else S.empty
+    go tm = foldMap go (children tm)
 
 -- | Names reachable in one or more steps.
 reachable :: M.Map String (S.Set String) -> String -> S.Set String
@@ -162,11 +157,18 @@ buildSig decls = do
 fieldsOf :: Sig -> String -> [Ty]
 fieldsOf s d = [f | Just (_, cs) <- [M.lookup d (sigData s)], (_, fs) <- cs, f <- fs]
 
+-- | Data types stored inline (not behind Box or a function) in a type.
+unboxedData :: Ty -> [String]
+unboxedData t = case t of
+  TData d -> [d]
+  TPair a b -> unboxedData a ++ unboxedData b
+  _ -> []
+
 -- | Data types reachable from @d@ through unboxed fields (well-formedness rule 2).
 reachUnboxed :: Sig -> String -> S.Set String
 reachUnboxed s d0 = go S.empty (direct d0)
   where
-    direct d = [d' | TData d' <- fieldsOf s d]
+    direct d = concatMap unboxedData (fieldsOf s d)
     go seen [] = seen
     go seen (d : ds)
       | d `S.member` seen = go seen ds
@@ -181,6 +183,7 @@ occursNegatively s d = any (walk S.empty True) (fieldsOf s d)
       TFun a _ b -> walk seen (not pos) a || walk seen pos b
       TLFun a _ b -> walk seen (not pos) a || walk seen pos b
       TBox a -> walk seen pos a
+      TPair a b -> walk seen pos a || walk seen pos b
       TData d'
         | d' == d -> not pos
         | (d', pos) `S.member` seen -> False
@@ -192,6 +195,9 @@ wfTy s t = case t of
   TFun a e b -> wfEff e >> wfTy s a >> wfTy s b
   TLFun a e b -> wfEff e >> wfTy s a >> wfTy s b
   TBox a -> wfTy s a
+  TPair a b -> wfTy s a >> wfTy s b
+  TRef _ -> err RefEscape "reference type in core (elaborate first)"
+  TMut _ -> err RefEscape "reference type in core (elaborate first)"
   TData d -> unless (M.member d (sigData s)) $ err Unbound ("type " ++ d)
   _ -> pure ()
   where
@@ -299,6 +305,18 @@ infer s rec ctx tm = case tm of
       unless (sub tc tres) $ mismatch tres tc
       pure ec
     pure (tb, S.unions (S.delete l eb : ecs), ub)
+  Pair a b -> do
+    (ta, ea, ua) <- infer s rec ctx a
+    (tb, eb, ub) <- infer s rec ctx b
+    (TPair ta tb,ea <> eb,) <$> join2 ua ub
+  LetPair x y e body -> do
+    (te, ee, ue) <- infer s rec ctx e
+    (ta, tb) <- case te of
+      TPair ta tb -> pure (ta, tb)
+      _ -> err Mismatch ("let-pair of non-pair type " ++ show te)
+    (tr, eb, ub) <- bind [(x, ta), (y, tb)] body
+    (tr,ee <> eb,) <$> join2 ue ub
+  _ -> err RefEscape ("surface construct in core (elaborate first): " ++ show tm)
   where
     expect t e = do
       (t', eff, u) <- infer s rec ctx e

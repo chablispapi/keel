@@ -1,4 +1,7 @@
--- | Abstract syntax of Keel Core, stages 1–2 (spec/core.md §1.1, §2.1).
+-- | Abstract syntax of Keel Core, stages 1–3 (spec/core.md §1.1, §2.1, §3.1).
+--
+-- Constructors marked /surface/ belong to λK₃ only: "Keel.Elab" removes them before type
+-- checking and evaluation, which work on the core.
 module Keel.Syntax where
 
 import Data.Set (Set)
@@ -34,6 +37,9 @@ data Ty
   | TLFun Ty Eff Ty  -- ^ τ ⊸ε σ, linear closure
   | TData String
   | TBox Ty
+  | TPair Ty Ty      -- ^ τ ⊗ σ
+  | TRef Ty          -- ^ &τ, surface: only as a parameter type
+  | TMut Ty          -- ^ &mut τ, surface: only as a parameter type
   deriving (Eq, Show)
 
 data Kind = Free | Lin
@@ -65,7 +71,58 @@ data Term
   | Unbox Term
   | Perform String Term                     -- ^ op(e)
   | Handle String Term [(String, String, Term)] -- ^ handle e with l { op x → e; … }
+  | Pair Term Term                          -- ^ (e, e)
+  | LetPair String String Term Term         -- ^ let (x, y) = e in e
+  | Assign String Term                      -- ^ x := e, surface
+  | Seq Term Term                           -- ^ e; e, surface
+  | LetVar String Term Term                 -- ^ var x = e in e, surface
+  | Borrow String                           -- ^ &x, surface: only as a function argument
+  | BorrowMut String                        -- ^ &mut x, surface: only as a function argument
   deriving (Eq, Show)
+
+-- | Immediate subterms.
+children :: Term -> [Term]
+children tm = case tm of
+  Prim _ a b -> [a, b]
+  If c a b -> [c, a, b]
+  Lam _ _ b -> [b]
+  LLam _ _ b -> [b]
+  App f a -> [f, a]
+  Let _ e b -> [e, b]
+  Con _ as -> as
+  Case e alts -> e : [b | (_, _, b) <- alts]
+  Box e -> [e]
+  Unbox e -> [e]
+  Perform _ e -> [e]
+  Handle _ e cs -> e : [b | (_, _, b) <- cs]
+  Pair a b -> [a, b]
+  LetPair _ _ e b -> [e, b]
+  Assign _ e -> [e]
+  Seq a b -> [a, b]
+  LetVar _ e b -> [e, b]
+  _ -> []
+
+-- | Apply a function to every immediate subterm.
+descend :: (Term -> Term) -> Term -> Term
+descend f tm = case tm of
+  Prim op a b -> Prim op (f a) (f b)
+  If c a b -> If (f c) (f a) (f b)
+  Lam x t b -> Lam x t (f b)
+  LLam x t b -> LLam x t (f b)
+  App g a -> App (f g) (f a)
+  Let x e b -> Let x (f e) (f b)
+  Con c as -> Con c (map f as)
+  Case e alts -> Case (f e) [(c, xs, f b) | (c, xs, b) <- alts]
+  Box e -> Box (f e)
+  Unbox e -> Unbox (f e)
+  Perform op e -> Perform op (f e)
+  Handle l e cs -> Handle l (f e) [(op, x, f b) | (op, x, b) <- cs]
+  Pair a b -> Pair (f a) (f b)
+  LetPair x y e b -> LetPair x y (f e) (f b)
+  Assign x e -> Assign x (f e)
+  Seq a b -> Seq (f a) (f b)
+  LetVar x e b -> LetVar x (f e) (f b)
+  _ -> tm
 
 data Decl
   = Data Bool String [(String, [Ty])]  -- ^ linear?, name, constructors with field types

@@ -1,10 +1,11 @@
--- | Examples from spec/core.md §1.6 and §2.7: each program either evaluates to an expected
+-- | Examples from spec/core.md §1.6, §2.7 and §3.6: each program either evaluates to an expected
 -- value (and output trace), panics, or is rejected with an expected error class.
 module Main (main) where
 
 import Control.Monad (unless)
 import Data.Set qualified as S
 import Keel.Check
+import Keel.Elab
 import Keel.Eval
 import Keel.Syntax
 import System.Exit (exitFailure)
@@ -124,6 +125,69 @@ mockUart body =
     , ("write", "w", Case (Var "w") [("W", ["reg", "v"], Perform "out" (Var "v"))])
     ]
 
+-- Stage 3 declarations -------------------------------------------------------------------
+
+-- def bump : &mut i64 →{Panic} Unit = λ(&mut n:i64). n := n + 1
+bumpDef :: Decl
+bumpDef = Def "bump" (fnE [panicE] (TMut tI) TUnit) (Lam "n" (TMut tI) (Assign "n" (add (Var "n") (int 1))))
+
+-- linear data Counter = Counter(i64)
+-- def tick : &mut Counter → Unit = λ(&mut c:Counter). case c of Counter(n) → c := Counter(n +% 1)
+counter, tickDef :: Decl
+counter = Data True "Counter" [("Counter", [tI])]
+tickDef =
+  Def "tick" (fn (TMut (TData "Counter")) TUnit) $
+    Lam "c" (TMut (TData "Counter")) $
+      Case (Var "c") [("Counter", ["n"], Assign "c" (Con "Counter" [Prim (Arith Wrap Add) (Var "n") (int 1)]))]
+
+-- def drain : &mut IntList →{MMIO, Diverge} Unit = λ(&mut q:IntList). case q of
+--   Nil → ()
+--   Cons(c, rest) → write(W(0, c)); q := unbox rest; drain(&mut q)
+drainDef :: Decl
+drainDef =
+  Def "drain" (fnE ["MMIO", divergeE] (TMut tList) TUnit) $
+    Lam "q" (TMut tList) $
+      Case
+        (Var "q")
+        [ ("Nil", [], UnitLit)
+        , ( "Cons"
+          , ["c", "rest"]
+          , Seq
+              (Perform "write" (Con "W" [int 0, Var "c"]))
+              (Seq (Assign "q" (Unbox (Var "rest"))) (App (Var "drain") (BorrowMut "q")))
+          )
+        ]
+
+-- The same function written by hand in state-passing style:
+-- def drainSP : IntList →{MMIO, Diverge} Unit ⊗ IntList = λ(q:IntList). case q of
+--   Nil → ((), q)
+--   Cons(c, rest) → let d = write(W(0, c)) in drainSP (unbox rest)
+drainSPDef :: Decl
+drainSPDef =
+  Def "drainSP" (fnE ["MMIO", divergeE] tList (TPair TUnit tList)) $
+    Lam "q" tList $
+      Case
+        (Var "q")
+        [ ("Nil", [], Pair UnitLit (Var "q"))
+        , ( "Cons"
+          , ["c", "rest"]
+          , Let "d" (Perform "write" (Con "W" [int 0, Var "c"])) (App (Var "drainSP") (Unbox (Var "rest")))
+          )
+        ]
+
+-- def len : &IntList →{Diverge} i64 = λ(&xs:IntList). case xs of
+--   Nil → 0
+--   Cons(y, more) → var m = unbox more in len(&m) +% 1
+lenDef :: Decl
+lenDef =
+  Def "len" (fnE [divergeE] (TRef tList) tI) $
+    Lam "xs" (TRef tList) $
+      Case
+        (Var "xs")
+        [ ("Nil", [], int 0)
+        , ("Cons", ["y", "more"], LetVar "m" (Unbox (Var "more")) (Prim (Arith Wrap Add) (App (Var "len") (Borrow "m")) (int 1)))
+        ]
+
 -- Cases -----------------------------------------------------------------------------------
 
 cases :: [(String, Program, Expect)]
@@ -241,6 +305,65 @@ cases =
   , ("Panic cannot be handled", Program [] (Handle panicE (int 1) []), Rejects Unbound)
   , ("mixed integer widths", Program [] (add (IntLit u8 1) (int 1)), Rejects Mismatch)
   , ("literal out of range", Program [] (IntLit u8 300), Rejects Mismatch)
+  -- Stage 3 -------------------------------------------------------------------------------
+  , ( "&mut counter"
+    , Program
+        [bumpDef]
+        (LetVar "c" (int 0) (Seq (App (Var "bump") (BorrowMut "c")) (Seq (App (Var "bump") (BorrowMut "c")) (mul (Var "c") (int 10)))))
+    , ok (VInt i64 20)
+    )
+  , ( "&mut on a linear value"
+    , Program
+        [counter, tickDef]
+        ( LetVar "k" (Con "Counter" [int 0]) $
+            Seq (App (Var "tick") (BorrowMut "k")) $
+              Seq (App (Var "tick") (BorrowMut "k")) $
+                Case (Var "k") [("Counter", ["v"], Var "v")]
+        )
+    , ok (VInt i64 2)
+    )
+  , ( "drain with &mut"
+    , Program [intList, wData, mmio, drainDef] (mockUart (LetVar "buf" (list [72, 105]) (Seq (App (Var "drain") (BorrowMut "buf")) (Var "buf"))))
+    , Gives (VCon "Nil" []) [72, 105]
+    )
+  , ( "drain by hand, state passing"
+    , Program [intList, wData, mmio, drainSPDef] (mockUart (LetPair "u" "buf" (App (Var "drainSP") (list [72, 105])) (Var "buf")))
+    , Gives (VCon "Nil" []) [72, 105]
+    )
+  , ( "& borrow"
+    , Program [intList, lenDef] (LetVar "l" (list [5, 6, 7]) (App (Var "len") (Borrow "l")))
+    , ok (VInt i64 3)
+    )
+  , ("var holding a linear value", withToken (LetVar "t" (Con "Token" []) (App (Var "consume") (Var "t"))), ok (VInt i64 1))
+  , ("returning a reference", Program [Def "f" (fn tI (TMut tI)) (Lam "x" tI (Var "x"))] (int 0), Rejects RefEscape)
+  , ("reference in a data field", Program [Data False "D" [("D", [TRef tI])]] (int 0), Rejects RefEscape)
+  , ( "borrow outside an argument"
+    , Program [] (LetVar "x" (int 1) (Let "y" (BorrowMut "x") (int 0)))
+    , Rejects RefEscape
+    )
+  , ( "closure captures a place"
+    , Program [] (LetVar "x" (int 1) (Let "g" (Lam "u" TUnit (Var "x")) (App (Var "g") UnitLit)))
+    , Rejects PlaceCapture
+    )
+  , ( "assign to a & parameter"
+    , Program [Def "f" (fn (TRef tI) TUnit) (Lam "x" (TRef tI) (Assign "x" (int 1)))] (int 0)
+    , Rejects NotMutable
+    )
+  , ("assign to a non-place", Program [] (Let "y" (int 1) (Assign "y" (int 2))), Rejects NotAPlace)
+  , ("&mut of a non-place", Program [bumpDef] (Let "y" (int 1) (App (Var "bump") (BorrowMut "y"))), Rejects NotAPlace)
+  , ("var dropping a linear value", withToken (LetVar "t" (Con "Token" []) (int 1)), Rejects Dropped)
+  , ( "linear place used after a move"
+    , withToken (LetVar "t" (Con "Token" []) (Let "a" (App (Var "consume") (Var "t")) (App (Var "consume") (Var "t"))))
+    , Rejects Duplicate
+    )
+  , ( "changing an outer place inside a handled expression"
+    , Program [] (LetVar "x" (int 0) (Handle ioE (Assign "x" (int 1)) [("out", "v", UnitLit)]))
+    , Rejects PlaceCapture
+    )
+  , ( "handler clause reads a place"
+    , Program [] (LetVar "x" (int 0) (Handle ioE (Perform "out" (int 1)) [("out", "v", Perform "out" (Var "x"))]))
+    , Rejects PlaceCapture
+    )
   ]
 
 -- Runner --------------------------------------------------------------------------------
@@ -252,11 +375,11 @@ main = do
   putStrLn (show (length cases - length failures) ++ "/" ++ show (length cases) ++ " passed")
   unless (null failures) exitFailure
   where
-    run (name, prog, expect) = case (checkProgram prog, expect) of
+    run (name, prog, expect) = case (checkSurface prog, expect) of
       (Left (TypeError k _), Rejects k') -> [failMsg name ("expected " ++ show k' ++ ", got " ++ show k) | k /= k']
       (Left e, _) -> [failMsg name ("unexpected rejection: " ++ show e)]
       (Right t, Rejects k) -> [failMsg name ("expected " ++ show k ++ ", but accepted at " ++ show t)]
-      (Right _, _) -> case (evalProgram prog, expect) of
+      (Right _, _) -> case (evalProgram (elaborate prog), expect) of
         ((Done v, tr), Gives v' tr') | v == v' && tr == tr' -> []
         ((Panicked _, tr), Panics tr') | tr == tr' -> []
         (got, _) -> [failMsg name ("got " ++ show got)]

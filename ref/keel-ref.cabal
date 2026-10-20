@@ -12,7 +12,7 @@ common shared
 library
   import:          shared
   hs-source-dirs:  src
-  exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval
+  exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval, Keel.Elab
 
 test-suite core
   import:         shared
