@@ -1,6 +1,11 @@
-# A functional language that compiles to native code with no heavy runtime: notes
+# Keel: a functional language that compiles to native code with no heavy runtime
 
 Source: "The wasted potential of Haskell: language and compiler" (transcript in `transcription.txt`).
+
+**Name: Keel.** The keel is the structural spine at the bottom of a ship: invisible, underneath
+everything, keeping it stable. That fits a language for kernels and firmware. File extension
+`.kl`, compiler `keelc`. (Before publishing, check the name isn't already taken on GitHub,
+package registries or trademarks.)
 
 ## 1. Context
 
@@ -651,7 +656,7 @@ QEMU also covers Cortex-M boards (e.g. `mps2-an385`, for Thumb-2), x86-64 and AA
 ```sh
 brew install qemu llvm
 
-ourc --target riscv64-none-elf hello.src -o hello.elf
+keelc --target riscv64-none-elf hello.kl -o hello.elf
 llvm-objdump -d --triple=riscv64 hello.elf                        # inspect output
 qemu-system-riscv64 -machine virt -nographic -bios none -kernel hello.elf
 qemu-system-riscv64 -machine virt -nographic -bios none -kernel hello.elf -s -S
