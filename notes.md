@@ -807,7 +807,7 @@ code gets written fast, but understanding and steering each part takes time.
 
 | # | Milestone | Includes | Rough effort |
 |---|---|---|---|
-| **M0** | Toy compiler | Section 5 evaluator → λ-terms + ints → ANF → closure conversion → AArch64 asm, assembled and linked with the Mac's `as`/`ld`; closures in a never-freed bump arena | A few sessions (~1–2k lines) |
+| **M0** | Toy compiler | Section 5 evaluator → λ-terms + ints → ANF → closure conversion → AArch64 asm, assembled and linked with the Mac's `as`/`ld`; closures in a never-freed bump arena | A few sessions (~1–2k lines). **Done:** `Keel.Lower` + `Keel.AArch64`, differential-tested natively |
 | **M1** | Small real language | Parser, type inference, ADTs + pattern matching, monomorphization, guaranteed tail calls, simple stack-based codegen, a syscall-only runtime; shared IR introduced | 2–6 weeks |
 | **M2** | No-GC memory model | Linear/affine checking, second-class references, refcounting with in-place reuse, arenas | 1–3 months (close to research) |
 | **M3** | Systems features | Effects (`MMIO`, `Unsafe`, `Alloc`, `Panic`…), `bitdata`, `repr C`, inline asm, C header import, freestanding mode | 1–3 months |
@@ -835,7 +835,7 @@ development for over a decade.
 - [ ] Design refinement types and constant-time `Secret a` typing; choose translation validation or a verified compiler (section 14).
 - [ ] First RISC-V milestone: "hello world" over the QEMU `virt` UART (section 15).
 - [x] Write the core calculus formally: linear types + second-class refs + effects + codata (section 16). Done: `spec/core.md` (Keel Core, stages 1–4) with the Haskell reference checker/evaluator in `ref/` (`cd ref && cabal test`).
-- [ ] Turn the evaluator from section 5 into a tiny compiler: λ-terms → ANF → closure conversion → ARM64 asm that assembles and runs on this Mac.
+- [x] Turn the evaluator from section 5 into a tiny compiler: λ-terms → ANF → closure conversion → ARM64 asm that assembles and runs on this Mac. Done (M0): `ref/src/Keel/Lower.hs` + `AArch64.hs`, checked against the reference evaluator by `ref/test/Native.hs`.
 - [ ] Deep dive: closures and defunctionalization (eval/apply, partial application).
 - [ ] Deep dive: Perceus refcounting and reuse (pure code compiled to in-place mutation).
 - [ ] Deep dive: linear types, affine types, and QTT as a replacement for the GC.
