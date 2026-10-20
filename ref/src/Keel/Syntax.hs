@@ -1,10 +1,13 @@
--- | Abstract syntax of Keel Core, stages 1–3 (spec/core.md §1.1, §2.1, §3.1).
+-- | Abstract syntax of Keel Core, stages 1–4 (spec/core.md §1.1, §2.1, §3.1, §4.1).
 --
 -- Constructors marked /surface/ belong to λK₃ only: "Keel.Elab" removes them before type
 -- checking and evaluation, which work on the core.
 module Keel.Syntax where
 
+import Data.List (intercalate)
+import Data.Map.Strict qualified as M
 import Data.Set (Set)
+import Data.Set qualified as S
 
 -- | Fixed-width integer types.
 data IntTy = IntTy {signed :: Bool, bits :: Int}
@@ -26,8 +29,13 @@ intRange (IntTy sgn n)
   | sgn = (-(2 ^ (n - 1)), 2 ^ (n - 1) - 1)
   | otherwise = (0, 2 ^ n - 1)
 
--- | An effect is a set of labels. Row variables arrive with polymorphism in stage 4.
+-- | An effect is a set of labels. Effect variables (ρ) are labels starting with @'@; they are
+-- bound by ∀ and replaced by effect sets on instantiation (§4.1).
 type Eff = Set String
+
+isEffVar :: String -> Bool
+isEffVar ('\'' : _) = True
+isEffVar _ = False
 
 data Ty
   = TUnit
@@ -35,9 +43,11 @@ data Ty
   | TInt IntTy
   | TFun Ty Eff Ty   -- ^ τ →ε σ, free closure
   | TLFun Ty Eff Ty  -- ^ τ ⊸ε σ, linear closure
-  | TData String
+  | TData String [Ty] -- ^ data or codata type applied to type arguments
+  | TVar String
   | TBox Ty
   | TPair Ty Ty      -- ^ τ ⊗ σ
+  | TForall [(String, Kind)] [String] Ty -- ^ ∀ types and effect variables; only at the top of a def's type
   | TRef Ty          -- ^ &τ, surface: only as a parameter type
   | TMut Ty          -- ^ &mut τ, surface: only as a parameter type
   deriving (Eq, Show)
@@ -45,7 +55,7 @@ data Ty
 data Kind = Free | Lin
   deriving (Eq, Show)
 
-data Overflow = Checked | Wrap | Saturate
+data Overflow = Checked | Wrap | Saturate | Optional -- ^ Optional: @+?@ returns Option
   deriving (Eq, Show)
 
 data ArithOp = Add | Sub | Mul
@@ -65,7 +75,7 @@ data Term
   | LLam String Ty Term  -- ^ λ°(x:τ). e
   | App Term Term
   | Let String Term Term
-  | Con String [Term]
+  | Con String [Ty] [Term]                  -- ^ C[τ̄](e, …)
   | Case Term [(String, [String], Term)]
   | Box Term
   | Unbox Term
@@ -73,6 +83,9 @@ data Term
   | Handle String Term [(String, String, Term)] -- ^ handle e with l { op x → e; … }
   | Pair Term Term                          -- ^ (e, e)
   | LetPair String String Term Term         -- ^ let (x, y) = e in e
+  | TyApp String [Ty] [Eff]                 -- ^ f[τ̄; ε̄], instantiate a polymorphic def
+  | Cocase String [Ty] [(String, Term)]     -- ^ cocase D[τ̄] { obs → e; … }
+  | Proj Term String                        -- ^ e.obs
   | Assign String Term                      -- ^ x := e, surface
   | Seq Term Term                           -- ^ e; e, surface
   | LetVar String Term Term                 -- ^ var x = e in e, surface
@@ -89,7 +102,7 @@ children tm = case tm of
   LLam _ _ b -> [b]
   App f a -> [f, a]
   Let _ e b -> [e, b]
-  Con _ as -> as
+  Con _ _ as -> as
   Case e alts -> e : [b | (_, _, b) <- alts]
   Box e -> [e]
   Unbox e -> [e]
@@ -97,6 +110,8 @@ children tm = case tm of
   Handle _ e cs -> e : [b | (_, _, b) <- cs]
   Pair a b -> [a, b]
   LetPair _ _ e b -> [e, b]
+  Cocase _ _ bs -> map snd bs
+  Proj e _ -> [e]
   Assign _ e -> [e]
   Seq a b -> [a, b]
   LetVar _ e b -> [e, b]
@@ -111,7 +126,7 @@ descend f tm = case tm of
   LLam x t b -> LLam x t (f b)
   App g a -> App (f g) (f a)
   Let x e b -> Let x (f e) (f b)
-  Con c as -> Con c (map f as)
+  Con c ts as -> Con c ts (map f as)
   Case e alts -> Case (f e) [(c, xs, f b) | (c, xs, b) <- alts]
   Box e -> Box (f e)
   Unbox e -> Unbox (f e)
@@ -119,14 +134,89 @@ descend f tm = case tm of
   Handle l e cs -> Handle l (f e) [(op, x, f b) | (op, x, b) <- cs]
   Pair a b -> Pair (f a) (f b)
   LetPair x y e b -> LetPair x y (f e) (f b)
+  Cocase d ts bs -> Cocase d ts [(o, f b) | (o, b) <- bs]
+  Proj e o -> Proj (f e) o
   Assign x e -> Assign x (f e)
   Seq a b -> Seq (f a) (f b)
   LetVar x e b -> LetVar x (f e) (f b)
   _ -> tm
 
+-- | All subterms, including the term itself.
+universe :: Term -> [Term]
+universe tm = tm : concatMap universe (children tm)
+
+-- Substitution ----------------------------------------------------------------------------
+
+type TySubst = M.Map String Ty
+
+type EffSubst = M.Map String Eff
+
+substEff :: EffSubst -> Eff -> Eff
+substEff ev e = S.unions [M.findWithDefault (S.singleton l) l ev | l <- S.toList e]
+
+substTy :: TySubst -> EffSubst -> Ty -> Ty
+substTy tv ev t = case t of
+  TVar a -> M.findWithDefault t a tv
+  TFun a e b -> TFun (go a) (substEff ev e) (go b)
+  TLFun a e b -> TLFun (go a) (substEff ev e) (go b)
+  TData d as -> TData d (map go as)
+  TBox a -> TBox (go a)
+  TPair a b -> TPair (go a) (go b)
+  TRef a -> TRef (go a)
+  TMut a -> TMut (go a)
+  TForall vs es b -> TForall vs es (substTy (foldr (M.delete . fst) tv vs) (foldr M.delete ev es) b)
+  _ -> t
+  where
+    go = substTy tv ev
+
+-- | Substitute in every type annotation of a term.
+substTerm :: TySubst -> EffSubst -> Term -> Term
+substTerm tv ev = go
+  where
+    st = substTy tv ev
+    go tm = descend go $ case tm of
+      Lam x t b -> Lam x (st t) b
+      LLam x t b -> LLam x (st t) b
+      Con c ts as -> Con c (map st ts) as
+      TyApp f ts es -> TyApp f (map st ts) (map (substEff ev) es)
+      Cocase d ts bs -> Cocase d (map st ts) bs
+      _ -> tm
+
+-- Printing --------------------------------------------------------------------------------
+
+prettyTy :: Ty -> String
+prettyTy t = case t of
+  TUnit -> "Unit"
+  TBool -> "Bool"
+  TInt (IntTy s n) -> (if s then "i" else "u") ++ show n
+  TFun a e b -> paren a ++ " →" ++ prettyEff e ++ " " ++ prettyTy b
+  TLFun a e b -> paren a ++ " ⊸" ++ prettyEff e ++ " " ++ prettyTy b
+  TData d [] -> d
+  TData d as -> d ++ "[" ++ intercalate ", " (map prettyTy as) ++ "]"
+  TVar a -> a
+  TBox a -> "Box " ++ paren a
+  TPair a b -> paren a ++ " ⊗ " ++ paren b
+  TForall vs es b -> "∀" ++ unwords (map fst vs ++ es) ++ ". " ++ prettyTy b
+  TRef a -> "&" ++ paren a
+  TMut a -> "&mut " ++ paren a
+  where
+    paren x = case x of
+      TFun {} -> "(" ++ prettyTy x ++ ")"
+      TLFun {} -> "(" ++ prettyTy x ++ ")"
+      TPair {} -> "(" ++ prettyTy x ++ ")"
+      _ -> prettyTy x
+
+prettyEff :: Eff -> String
+prettyEff e
+  | S.null e = ""
+  | otherwise = "{" ++ intercalate ", " (S.toList e) ++ "}"
+
+-- Declarations ----------------------------------------------------------------------------
+
 data Decl
-  = Data Bool String [(String, [Ty])]  -- ^ linear?, name, constructors with field types
-  | Effect String [(String, Ty, Ty)]   -- ^ label, operations with argument and result types
+  = Data Bool String [String] [(String, [Ty])] -- ^ linear?, name, type parameters, constructors
+  | Codata String [String] [(String, Ty)]      -- ^ name, type parameters, observations
+  | Effect String [(String, Ty, Ty)]           -- ^ label, operations with argument and result types
   | Def String Ty Term
   deriving (Eq, Show)
 
@@ -139,3 +229,7 @@ ioE, panicE, divergeE :: String
 ioE = "IO"
 panicE = "Panic"
 divergeE = "Diverge"
+
+-- | Built-in data: @data Option a = None | Some(a)@, the result of @+?@.
+optionDecl :: Decl
+optionDecl = Data False "Option" ["a"] [("None", []), ("Some", [TVar "a"])]

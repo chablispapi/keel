@@ -834,7 +834,7 @@ development for over a decade.
 - [ ] Design the real-time effects (`Alloc`, `Block`, `Diverge`) and the termination checker (section 13).
 - [ ] Design refinement types and constant-time `Secret a` typing; choose translation validation or a verified compiler (section 14).
 - [ ] First RISC-V milestone: "hello world" over the QEMU `virt` UART (section 15).
-- [ ] Write the core calculus formally: linear types + second-class refs + effect rows + codata (section 16).
+- [x] Write the core calculus formally: linear types + second-class refs + effects + codata (section 16). Done: `spec/core.md` (Keel Core, stages 1–4) with the Haskell reference checker/evaluator in `ref/` (`cd ref && cabal test`).
 - [ ] Turn the evaluator from section 5 into a tiny compiler: λ-terms → ANF → closure conversion → ARM64 asm that assembles and runs on this Mac.
 - [ ] Deep dive: closures and defunctionalization (eval/apply, partial application).
 - [ ] Deep dive: Perceus refcounting and reuse (pure code compiled to in-place mutation).

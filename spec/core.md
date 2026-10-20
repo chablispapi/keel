@@ -8,11 +8,13 @@ the REPL and the compiler. It is built in four stages, each extending the previo
 | 1 | λK₁ | Linear types, functions, `data`, `case`, `Box` | done |
 | 2 | λK₂ | Effects, tail-resumptive handlers, fixed-width checked arithmetic, `Panic`, `Diverge` | done |
 | 3 | λK₃ | Second-class references `&` / `&mut`, `var`, assignment; elaborated to state passing | done |
-| 4 | λK₄ | `codata`, rank-1 polymorphism, monomorphization | planned |
+| 4 | λK₄ | `codata`, rank-1 type and effect polymorphism, monomorphization | done |
 
 The executable reference checker and evaluator live in `ref/` (Haskell). Every rule below
-corresponds to a case in `ref/src/Keel/Check.hs`, `Eval.hs` or `Elab.hs`, and the examples in
-each stage's examples section (§1.6, §2.7, §3.6) are the tests in `ref/test/Main.hs`.
+corresponds to a case in `ref/src/Keel/Check.hs`, `Eval.hs`, `Elab.hs` or `Mono.hs`, and the examples in
+each stage's examples section (§1.6, §2.7, §3.6, §4.6) are the tests in `ref/test/Main.hs`. The whole
+pipeline (place rules → elaboration → checking → monomorphization → checking again) is
+`compile` in `ref/src/Keel/Mono.hs`.
 
 ---
 
@@ -701,3 +703,228 @@ the hand-written state-passing version produce the same value and the same outpu
   mock device can't keep its own state yet. Handler-owned state (Koka's handler-local `var`)
   needs either a primitive with its own semantics or a state-passing translation of every
   operation the handled code performs; this is an open design question.
+
+---
+
+## 4. λK₄: codata and polymorphism
+
+Stage 4 adds the last two pieces of `notes.md` §16: **codata as the interface mechanism**
+and **explicit dictionaries + monomorphization** in place of type classes. Polymorphism is
+rank-1 only, so every program can be specialized to a monomorphic one before code
+generation, which is how the compiler will run it.
+
+### 4.1 Syntax (additions)
+
+```
+α, β                                     type variables
+ρ                                        effect variables (written 'e in the reference implementation)
+ε ::= { l₁, …, lₙ, ρ₁, …, ρₘ }            effects may contain effect variables
+
+τ ::= … | α | D[τ₁, …, τₙ]                 data and codata types take type arguments
+σ ::= ∀(α₁:κ₁) … (αₙ:κₙ) ρ₁ … ρₘ. τ        type schemes: only as the type of a top-level def
+
+e ::= …
+    | C[τ̄](e₁, …, eₙ)                      constructors name their type arguments
+    | f[τ̄; ε̄]                              instantiate a polymorphic definition
+    | cocase D[τ̄] { o₁ → e₁ ; … ; oₙ → eₙ } build a codata value
+    | e.o                                   observe it
+    | e₁ +? e₂  (also -?, *?)               arithmetic returning Option ι instead of panicking
+
+decl ::= [linear] data D α₁ … αₙ = C₁(τ, …) | …
+       | codata D α₁ … αₙ { o₁ : τ ; … }
+       | def f : σ = e
+```
+
+Keel Core stays explicitly typed: every instantiation, constructor and cocase names its type
+arguments. The surface language infers them. Built in: `data Option a = None | Some(a)`.
+
+**Design note: why codata.** A codata type is defined by its *observations*, not its
+constructors. A `cocase` is a record of operations that closes over its environment, which
+is what an interface implementation, a driver vtable or a type-class dictionary is. One
+mechanism covers all three:
+
+```
+codata Serial { send : i64 →{IO} Unit }                     an interface
+codata Ord a  { lt : a → a → Bool }                         a dictionary
+
+def sort : ∀(a:Free). Ord a → List a →{Diverge} List a = …  explicit dictionary passing
+main = sort[i64] ordI64 [3, 1, 2]
+```
+
+There is no instance resolution: the dictionary is an ordinary argument. After
+monomorphization the dictionary is a known constant, so inlining (milestone M4) turns `o.lt x y`
+into `x < y`. None of the type-class problems listed in the video (coherence, orphan
+instances, global uniqueness) can arise.
+
+### 4.2 Kinds and typing
+
+**Kinds with type variables.** Each quantified variable declares a kind. `(α:Free)` may be
+copied and dropped and can only be instantiated with `Free` types (`KindMismatch`
+otherwise). `(α:Lin)` may be instantiated with anything, so the body must use an `α` value
+exactly once. Linear is the safe default: `∀(a:Lin). a → a ⊗ a` is rejected (`Duplicate`).
+
+```
+κ(α)      = the declared kind of α
+κ(D[τ̄])   = Lin   if D is `linear data`, or some τᵢ has kind Lin
+          = Free  otherwise (and always for codata)
+```
+
+So `List[i64]` is `Free` and `List[Token]` is `Lin`, from a single declaration. Inside a
+declaration its parameters count as `Free` for rule 1 (§1.2): the linearity of an argument
+moves to the whole type instead of making the declaration ill-formed.
+
+**Rules.** Let `θ = [τ̄/ᾱ, ε̄/ρ̄]` be a substitution.
+
+```
+            def f : ∀(ᾱ:κ̄) ρ̄. τ ∈ Σ     κ(τᵢ) ⊑ κᵢ  (Lin types only for Lin variables)
+ (Inst)  ──────────────────────────────────────────────────────────────────────────────    Diverge if f is in
+            Γ ⊢ f[τ̄; ε̄] : θτ ! {}                                                          the current group
+
+            C : (σ̄) → D ᾱ      Γᵢ ⊢ eᵢ : [τ̄/ᾱ]σᵢ
+ (Con)   ──────────────────────────────────────────          (Case) substitutes the scrutinee's
+            ⋈Γᵢ ⊢ C[τ̄](ē) : D[τ̄]                              arguments into the pattern types
+
+            codata D ᾱ { oᵢ : σᵢ }      Free(Γ)      Γ ⊢ eᵢ : [τ̄/ᾱ]σᵢ ! {}   (each oᵢ exactly once)
+ (Cocase) ───────────────────────────────────────────────────────────────────────────────────
+            Γ ⊢ cocase D[τ̄] { o₁ → e₁ ; … } : D[τ̄] ! {}
+
+            Γ ⊢ e : D[τ̄] ! ε      codata D ᾱ { …; o : σ; … }
+ (Proj)   ──────────────────────────────────────────────────
+            Γ ⊢ e.o : [τ̄/ᾱ]σ ! ε
+```
+
+A cocase can be observed any number of times, so like a free λ it can't capture linear
+values (`LinearCapture`), and that is why codata is always `Free`. Its branches must be
+effect-free (`EffectMismatch`): a branch is a value such as a λ, and the effects go inside it.
+
+A polymorphic definition is checked once, with its type variables **rigid** (equal only to
+themselves) and its effect variables treated as opaque labels. Effect polymorphism therefore
+needs no new machinery: `pmap : ∀a b ρ. (a →ρ b) → List a →{ρ, Diverge} List b` checks
+because `f x` has effect `{ρ}`, and `pmap[i64; i64; {Panic}]` substitutes `ρ ↦ {Panic}`.
+
+**Rank-1 only** (`HigherRank`). `∀` appears only at the top of a `def`'s type, never inside a
+type. Using a polymorphic definition without instantiating it is a `Mismatch`. This rules out
+runtime type passing, which monomorphization needs. A polymorphic function argument is an
+explicit codata value instead.
+
+### 4.3 Well-formedness with parameters
+
+- **Variance.** For each data and codata type, compute the polarities at which each
+  parameter occurs (positive, negative or both), as the least fixpoint over all declarations.
+  `codata Ord a { lt : a → a → Bool }` has `a` negative. `List a` has `a` positive.
+- **Positivity through parameters (rule 4).** When checking that `D` occurs only positively
+  in its own definition, an occurrence inside `E[…, τ, …]` takes the polarity of `E`'s
+  parameter. So `data T = T(Box (Neg T))` with `data Neg a = Neg(a → i64)` is `NonPositive`,
+  and so is `codata Bad { f : Bad → i64 }`, which would allow a loop with no recursion.
+- **Finite size (rule 2), conservatively.** Type arguments count as stored inline, so
+  `data L = C(i64, Wrap L)` with `data Wrap a = W(a)` is `InfiniteSize`. This also rejects
+  some finite types whose parameter only sits behind `Box` or a function; precise per-parameter
+  layout analysis is future work.
+
+### 4.4 Monomorphization
+
+`Mono.hs` is the worklist of `notes.md` §4:
+
+1. Start from `main` and every monomorphic definition, and collect each instantiation
+   `f[τ̄; ε̄]`. All of these are closed.
+2. For each new instance, substitute into `f`'s body and type, name it `f[τ̄; ε̄]`, and add the
+   instantiations in the new body to the worklist.
+3. Replace every `f[τ̄; ε̄]` with a reference to its instance, and drop the polymorphic
+   definitions.
+
+**Polymorphic recursion is rejected** (`PolyRecursion`). Inside a recursive group, members
+may only be instantiated at the caller's own type variables. For example,
+`depth : ∀a. Nested a → i64` calling `depth[List a]` is rejected; `pmap` calling
+`pmap[a, b]` is fine. Effect arguments are unrestricted.
+
+**Output.** No `∀`, no instantiation, and no type variable in any definition or in `main`
+(`isClosed`). Data and codata declarations stay parameterized: they are layout *templates*,
+and the backend lays out `List[i64]` and `List[Token]` separately, as Rust does with
+generic structs. The output is checked again by the core checker (`compile`).
+
+### 4.5 Semantics
+
+Types are erased: `f[τ̄; ε̄]` evaluates like `f`, and `C[τ̄](ē)` like `C(ē)`. A `cocase` evaluates
+to a codata value `⟨ρ, {oᵢ ↦ eᵢ}⟩` (its environment and branches). An observation runs the
+branch in that environment, every time:
+
+```
+ H; ρ ⊢ e ⇓ ⟨ρ', {…, o ↦ e_o, …}⟩     H; ρ' ⊢ e_o ⇓ v
+ ───────────────────────────────────────────────────────
+                 H; ρ ⊢ e.o ⇓ v
+```
+
+Re-running a branch is safe: branches are effect-free and capture no linear values. `+?`
+returns `Some(r)` when the exact result `r` is in range and `None` otherwise.
+
+### 4.6 Examples
+
+**Accepted** (each also monomorphized, checked as closed, and re-run: same result):
+
+| Program | Result |
+|---|---|
+| `psum (pmap[i64; i64; {Panic}] inc [1,2,3])`, effect-polymorphic `pmap` | `9` |
+| `psum (pmap[Token; i64; {}] consume [Token, Token])` (a list of linear tokens) | `2` |
+| `greet loud; greet quiet; greet loud`, where `greet s = s.send 72; s.send 105` | `()`, output `[72, 105, 72, 105]` |
+| `sort[i64] ordI64 [3,1,2]` with `ordI64 = cocase Ord[i64] { lt → λp q. p < q }` | `[1, 2, 3]` |
+| `sort[i64] ordDesc [3,1,2]` with the reversed dictionary | `[3, 2, 1]` |
+| `dup[i64] 3` with `dup : ∀(a:Free). a → a ⊗ a` | `(3, 3)` |
+| `1 +? 2` / `250:u8 +? 10:u8` | `Some(3)` / `None` |
+
+**Rejected:**
+
+| Program | Error |
+|---|---|
+| `depth : ∀a. Nested a → i64` calling `depth[List a]` | `PolyRecursion` |
+| `insert[Token]` where `insert : ∀(a:Free). …` | `KindMismatch` |
+| `let g = pmap in 0` (no type arguments) | `Mismatch` |
+| `def hr : (∀a. a → a) → i64` | `HigherRank` |
+| `def dup : ∀(a:Lin). a → a ⊗ a = λx. (x, x)` | `Duplicate` |
+| a `cocase` branch that uses a linear `Token` from outside | `LinearCapture` |
+| `cocase Ord[i64] {}` | `NonExhaustive` |
+| `codata Bad { f : Bad → i64 }` | `NonPositive` |
+| `data T = T(Box (Neg T))`, `data Neg a = Neg(a → i64)` | `NonPositive` |
+| `data L2 = C2(i64, Wrap L2)`, `data Wrap a = W(a)` | `InfiniteSize` |
+| `def g : i64 →{'q} i64` with `'q` not bound | `Unbound` |
+
+### 4.7 Metatheory
+
+**Lemma (substitution).** If `def f : ∀(ᾱ:κ̄) ρ̄. τ = e` is well typed, the arguments
+respect the declared kinds, and `θ = [τ̄/ᾱ, ε̄/ρ̄]` is closed, then `· ⊢ θe : θτ ! {}`. Kinds are
+preserved because `κ(θτ)` can only become `Lin` where τ mentions an `α:Lin`, which the body
+already treated linearly. Effects are preserved because subset and union commute with
+substituting sets for labels.
+
+**Theorem 8 (monomorphization terminates).** Under the polymorphic-recursion restriction,
+the worklist reaches a fixpoint.
+
+*Sketch.* Order recursive groups topologically. Inside a group, instances are created only
+at the caller's own type arguments, so a group entered at closed arguments `τ̄` creates
+instances whose arguments are drawn from `τ̄`: finitely many. Effect arguments range over
+subsets of the finitely many labels in the program. Calls between groups go down the
+topological order. Each step therefore creates finitely many instances.
+
+**Theorem 9 (monomorphization preserves typing and meaning).** If `compile` accepts a
+program, the monomorphic output is well typed, closed, and evaluates to the same outcome and
+output trace as the original.
+
+*Sketch.* Typing: by the substitution lemma, each instance is well typed at its closed
+type, and replacing `f[τ̄; ε̄]` by the instance name preserves types. Meaning: evaluation
+erases types, so an instance's body evaluates exactly like the polymorphic body. The test
+suite checks the "same outcome" part on every accepted program.
+
+**Theorem 1, 2, 4, 5 extend unchanged.** Codata adds a value form whose observation is a
+closure call. The (Cocase) rule gives it the same guarantees as a free λ: no linear capture,
+and effects only through the function types it returns.
+
+### 4.8 Limitations
+
+- **Data and codata parameters are types only.** A codata type can't be effect-polymorphic
+  (`codata Stream ρ a`), so an interface fixes its effects (`Serial`'s `send` is `{IO}`).
+- **No `Self` in codata.** The `notes.md` §16 sketch has `send : &mut Self → …`. That needs
+  observations with a reference to the value itself; for now a codata value holds its state
+  in its closure.
+- **Observations re-run their branch.** This is cheap and correct because branches are
+  effect-free values. A compiler would build the record of closures once.
+- **The size rule is conservative over type arguments** (§4.3).
+- **Instance names are strings** (`pmap[i64; i64; {Panic}]`). A compiler would intern them.

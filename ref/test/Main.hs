@@ -1,4 +1,4 @@
--- | Examples from spec/core.md §1.6, §2.7 and §3.6: each program either evaluates to an expected
+-- | Examples from spec/core.md §1.6, §2.7, §3.6 and §4.6: each program either evaluates to an expected
 -- value (and output trace), panics, or is rejected with an expected error class.
 module Main (main) where
 
@@ -6,6 +6,7 @@ import Control.Monad (unless)
 import Data.Set qualified as S
 import Keel.Check
 import Keel.Elab
+import Keel.Mono
 import Keel.Eval
 import Keel.Syntax
 import System.Exit (exitFailure)
@@ -40,12 +41,12 @@ eq = Prim Eq
 -- Shared declarations ---------------------------------------------------------------------
 
 intList, token :: Decl
-intList = Data False "IntList" [("Nil", []), ("Cons", [tI, TBox (TData "IntList")])]
-token = Data True "Token" [("Token", [])]
+intList = Data False "IntList" [] [("Nil", []), ("Cons", [tI, TBox (TData "IntList" [])])]
+token = Data True "Token" [] [("Token", [])]
 
 tList, tTok :: Ty
-tList = TData "IntList"
-tTok = TData "Token"
+tList = TData "IntList" []
+tTok = TData "Token" []
 
 -- def consume : Token → i64 = λ(t:Token). case t of { Token → 1 }
 consume :: Decl
@@ -59,10 +60,10 @@ mapDef =
       Lam "xs" tList $
         Case
           (Var "xs")
-          [ ("Nil", [], Con "Nil" [])
+          [ ("Nil", [], Con "Nil" [] [])
           , ( "Cons"
             , ["x", "rest"]
-            , Con "Cons" [App (Var "f") (Var "x"), Box (App (App (Var "map") (Var "f")) (Unbox (Var "rest")))]
+            , Con "Cons" [] [App (Var "f") (Var "x"), Box (App (App (Var "map") (Var "f")) (Unbox (Var "rest")))]
             )
           ]
 
@@ -81,18 +82,18 @@ incDef :: Decl
 incDef = Def "inc" (fnE [panicE] tI tI) (Lam "n" tI (add (Var "n") (int 1)))
 
 list :: [Integer] -> Term
-list = foldr (\n t -> Con "Cons" [int n, Box t]) (Con "Nil" [])
+list = foldr (\n t -> Con "Cons" [] [int n, Box t]) (Con "Nil" [] [])
 
 withToken :: Term -> Program
 withToken = Program [token, consume]
 
 letTok :: Term -> Term
-letTok = Let "t" (Con "Token" [])
+letTok = Let "t" (Con "Token" [] [])
 
 -- effect MMIO { read : i64 ⇒ i64 ; write : W ⇒ Unit },  data W = W(i64, i64)
 mmio, wData :: Decl
-mmio = Effect "MMIO" [("read", tI, tI), ("write", TData "W", TUnit)]
-wData = Data False "W" [("W", [tI, tI])]
+mmio = Effect "MMIO" [("read", tI, tI), ("write", TData "W" [], TUnit)]
+wData = Data False "W" [] [("W", [tI, tI])]
 
 -- def send : IntList →{MMIO, Diverge} Unit
 --   = λxs. case xs of
@@ -110,8 +111,8 @@ sendDef =
           , ["c", "rest"]
           , If
               (eq (Perform "read" (int 4)) (int 1))
-              (Let "done" (Perform "write" (Con "W" [int 0, Var "c"])) (App (Var "send") (Unbox (Var "rest"))))
-              (App (Var "send") (Con "Cons" [Var "c", Var "rest"]))
+              (Let "done" (Perform "write" (Con "W" [] [int 0, Var "c"])) (App (Var "send") (Unbox (Var "rest"))))
+              (App (Var "send") (Con "Cons" [] [Var "c", Var "rest"]))
           )
         ]
 
@@ -134,11 +135,11 @@ bumpDef = Def "bump" (fnE [panicE] (TMut tI) TUnit) (Lam "n" (TMut tI) (Assign "
 -- linear data Counter = Counter(i64)
 -- def tick : &mut Counter → Unit = λ(&mut c:Counter). case c of Counter(n) → c := Counter(n +% 1)
 counter, tickDef :: Decl
-counter = Data True "Counter" [("Counter", [tI])]
+counter = Data True "Counter" [] [("Counter", [tI])]
 tickDef =
-  Def "tick" (fn (TMut (TData "Counter")) TUnit) $
-    Lam "c" (TMut (TData "Counter")) $
-      Case (Var "c") [("Counter", ["n"], Assign "c" (Con "Counter" [Prim (Arith Wrap Add) (Var "n") (int 1)]))]
+  Def "tick" (fn (TMut (TData "Counter" [])) TUnit) $
+    Lam "c" (TMut (TData "Counter" [])) $
+      Case (Var "c") [("Counter", ["n"], Assign "c" (Con "Counter" [] [Prim (Arith Wrap Add) (Var "n") (int 1)]))]
 
 -- def drain : &mut IntList →{MMIO, Diverge} Unit = λ(&mut q:IntList). case q of
 --   Nil → ()
@@ -153,7 +154,7 @@ drainDef =
         , ( "Cons"
           , ["c", "rest"]
           , Seq
-              (Perform "write" (Con "W" [int 0, Var "c"]))
+              (Perform "write" (Con "W" [] [int 0, Var "c"]))
               (Seq (Assign "q" (Unbox (Var "rest"))) (App (Var "drain") (BorrowMut "q")))
           )
         ]
@@ -171,7 +172,7 @@ drainSPDef =
         [ ("Nil", [], Pair UnitLit (Var "q"))
         , ( "Cons"
           , ["c", "rest"]
-          , Let "d" (Perform "write" (Con "W" [int 0, Var "c"])) (App (Var "drainSP") (Unbox (Var "rest")))
+          , Let "d" (Perform "write" (Con "W" [] [int 0, Var "c"])) (App (Var "drainSP") (Unbox (Var "rest")))
           )
         ]
 
@@ -187,6 +188,104 @@ lenDef =
         [ ("Nil", [], int 0)
         , ("Cons", ["y", "more"], LetVar "m" (Unbox (Var "more")) (Prim (Arith Wrap Add) (App (Var "len") (Borrow "m")) (int 1)))
         ]
+
+-- Stage 4 declarations -------------------------------------------------------------------
+
+tA, tB :: Ty
+tA = TVar "a"
+tB = TVar "b"
+
+tL :: Ty -> Ty
+tL a = TData "List" [a]
+
+-- data List a = Nil | Cons(a, Box (List a))
+listD :: Decl
+listD = Data False "List" ["a"] [("Nil", []), ("Cons", [tA, TBox (tL tA)])]
+
+plist :: Ty -> [Term] -> Term
+plist t = foldr (\x r -> Con "Cons" [t] [x, Box r]) (Con "Nil" [t] [])
+
+vlist :: [Integer] -> Value
+vlist = foldr (\n r -> VCon "Cons" [VInt i64 n, VBox r]) (VCon "Nil" [])
+
+-- def pmap : ∀a b 'e. (a →'e b) → List a →{'e, Diverge} List b
+pmapDef :: Decl
+pmapDef =
+  Def "pmap" (TForall [("a", Lin), ("b", Lin)] ["'e"] (fn (fnE ["'e"] tA tB) (fnE ["'e", divergeE] (tL tA) (tL tB)))) $
+    Lam "f" (fnE ["'e"] tA tB) $
+      Lam "xs" (tL tA) $
+        Case
+          (Var "xs")
+          [ ("Nil", [], Con "Nil" [tB] [])
+          , ( "Cons"
+            , ["x", "rest"]
+            , Con "Cons" [tB] [App (Var "f") (Var "x"), Box (App (App (TyApp "pmap" [tA, tB] [S.singleton "'e"]) (Var "f")) (Unbox (Var "rest")))]
+            )
+          ]
+
+-- def psum : List i64 →{Panic, Diverge} i64
+psumDef :: Decl
+psumDef =
+  Def "psum" (fnE [panicE, divergeE] (tL tI) tI) $
+    Lam "ys" (tL tI) $
+      Case (Var "ys") [("Nil", [], int 0), ("Cons", ["y", "more"], add (Var "y") (App (Var "psum") (Unbox (Var "more"))))]
+
+-- codata Serial { send : i64 →{IO} Unit }, two implementations, and a client.
+serialD, loudDef, quietDef, greetDef :: Decl
+serialD = Codata "Serial" [] [("send", fnE [ioE] tI TUnit)]
+loudDef = Def "loud" (TData "Serial" []) (Cocase "Serial" [] [("send", Lam "c" tI (Perform "out" (Var "c")))])
+quietDef = Def "quiet" (TData "Serial" []) (Cocase "Serial" [] [("send", Lam "c" tI UnitLit)])
+greetDef =
+  Def "greet" (fnE [ioE] (TData "Serial" []) TUnit) $
+    Lam "s" (TData "Serial" []) (Seq (App (Proj (Var "s") "send") (int 72)) (App (Proj (Var "s") "send") (int 105)))
+
+-- codata Ord a { lt : a → a → Bool }: an explicit dictionary.
+ordD :: Decl
+ordD = Codata "Ord" ["a"] [("lt", fn tA (fn tA TBool))]
+
+tOrd :: Ty -> Ty
+tOrd a = TData "Ord" [a]
+
+-- def insert : ∀(a:Free). Ord a → a → List a →{Diverge} List a
+insertDef :: Decl
+insertDef =
+  Def "insert" (TForall [("a", Free)] [] (fn (tOrd tA) (fn tA (fnE [divergeE] (tL tA) (tL tA))))) $
+    Lam "o" (tOrd tA) $
+      Lam "x" tA $
+        Lam "xs" (tL tA) $
+          Case
+            (Var "xs")
+            [ ("Nil", [], Con "Cons" [tA] [Var "x", Box (Con "Nil" [tA] [])])
+            , ( "Cons"
+              , ["y", "rest"]
+              , If
+                  (App (App (Proj (Var "o") "lt") (Var "x")) (Var "y"))
+                  (Con "Cons" [tA] [Var "x", Box (Con "Cons" [tA] [Var "y", Var "rest"])])
+                  (Con "Cons" [tA] [Var "y", Box (App (App (App (TyApp "insert" [tA] []) (Var "o")) (Var "x")) (Unbox (Var "rest")))])
+              )
+            ]
+
+-- def sort : ∀(a:Free). Ord a → List a →{Diverge} List a
+sortDef :: Decl
+sortDef =
+  Def "sort" (TForall [("a", Free)] [] (fn (tOrd tA) (fnE [divergeE] (tL tA) (tL tA)))) $
+    Lam "o2" (tOrd tA) $
+      Lam "zs" (tL tA) $
+        Case
+          (Var "zs")
+          [ ("Nil", [], Con "Nil" [tA] [])
+          , ( "Cons"
+            , ["z", "more"]
+            , App (App (App (TyApp "insert" [tA] []) (Var "o2")) (Var "z")) (App (App (TyApp "sort" [tA] []) (Var "o2")) (Unbox (Var "more")))
+            )
+          ]
+
+ordI64, ordDesc :: Decl
+ordI64 = Def "ordI64" (tOrd tI) (Cocase "Ord" [tI] [("lt", Lam "p" tI (Lam "q" tI (Prim Lt (Var "p") (Var "q"))))])
+ordDesc = Def "ordDesc" (tOrd tI) (Cocase "Ord" [tI] [("lt", Lam "p" tI (Lam "q" tI (Prim Lt (Var "q") (Var "p"))))])
+
+sortWith :: String -> Term
+sortWith o = App (App (TyApp "sort" [tI] []) (Var o)) (plist tI (map int [3, 1, 2]))
 
 -- Cases -----------------------------------------------------------------------------------
 
@@ -212,8 +311,8 @@ cases =
     )
   , ( "linear data with linear field"
     , Program
-        [token, consume, Data True "Pair" [("P", [tTok, tI])]]
-        (Case (Con "P" [Con "Token" [], int 5]) [("P", ["t", "n"], add (App (Var "consume") (Var "t")) (Var "n"))])
+        [token, consume, Data True "Pair" [] [("P", [tTok, tI])]]
+        (Case (Con "P" [] [Con "Token" [] [], int 5]) [("P", ["t", "n"], add (App (Var "consume") (Var "t")) (Var "n"))])
     , ok (VInt i64 6)
     )
   , ( "linear var used in both branches"
@@ -237,13 +336,13 @@ cases =
     , withToken (letTok (Let "k" (LLam "n" tI (App (Var "consume") (Var "t"))) (add (App (Var "k") (int 1)) (App (Var "k") (int 2)))))
     , Rejects Duplicate
     )
-  , ("free data with linear field", Program [token, Data False "Bad" [("B", [tTok])]] (int 0), Rejects LinearField)
-  , ("unboxed recursion", Program [Data False "L" [("N", []), ("C", [tI, TData "L"])]] (int 0), Rejects InfiniteSize)
+  , ("free data with linear field", Program [token, Data False "Bad" [] [("B", [tTok])]] (int 0), Rejects LinearField)
+  , ("unboxed recursion", Program [Data False "L" [] [("N", []), ("C", [tI, TData "L" []])]] (int 0), Rejects InfiniteSize)
   , ( "mutual unboxed recursion"
-    , Program [Data False "A" [("MkA", [TData "B"])], Data False "B" [("MkB", [TData "A"]), ("E", [])]] (int 0)
+    , Program [Data False "A" [] [("MkA", [TData "B" []])], Data False "B" [] [("MkB", [TData "A" []]), ("E", [])]] (int 0)
     , Rejects InfiniteSize
     )
-  , ("non-exhaustive case", Program [intList] (Case (Con "Nil" []) [("Nil", [], int 0)]), Rejects NonExhaustive)
+  , ("non-exhaustive case", Program [intList] (Case (Con "Nil" [] []) [("Nil", [], int 0)]), Rejects NonExhaustive)
   , ("type mismatch", Program [] (add (int 1) (BoolLit True)), Rejects Mismatch)
   , ("shadowing", Program [] (Let "x" (int 1) (Let "x" (int 2) (Var "x"))), Rejects Shadowing)
   -- Stage 2 -------------------------------------------------------------------------------
@@ -293,7 +392,7 @@ cases =
         (int 0)
     , Rejects EffectMismatch
     )
-  , ("non-positive data", Program [Data False "T" [("MkT", [fn (TData "T") tI])]] (int 0), Rejects NonPositive)
+  , ("non-positive data", Program [Data False "T" [] [("MkT", [fn (TData "T" []) tI])]] (int 0), Rejects NonPositive)
   , ( "handler clause captures linear"
     , withToken (letTok (Handle ioE (Perform "out" (int 1)) [("out", "x", Let "r" (App (Var "consume") (Var "t")) UnitLit)]))
     , Rejects LinearCapture
@@ -315,7 +414,7 @@ cases =
   , ( "&mut on a linear value"
     , Program
         [counter, tickDef]
-        ( LetVar "k" (Con "Counter" [int 0]) $
+        ( LetVar "k" (Con "Counter" [] [int 0]) $
             Seq (App (Var "tick") (BorrowMut "k")) $
               Seq (App (Var "tick") (BorrowMut "k")) $
                 Case (Var "k") [("Counter", ["v"], Var "v")]
@@ -334,9 +433,9 @@ cases =
     , Program [intList, lenDef] (LetVar "l" (list [5, 6, 7]) (App (Var "len") (Borrow "l")))
     , ok (VInt i64 3)
     )
-  , ("var holding a linear value", withToken (LetVar "t" (Con "Token" []) (App (Var "consume") (Var "t"))), ok (VInt i64 1))
+  , ("var holding a linear value", withToken (LetVar "t" (Con "Token" [] []) (App (Var "consume") (Var "t"))), ok (VInt i64 1))
   , ("returning a reference", Program [Def "f" (fn tI (TMut tI)) (Lam "x" tI (Var "x"))] (int 0), Rejects RefEscape)
-  , ("reference in a data field", Program [Data False "D" [("D", [TRef tI])]] (int 0), Rejects RefEscape)
+  , ("reference in a data field", Program [Data False "D" [] [("D", [TRef tI])]] (int 0), Rejects RefEscape)
   , ( "borrow outside an argument"
     , Program [] (LetVar "x" (int 1) (Let "y" (BorrowMut "x") (int 0)))
     , Rejects RefEscape
@@ -351,9 +450,9 @@ cases =
     )
   , ("assign to a non-place", Program [] (Let "y" (int 1) (Assign "y" (int 2))), Rejects NotAPlace)
   , ("&mut of a non-place", Program [bumpDef] (Let "y" (int 1) (App (Var "bump") (BorrowMut "y"))), Rejects NotAPlace)
-  , ("var dropping a linear value", withToken (LetVar "t" (Con "Token" []) (int 1)), Rejects Dropped)
+  , ("var dropping a linear value", withToken (LetVar "t" (Con "Token" [] []) (int 1)), Rejects Dropped)
   , ( "linear place used after a move"
-    , withToken (LetVar "t" (Con "Token" []) (Let "a" (App (Var "consume") (Var "t")) (App (Var "consume") (Var "t"))))
+    , withToken (LetVar "t" (Con "Token" [] []) (Let "a" (App (Var "consume") (Var "t")) (App (Var "consume") (Var "t"))))
     , Rejects Duplicate
     )
   , ( "changing an outer place inside a handled expression"
@@ -364,6 +463,70 @@ cases =
     , Program [] (LetVar "x" (int 0) (Handle ioE (Perform "out" (int 1)) [("out", "v", Perform "out" (Var "x"))]))
     , Rejects PlaceCapture
     )
+  -- Stage 4 -------------------------------------------------------------------------------
+  , ( "polymorphic, effect-polymorphic map"
+    , Program [listD, pmapDef, psumDef, incDef] (App (Var "psum") (App (App (TyApp "pmap" [tI, tI] [S.singleton panicE]) (Var "inc")) (plist tI (map int [1, 2, 3]))))
+    , ok (VInt i64 9)
+    )
+  , ( "map over a list of linear tokens"
+    , Program
+        [listD, pmapDef, psumDef, token, consume]
+        (App (Var "psum") (App (App (TyApp "pmap" [tTok, tI] [S.empty]) (Var "consume")) (plist tTok [Con "Token" [] [], Con "Token" [] []])))
+    , ok (VInt i64 2)
+    )
+  , ( "codata interface, two implementations"
+    , Program [serialD, loudDef, quietDef, greetDef] (Seq (App (Var "greet") (Var "loud")) (Seq (App (Var "greet") (Var "quiet")) (App (Var "greet") (Var "loud"))))
+    , Gives VUnit [72, 105, 72, 105]
+    )
+  , ("sort with an explicit Ord dictionary", Program [listD, ordD, insertDef, sortDef, ordI64] (sortWith "ordI64"), ok (vlist [1, 2, 3]))
+  , ("same sort, another dictionary", Program [listD, ordD, insertDef, sortDef, ordDesc] (sortWith "ordDesc"), ok (vlist [3, 2, 1]))
+  , ( "Free type variable at a Free type"
+    , Program
+        [Def "dup" (TForall [("a", Free)] [] (fn tA (TPair tA tA))) (Lam "x" tA (Pair (Var "x") (Var "x")))]
+        (App (TyApp "dup" [tI] []) (int 3))
+    , ok (VPair (VInt i64 3) (VInt i64 3))
+    )
+  , ("+? in range", Program [] (Prim (Arith Optional Add) (int 1) (int 2)), ok (VCon "Some" [VInt i64 3]))
+  , ("+? overflow", Program [] (Prim (Arith Optional Add) (IntLit u8 250) (IntLit u8 10)), ok (VCon "None" []))
+  , ( "polymorphic recursion"
+    , Program
+        [ listD
+        , Data False "Nested" ["a"] [("Flat", [tA]), ("Nest", [TBox (TData "Nested" [tL tA])])]
+        , Def "depth" (TForall [("a", Free)] [] (fnE [panicE, divergeE] (TData "Nested" [tA]) tI)) $
+            Lam "n" (TData "Nested" [tA]) $
+              Case (Var "n") [("Flat", ["v"], int 1), ("Nest", ["m"], add (int 1) (App (TyApp "depth" [tL tA] []) (Unbox (Var "m"))))]
+        ]
+        (int 0)
+    , Rejects PolyRecursion
+    )
+  , ( "linear type for a Free variable"
+    , Program [token, listD, ordD, insertDef] (Let "g" (TyApp "insert" [tTok] []) (int 0))
+    , Rejects KindMismatch
+    )
+  , ("polymorphic def without type arguments", Program [listD, pmapDef] (Let "g" (Var "pmap") (int 0)), Rejects Mismatch)
+  , ( "higher-rank type"
+    , Program [Def "hr" (fn (TForall [("a", Lin)] [] (fn tA tA)) tI) (Lam "h" (TForall [("a", Lin)] [] (fn tA tA)) (int 0))] (int 0)
+    , Rejects HigherRank
+    )
+  , ( "linear by default: can't duplicate"
+    , Program [Def "dup" (TForall [("a", Lin)] [] (fn tA (TPair tA tA))) (Lam "x" tA (Pair (Var "x") (Var "x")))] (int 0)
+    , Rejects Duplicate
+    )
+  , ( "cocase captures linear"
+    , Program [token, consume, serialD] (letTok (Let "s" (Cocase "Serial" [] [("send", Lam "c" tI (Let "r" (App (Var "consume") (Var "t")) UnitLit))]) UnitLit))
+    , Rejects LinearCapture
+    )
+  , ("cocase misses an observation", Program [ordD] (Let "o" (Cocase "Ord" [tI] []) (int 0)), Rejects NonExhaustive)
+  , ("negative codata", Program [Codata "Bad" [] [("f", fn (TData "Bad" []) tI)]] (int 0), Rejects NonPositive)
+  , ( "negative through a type parameter"
+    , Program [Data False "Neg" ["a"] [("Neg", [fn tA tI])], Data False "T" [] [("T", [TBox (TData "Neg" [TData "T" []])])]] (int 0)
+    , Rejects NonPositive
+    )
+  , ( "infinite size through a type parameter"
+    , Program [Data False "Wrap" ["a"] [("W", [tA])], Data False "L2" [] [("C2", [tI, TData "Wrap" [TData "L2" []]])]] (int 0)
+    , Rejects InfiniteSize
+    )
+  , ("unbound effect variable", Program [Def "g" (fnE ["'q"] tI tI) (Lam "n" tI (Var "n"))] (int 0), Rejects Unbound)
   ]
 
 -- Runner --------------------------------------------------------------------------------
@@ -375,12 +538,16 @@ main = do
   putStrLn (show (length cases - length failures) ++ "/" ++ show (length cases) ++ " passed")
   unless (null failures) exitFailure
   where
-    run (name, prog, expect) = case (checkSurface prog, expect) of
+    run (name, prog, expect) = case (compile prog, expect) of
       (Left (TypeError k _), Rejects k') -> [failMsg name ("expected " ++ show k' ++ ", got " ++ show k) | k /= k']
       (Left e, _) -> [failMsg name ("unexpected rejection: " ++ show e)]
       (Right t, Rejects k) -> [failMsg name ("expected " ++ show k ++ ", but accepted at " ++ show t)]
-      (Right _, _) -> case (evalProgram (elaborate prog), expect) of
-        ((Done v, tr), Gives v' tr') | v == v' && tr == tr' -> []
-        ((Panicked _, tr), Panics tr') | tr == tr' -> []
-        (got, _) -> [failMsg name ("got " ++ show got)]
+      (Right mono, _) ->
+        let got = evalProgram (elaborate prog)
+         in [failMsg name "monomorphized program still has type variables" | not (isClosed mono)]
+              ++ [failMsg name ("monomorphization changed the result: " ++ show (evalProgram mono)) | evalProgram mono /= got]
+              ++ case (got, expect) of
+                ((Done v, tr), Gives v' tr') | v == v' && tr == tr' -> []
+                ((Panicked _, tr), Panics tr') | tr == tr' -> []
+                _ -> [failMsg name ("got " ++ show got)]
     failMsg name msg = "FAIL " ++ name ++ ": " ++ msg

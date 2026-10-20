@@ -1,5 +1,5 @@
--- | Call-by-value, environment-based evaluator for Keel Core, stages 1–3
--- (spec/core.md §1.4, §2.5, §3.4). Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
+-- | Call-by-value, environment-based evaluator for Keel Core, stages 1–4
+-- (spec/core.md §1.4, §2.5, §3.4, §4.5). Types are erased: @f[τ̄]@ evaluates like @f@. Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
 module Keel.Eval (Value (..), Outcome (..), evalProgram) where
 
@@ -17,6 +17,7 @@ data Value
   | VCon String [Value]
   | VBox Value
   | VPair Value Value
+  | VCodata Env (M.Map String Term) -- ^ a cocase: each observation runs its branch in the env
 
 type Env = M.Map String Value
 
@@ -30,6 +31,7 @@ instance Show Value where
     VCon c vs -> c ++ "(" ++ commas (map show vs) ++ ")"
     VBox a -> "box " ++ show a
     VPair a b -> "(" ++ show a ++ ", " ++ show b ++ ")"
+    VCodata {} -> "<codata>"
     where
       commas = foldr1 (\a b -> a ++ ", " ++ b)
 
@@ -70,6 +72,7 @@ evalProgram (Program decls main) = (either Panicked Done r, reverse trace)
 eval :: [Handler] -> Env -> Term -> Run Value
 eval hs env tm = case tm of
   Var x -> pure (env M.! x)
+  TyApp f _ _ -> pure (env M.! f)
   UnitLit -> pure VUnit
   IntLit t n -> pure (VInt t n)
   BoolLit b -> pure (VBool b)
@@ -94,7 +97,7 @@ eval hs env tm = case tm of
   Let x e body -> do
     v <- eval hs env e
     eval hs (M.insert x v env) body
-  Con c args -> VCon c <$> mapM (eval hs env) args
+  Con c _ args -> VCon c <$> mapM (eval hs env) args
   Case e alts -> do
     v <- eval hs env e
     case v of
@@ -120,6 +123,12 @@ eval hs env tm = case tm of
     case v of
       VPair a b -> eval hs (M.insert y b (M.insert x a env)) body
       _ -> stuck "let-pair of a non-pair"
+  Cocase _ _ branches -> pure (VCodata env (M.fromList branches))
+  Proj e o -> do
+    v <- eval hs env e
+    case v of
+      VCodata cenv bs | Just b <- M.lookup o bs -> eval hs cenv b
+      _ -> stuck ("observation " ++ o ++ " of a non-codata value")
   _ -> stuck ("surface construct in core: " ++ show tm)
 
 -- | Find the innermost handler for @op@ and run its clause with the handlers *outside* it,
@@ -146,8 +155,9 @@ prim op (VInt t a) (VInt _ b) = case op of
     let r = arith aop a b
         (lo, hi) = intRange t
      in if r >= lo && r <= hi
-          then pure (VInt t r)
+          then pure (if ov == Optional then VCon "Some" [VInt t r] else VInt t r)
           else case ov of
+            Optional -> pure (VCon "None" [])
             Checked -> throwE ("overflow: " ++ show aop ++ " " ++ show a ++ " " ++ show b ++ " in " ++ show t)
             Wrap -> pure (VInt t (lo + (r - lo) `mod` (hi - lo + 1)))
             Saturate -> pure (VInt t (max lo (min hi r)))

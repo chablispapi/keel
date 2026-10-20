@@ -34,7 +34,8 @@ err k msg = Left (TypeError k msg)
 checkRefs :: Program -> TC ()
 checkRefs (Program decls main) = do
   forM_ decls $ \d -> case d of
-    Data _ _ cs -> mapM_ tyOk (concatMap snd cs)
+    Data _ _ _ cs -> mapM_ tyOk (concatMap snd cs)
+    Codata _ _ os -> mapM_ (tyOk . snd) os
     Effect _ ops -> forM_ ops $ \(_, a, r) -> tyOk a >> tyOk r
     Def _ t e -> tyOk t >> places M.empty e
   places M.empty main
@@ -48,6 +49,8 @@ tyOk t = case t of
   TLFun a _ b -> paramOk a >> tyOk b
   TBox a -> tyOk a
   TPair a b -> tyOk a >> tyOk b
+  TData _ as -> mapM_ tyOk as
+  TForall _ _ b -> tyOk b
   _ -> pure ()
 
 paramOk :: Ty -> TC ()
@@ -70,6 +73,7 @@ places env tm = case tm of
   Handle _ b cs -> do
     places (M.map freeze env) b
     forM_ cs $ \(_, _, c) -> places (M.map (const Captured) env) c
+  Cocase _ _ bs -> forM_ bs $ \(_, b) -> places (M.map (const Captured) env) b
   _ -> mapM_ (places env) (children tm)
   where
     enter x t =
@@ -114,7 +118,8 @@ elaborate :: Program -> Program
 elaborate (Program decls main) = evalState (Program <$> mapM decl decls <*> top main) 0
   where
     decl d = case d of
-      Data l n cs -> pure (Data l n [(c, map elabTy fs) | (c, fs) <- cs])
+      Data l n ps cs -> pure (Data l n ps [(c, map elabTy fs) | (c, fs) <- cs])
+      Codata n ps os -> pure (Codata n ps [(o, elabTy ty) | (o, ty) <- os])
       Effect l ops -> pure (Effect l [(op, elabTy a, elabTy r) | (op, a, r) <- ops])
       Def f t e -> Def f (elabTy t) <$> top e
     top e = expr M.empty e (\_ v -> pure v)
@@ -126,6 +131,8 @@ elabTy t = case t of
   TLFun a e b -> arrow TLFun a e b
   TBox a -> TBox (elabTy a)
   TPair a b -> TPair (elabTy a) (elabTy b)
+  TData d as -> TData d (map elabTy as)
+  TForall vs es b -> TForall vs es (elabTy b)
   TRef a -> elabTy a
   TMut a -> elabTy a
   _ -> t
@@ -147,6 +154,8 @@ hasRef t = case t of
   TLFun a _ b -> hasRef a || hasRef b
   TBox a -> hasRef a
   TPair a b -> hasRef a || hasRef b
+  TData _ as -> any hasRef as
+  TForall _ _ b -> hasRef b
   _ -> False
 
 -- | Does the term need elaboration? Terms that don't are core already (up to renaming places).
@@ -188,7 +197,12 @@ expr ps tm k
       Prim op a b -> exprs ps [a, b] $ \ps1 vs -> case vs of
         [va, vb] -> k ps1 (Prim op va vb)
         _ -> error "unreachable"
-      Con c as -> exprs ps as $ \ps1 vs -> k ps1 (Con c vs)
+      Con c tys as -> exprs ps as $ \ps1 vs -> k ps1 (Con c (map elabTy tys) vs)
+      -- Like closures: branches see no outer places.
+      Cocase d tys bs -> do
+        bs' <- mapM (\(o, b) -> (o,) <$> expr M.empty b (\_ v -> pure v)) bs
+        k ps (Cocase d (map elabTy tys) bs')
+      Proj e o -> expr ps e $ \ps1 v -> k ps1 (Proj v o)
       Pair a b -> exprs ps [a, b] $ \ps1 vs -> case vs of
         [va, vb] -> k ps1 (Pair va vb)
         _ -> error "unreachable"
