@@ -1,0 +1,22 @@
+cabal-version: 3.0
+name:          keel-ref
+version:       0.1.0
+synopsis:      Reference type checker and evaluator for Keel Core (spec/core.md)
+build-type:    Simple
+
+common shared
+  default-language: GHC2021
+  ghc-options:      -Wall
+  build-depends:    base, containers
+
+library
+  import:          shared
+  hs-source-dirs:  src
+  exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval
+
+test-suite core
+  import:         shared
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Main.hs
+  build-depends:  keel-ref
