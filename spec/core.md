@@ -5,8 +5,8 @@ the REPL and the compiler. It is built in four stages, each extending the previo
 
 | Stage | Calculus | Adds | Status |
 |---|---|---|---|
-| 1 | λK₁ | Linear types, functions, `data`, `case`, `Box` | **this document** |
-| 2 | λK₂ | Effect rows, tail-resumptive handlers, `Panic`, checked arithmetic | planned |
+| 1 | λK₁ | Linear types, functions, `data`, `case`, `Box` | done |
+| 2 | λK₂ | Effects, tail-resumptive handlers, fixed-width checked arithmetic, `Panic`, `Diverge` | done |
 | 3 | λK₃ | Second-class references `&` / `&mut`, elaborated to state passing | planned |
 | 4 | λK₄ | `codata`, rank-1 polymorphism, monomorphization | planned |
 
@@ -265,3 +265,244 @@ def consume : Token → Int = λ(t:Token). case t of { Token → 1 }
 | `data L = N \| C(Int, L)` | `InfiniteSize` |
 | `case Nil of { Nil → 0 }` | `NonExhaustive` |
 | `1 + true` | `Mismatch` |
+
+---
+
+## 2. λK₂: effects
+
+Stage 2 makes every side effect visible in types. Functions carry the effects their body
+may perform, handlers discharge effects without a runtime, integers get fixed widths with
+checked arithmetic, and recursion becomes the visible effect `Diverge`.
+
+### 2.1 Syntax (additions and changes)
+
+```
+ι ::= i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64     integer types
+ε ::= { l₁, …, lₙ }                                     effects: finite sets of labels
+τ ::= Unit | Bool | ι | τ →ε τ | τ ⊸ε τ | D | Box τ     Int of §1 is now i64
+
+e ::= …
+    | () | n:ι                                          literals carry their type
+    | e ⊕ e                                             ⊕ ∈ { +, -, * } checked, { +%, -%, *% } wrapping,
+                                                        { +|, -|, *| } saturating, { ==, < }
+    | op(e)                                             perform an operation
+    | handle e with l { op₁ x → e₁ ; … ; opₙ x → eₙ }   tail-resumptive handler
+
+decl ::= … | effect l { op₁ : τ ⇒ τ ; … }
+```
+
+`τ → σ` abbreviates `τ →{} σ`, so the stage 1 rules are the special case of empty effects.
+Keel Core is explicitly typed: the surface language infers literal widths and inserts
+annotations.
+
+**Built-in labels:**
+
+| Label | Operations | Handleable | Raised by |
+|---|---|---|---|
+| `IO` | `out : i64 ⇒ Unit` | yes | `out(e)`; at top level, appends to the program's output trace |
+| `Panic` | none | no | checked arithmetic overflow |
+| `Diverge` | none | no | referencing a definition from its own recursive group (§2.4) |
+
+`Panic` is deliberately not handleable inside Keel Core: a panic ends the program, and the
+reset handler of `notes.md` §16 lives in the runtime outside the calculus. A `+?` operator
+returning `Option` waits for polymorphism (stage 4); stage 2 has no explicit `panic` term,
+since it would need usage rules for "consumes any linear variables".
+
+**Design note: effect sets now, rows later.** Koka-style row variables (`⟨l | ρ⟩`) only pay
+off once functions can be polymorphic, which is stage 4. Until then effects are closed sets
+with subsumption (§2.3), and stage 4 adds row variables on top.
+
+### 2.2 Typing
+
+The judgment gains an effect: `Γ ⊢ e : τ ! ε` means evaluating `e` may perform the operations
+of `ε` and no others. Values (variables, literals, λ, constructors of values) have effect `{}`;
+compound terms take the union of their parts. The algorithmic form is
+`Γ ⊢ e ⇒ τ ! ε ▷ U`, with usage U exactly as in §1.3. The new and changed rules:
+
+```
+         Γ, x:τ ⊢ e : σ ! ε     Free(Γ)                  Γ, x:τ ⊢ e : σ ! ε
+ (Lam) ─────────────────────────────────    (LLam) ──────────────────────────────
+         Γ ⊢ λ(x:τ). e : τ →ε σ ! {}                   Γ ⊢ λ°(x:τ). e : τ ⊸ε σ ! {}
+
+         Γ₁ ⊢ e₁ : τ ⇒ε σ ! ε₁    Γ₂ ⊢ e₂ : τ ! ε₂
+ (App) ────────────────────────────────────────────────
+         Γ₁ ⋈ Γ₂ ⊢ e₁ e₂ : σ ! ε₁ ∪ ε₂ ∪ ε
+
+         Γ₁ ⊢ e₁ : ι ! ε₁    Γ₂ ⊢ e₂ : ι ! ε₂
+ (Op)  ───────────────────────────────────────────    π = {Panic} for checked + - *, {} otherwise
+         Γ₁ ⋈ Γ₂ ⊢ e₁ ⊕ e₂ : ι ! ε₁ ∪ ε₂ ∪ π         (result Bool for == <)
+
+         (op : τ ⇒ σ) ∈ l      Γ ⊢ e : τ ! ε
+ (Perform) ──────────────────────────────────
+             Γ ⊢ op(e) : σ ! ε ∪ {l}
+
+         Γ ⊢ e : τ ! ε     l = { opᵢ : τᵢ ⇒ σᵢ }     Free(Γ)     Γ, x:τᵢ ⊢ eᵢ : σᵢ ! εᵢ   (each opᵢ exactly once)
+ (Handle) ────────────────────────────────────────────────────────────────────────────────────────────────
+             Γ ⊢ handle e with l { op₁ x → e₁ ; … } : τ ! (ε ∖ {l}) ∪ ε₁ ∪ … ∪ εₙ
+
+         Γ ⊢ e : τ ! ε     τ <: τ'     ε ⊆ ε'
+ (Sub) ─────────────────────────────────────────
+                  Γ ⊢ e : τ' ! ε'
+```
+
+In (Handle), `Free(Γ)` applies to the clauses only: a clause may run any number of times, so
+like a free λ it can't capture linear variables (`LinearCapture`). The handled expression `e`
+uses the context normally. The clauses' own effects `εᵢ` go to the *enclosing* handlers.
+
+**Definitions and `main`.** A `def` body must have effect `{}`: definitions are evaluated
+once at program start, and in practice they are λs. `main` may leave only the machine-provided
+effects `{IO, Panic, Diverge}` unhandled; anything else is `Unhandled`.
+
+**New errors:** `EffectMismatch` (the types agree except that an effect is missing from a
+signature), `Unhandled`, `NonPositive` (§2.4). Handling an effect with a missing or repeated
+operation is `NonExhaustive`; handling `Panic` or `Diverge` is `Unbound`.
+
+### 2.3 Subtyping
+
+```
+ τ' <: τ    ε ⊆ ε'    σ <: σ'           τ' <: τ    ε ⊆ ε'    σ <: σ'
+ ─────────────────────────────          ─────────────────────────────          τ <: σ
+   τ →ε σ  <:  τ' →ε' σ'                  τ →ε σ  <:  τ' ⊸ε' σ'             ─────────────     τ <: τ
+                                          (also ⊸ <: ⊸)                     Box τ <: Box σ
+```
+
+A function with fewer effects can be used where more are allowed: a pure function can be
+passed to `map`, which accepts `i64 →{Panic} i64`. A free function can be used where a linear
+one is expected, since calling it once is always allowed. This removes stage 1's limitation.
+The checker applies subsumption wherever a type is checked against an expected one
+(arguments, constructor fields, `def` signatures, handler clauses); `case` and `if` branches
+must still have equal types.
+
+### 2.4 Divergence and positivity
+
+`Diverge` is the only way a Keel Core program can fail to terminate, which makes
+"guaranteed to terminate" a property checked from effects (`notes.md` §13).
+
+- **Recursive groups.** Build the reference graph of top-level definitions. The group of `f`
+  is the set of definitions that reach `f` and are reached from it. While checking `f`, a
+  *reference* (not just a call) to any member of its group has effect `{Diverge}`. Counting
+  references rather than calls matters: in `def f = λk. twice f k`, `f` is passed as an
+  argument and called by `twice`, and the reference still marks the loop.
+- **Strict positivity (well-formedness rule 4).** A data type may not occur to the left of an
+  arrow inside its own definition, following other data types transitively. Otherwise
+  `data T = MkT(T → i64)` would allow self-application and a loop with no recursive definition.
+
+Recursion is *marked*, not yet *checked*: a structurally recursive function such as `map`
+still carries `Diverge`. A totality checker that removes `Diverge` from provably terminating
+recursion is future work (`notes.md` §13).
+
+### 2.5 Operational semantics
+
+Evaluation now runs under a **handler stack** `H` (innermost first) and may produce an output
+trace or a panic: `H; ρ ⊢ e ⇓ r` where `r` is a value or `panic`. All stage 1 rules carry `H`
+unchanged, and a `panic` in any premise propagates. Closures run under the stack of their
+*call*, not their creation (deep handlers).
+
+```
+               H' = (l, {opᵢ ↦ xᵢ.eᵢ}, ρ) · H      H'; ρ ⊢ e ⇓ v
+ (Handle)  ─────────────────────────────────────────────────────────
+               H; ρ ⊢ handle e with l { … } ⇓ v
+
+            H; ρ ⊢ e ⇓ v     H = H₁ · (l, C, ρ_c) · H₂     op ∈ C, and no frame of H₁ handles op
+            C(op) = x.e'     H₂; ρ_c, x ↦ v ⊢ e' ⇓ v'
+ (Perform) ─────────────────────────────────────────────────────────────────────────────────────
+            H; ρ ⊢ op(e) ⇓ v'
+
+            H; ρ ⊢ e ⇓ n     no frame of H handles out
+ (Out)     ─────────────────────────────────────────────    appends n to the output trace
+            H; ρ ⊢ out(e) ⇓ ()
+```
+
+The clause runs under `H₂`, the handlers *outside* the one that caught the operation, so a
+clause that performs the same operation reaches the next handler out instead of looping. The
+clause's value *is* the operation's result: there is no continuation to capture, so a handler
+compiles to an ordinary function call (dependency injection). This is what makes mocking
+hardware free: the same driver code runs against a real `MMIO` handler in firmware and a mock
+one in tests (§2.7).
+
+**Arithmetic.** For `ι` with range `[lo, hi]` and exact result `r`:
+- **checked:** `r` if it's in range, else `panic`;
+- **wrapping:** `lo + (r − lo) mod (hi − lo + 1)` (two's complement);
+- **saturating:** `r` clamped to `[lo, hi]`.
+
+### 2.6 Metatheory
+
+**Theorem 1 (type soundness, extended).** A well-typed `main` either evaluates to a value of
+its type, panics, or diverges; it never gets stuck. Every operation it performs is handled by
+an enclosing handler or is `out`.
+
+**Theorem 4 (effect soundness).** If `Γ ⊢ e : τ ! ε` and evaluating `e` performs operation
+`op` of label `l` while no handler inside `e` catches it, then `l ∈ ε`. If evaluation panics,
+`Panic ∈ ε`.
+
+*Sketch.* Induction on the evaluation derivation. (Perform) contributes `{l}`; (Handle) removes
+`l` exactly when its frame catches every `op` of `l` performed by its body (it handles all of
+them by exhaustiveness) and adds the clauses' effects, which run under the outer stack. A
+closure's body effects are latent in its arrow type and are released by (App). Subsumption
+only enlarges ε.
+
+**Theorem 5 (termination).** If `⊢ program`, `· ⊢ main : τ ! ε` and `Diverge ∉ ε`, then
+evaluation of `main` terminates (with a value or a panic).
+
+*Sketch.* Without `Diverge`, every recursive definition the evaluation reaches was entered
+only through references outside its own group, and a definition's body can't re-enter its
+group without a `Diverge` reference, which would put `Diverge` into the effect of the call
+that reaches it. What remains is simply typed λ-calculus with strictly positive data,
+non-recursive `case`, and handlers whose clauses run under strictly smaller stacks. It
+normalizes by a standard reducibility argument (Tait's method), with handler clauses
+interpreted as functions of the outer stack.
+
+**Theorem 2 (linearity), qualified.** Theorem 2 holds for executions that don't panic. A
+panic ends the program with live linear values; that is the intended semantics, since the
+reset handler restarts the system. Handler clauses never hold linear values (rule Handle), so
+running a clause zero or many times can't duplicate or lose one.
+
+### 2.7 Examples
+
+```
+data W = W(i64, i64)
+effect MMIO { read : i64 ⇒ i64 ; write : W ⇒ Unit }
+
+def send : IntList →{MMIO, Diverge} Unit = λ(xs:IntList). case xs of
+  Nil → ()
+  Cons(c, rest) → if read(4) == 1 then let done = write(W(0, c)) in send (unbox rest)
+                  else send (Cons(c, rest))
+
+main = handle send([72, 105]) with MMIO {        -- a mock UART
+  read addr → 1 ;
+  write w → case w of { W(reg, v) → out(v) }
+}
+```
+
+**Accepted:**
+
+| Program | Result |
+|---|---|
+| the mock UART above | `()`, output `[72, 105]` |
+| `handle out(5) with IO { out x → out(x * 10) }` | `()`, output `[50]` (clause reaches the outer handler) |
+| `250:u8 +% 10:u8` | `4:u8` |
+| `100:i8 *% 2:i8` | `-56:i8` |
+| `250:u8 +| 10:u8` | `255:u8` |
+| `-100:i8 -| 100:i8` | `-128:i8` |
+| `250:u8 + 10:u8` | panic |
+| `let a = out(1) in 250:u8 + 10:u8` | panic, output `[1]` |
+| `sum (map double [1,2,3])` with pure `double : i64 → i64` (subsumption) | `12` |
+| `apply1 (λn. n +% 1)` where `apply1 : (i64 ⊸ i64) → i64` | `2` |
+
+All stage 1 examples still hold. Their types now record effects: `inc : i64 →{Panic} i64` and
+`map : (i64 →{Panic} i64) → IntList →{Panic, Diverge} IntList`.
+
+**Rejected:**
+
+| Program | Error |
+|---|---|
+| `main = read(4)` | `Unhandled` |
+| `def bad : i64 → i64 = λn. n + 1` | `EffectMismatch` (Panic missing) |
+| `def loop : i64 → i64 = λn. loop n` | `EffectMismatch` (Diverge missing) |
+| `def f : i64 → i64 = λk. twice f k` | `EffectMismatch` (recursion through an argument) |
+| `data T = MkT(T → i64)` | `NonPositive` |
+| `let t = Token in handle out(1) with IO { out x → let r = consume t in () }` | `LinearCapture` |
+| `handle read(4) with MMIO { read a → 1 }` | `NonExhaustive` |
+| `handle 1 with Panic {}` | `Unbound` |
+| `1:u8 + 1:i64` | `Mismatch` |
+| `300:u8` | `Mismatch` |

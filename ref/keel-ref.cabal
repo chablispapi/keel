@@ -7,7 +7,7 @@ build-type:    Simple
 common shared
   default-language: GHC2021
   ghc-options:      -Wall
-  build-depends:    base, containers
+  build-depends:    base, containers, transformers
 
 library
   import:          shared

@@ -1,14 +1,17 @@
-{-# LANGUAGE BangPatterns #-}
+-- | Call-by-value, environment-based evaluator for Keel Core, stages 1–2
+-- (spec/core.md §1.4, §2.5). Assumes a well-typed program; stuck states are impossible by
+-- Theorem 1.
+module Keel.Eval (Value (..), Outcome (..), evalProgram) where
 
--- | Call-by-value, environment-based evaluator for Keel Core, stage 1 (spec/core.md §1.4).
--- Assumes a well-typed program; stuck states are impossible by Theorem 1.
-module Keel.Eval (Value (..), evalProgram) where
-
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
+import Control.Monad.Trans.State.Strict (State, modify, runState)
 import Data.Map.Strict qualified as M
 import Keel.Syntax
 
 data Value
-  = VInt Integer
+  = VUnit
+  | VInt IntTy Integer
   | VBool Bool
   | VClo Env String Term -- ^ ⟨ρ, x, e⟩, for both λ and λ° (linearity is erased)
   | VCon String [Value]
@@ -18,7 +21,8 @@ type Env = M.Map String Value
 
 instance Show Value where
   show v = case v of
-    VInt n -> show n
+    VUnit -> "()"
+    VInt _ n -> show n
     VBool b -> if b then "true" else "false"
     VClo {} -> "<closure>"
     VCon c [] -> c
@@ -29,63 +33,118 @@ instance Show Value where
 
 -- | Structural equality on first-order values; closures are never equal.
 instance Eq Value where
-  VInt a == VInt b = a == b
+  VUnit == VUnit = True
+  VInt t a == VInt u b = t == u && a == b
   VBool a == VBool b = a == b
   VCon c vs == VCon d ws = c == d && vs == ws
   VBox a == VBox b = a == b
   _ == _ = False
 
-evalProgram :: Program -> Value
-evalProgram (Program decls main) = eval globals main
+-- | How a program ended. A panic stops the whole program (the reset handler of notes.md §16
+-- lives outside Keel Core).
+data Outcome = Done Value | Panicked String
+  deriving (Eq, Show)
+
+-- | Evaluation can panic and appends @out@ values to a trace (kept in reverse).
+type Run = ExceptT String (State [Integer])
+
+-- | A handler frame: operation ↦ (parameter, clause body), and the clause environment.
+data Handler = Handler (M.Map String (String, Term)) Env
+
+-- | Run @main@; returns the outcome and the values written with the built-in @out@ operation.
+evalProgram :: Program -> (Outcome, [Integer])
+evalProgram (Program decls main) = (either Panicked Done r, reverse trace)
   where
-    -- ρ_Σ: the recursive knot of top-level definitions.
-    globals = M.fromList [(f, eval globals e) | Def f _ e <- decls]
+    (r, trace) = runState (runExceptT (eval [] globals main)) []
+    -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
+    globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
+    pureValue m = case runState (runExceptT m) [] of
+      (Right v, []) -> v
+      _ -> stuck "effectful top-level definition"
 
--- | Values are forced before they are bound or stored, so evaluation order is CBV even though
--- the host language is lazy. Only the global knot is left lazy.
-eval :: Env -> Term -> Value
-eval env tm = case tm of
-  Var x -> env M.! x
-  IntLit n -> VInt n
-  BoolLit b -> VBool b
-  Prim op a b ->
-    let !va = eval env a
-        !vb = eval env b
-     in prim op va vb
-  If c a b -> case eval env c of
-    VBool True -> eval env a
-    _ -> eval env b
-  Lam x _ body -> VClo env x body
-  LLam x _ body -> VClo env x body
-  App f a ->
-    let !vf = eval env f
-        !va = eval env a
-     in case vf of
-          VClo cenv x body -> eval (M.insert x va cenv) body
-          _ -> stuck "application of a non-closure"
-  Let x e body ->
-    let !v = eval env e
-     in eval (M.insert x v env) body
-  Con c args ->
-    let vs = map (eval env) args
-     in foldr seq (VCon c vs) vs
-  Case e alts -> case eval env e of
-    VCon c vs
-      | (xs, body) : _ <- [(xs, body) | (c', xs, body) <- alts, c' == c] ->
-          eval (M.union (M.fromList (zip xs vs)) env) body
-    _ -> stuck "case without a matching constructor"
-  Box e -> let !v = eval env e in VBox v
-  Unbox e -> case eval env e of
-    VBox v -> v
-    _ -> stuck "unbox of a non-box"
+-- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
+-- the monad, left to right, before its value is used.
+eval :: [Handler] -> Env -> Term -> Run Value
+eval hs env tm = case tm of
+  Var x -> pure (env M.! x)
+  UnitLit -> pure VUnit
+  IntLit t n -> pure (VInt t n)
+  BoolLit b -> pure (VBool b)
+  Prim op a b -> do
+    va <- eval hs env a
+    vb <- eval hs env b
+    prim op va vb
+  If c a b -> do
+    vc <- eval hs env c
+    case vc of
+      VBool True -> eval hs env a
+      _ -> eval hs env b
+  Lam x _ body -> pure (VClo env x body)
+  LLam x _ body -> pure (VClo env x body)
+  App f a -> do
+    vf <- eval hs env f
+    va <- eval hs env a
+    case vf of
+      -- The body runs under the handlers active at the call (deep handlers).
+      VClo cenv x body -> eval hs (M.insert x va cenv) body
+      _ -> stuck "application of a non-closure"
+  Let x e body -> do
+    v <- eval hs env e
+    eval hs (M.insert x v env) body
+  Con c args -> VCon c <$> mapM (eval hs env) args
+  Case e alts -> do
+    v <- eval hs env e
+    case v of
+      VCon c vs
+        | (xs, body) : _ <- [(xs, body) | (c', xs, body) <- alts, c' == c] ->
+            eval hs (M.union (M.fromList (zip xs vs)) env) body
+      _ -> stuck "case without a matching constructor"
+  Box e -> VBox <$> eval hs env e
+  Unbox e -> do
+    v <- eval hs env e
+    case v of
+      VBox a -> pure a
+      _ -> stuck "unbox of a non-box"
+  Perform op a -> do
+    v <- eval hs env a
+    perform hs op v
+  Handle _ body clauses ->
+    let frame = Handler (M.fromList [(op, (x, e)) | (op, x, e) <- clauses]) env
+     in eval (frame : hs) env body
 
-prim :: Prim -> Value -> Value -> Value
-prim op (VInt a) (VInt b) = case op of
-  Add -> VInt (a + b)
-  Sub -> VInt (a - b)
-  Mul -> VInt (a * b)
-  Eq -> VBool (a == b)
-  Lt -> VBool (a < b)
+-- | Find the innermost handler for @op@ and run its clause with the handlers *outside* it,
+-- so a clause performing the same operation reaches the next handler out. The clause's value
+-- is the operation's result: tail-resumptive, so no continuation is captured.
+perform :: [Handler] -> String -> Value -> Run Value
+perform hs op v = case break handles hs of
+  (_, Handler clauses cenv : outer) | Just (x, body) <- M.lookup op clauses ->
+    eval outer (M.insert x v cenv) body
+  _ -> machine op v
+  where
+    handles (Handler clauses _) = M.member op clauses
+
+-- | Operations no handler caught are performed by the machine.
+machine :: String -> Value -> Run Value
+machine "out" (VInt _ n) = lift (modify (n :)) >> pure VUnit
+machine op _ = stuck ("unhandled operation " ++ op)
+
+prim :: Prim -> Value -> Value -> Run Value
+prim op (VInt t a) (VInt _ b) = case op of
+  Eq -> pure (VBool (a == b))
+  Lt -> pure (VBool (a < b))
+  Arith ov aop ->
+    let r = arith aop a b
+        (lo, hi) = intRange t
+     in if r >= lo && r <= hi
+          then pure (VInt t r)
+          else case ov of
+            Checked -> throwE ("overflow: " ++ show aop ++ " " ++ show a ++ " " ++ show b ++ " in " ++ show t)
+            Wrap -> pure (VInt t (lo + (r - lo) `mod` (hi - lo + 1)))
+            Saturate -> pure (VInt t (max lo (min hi r)))
+  where
+    arith Add = (+)
+    arith Sub = (-)
+    arith Mul = (*)
 prim _ _ _ = stuck "primitive on non-integers"
 
 stuck :: String -> a
