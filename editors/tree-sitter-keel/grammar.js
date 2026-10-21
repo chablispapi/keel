@@ -24,6 +24,7 @@ module.exports = grammar({
       $.boolean,
       $.number,
       $.string,
+      $.character,
       $.builtin_type,
       $.constructor,
       $.effect_variable,
@@ -54,6 +55,7 @@ module.exports = grammar({
       optional(choice(...intTypes)),
     )),
     string: _ => /"([^"\\\n]|\\.)*"/,
+    character: _ => /'([^'\\\n]|\\[^'\n]+)'/,
     comment: _ => token(choice(/--[^\n]*/, /\{-([^-]|-+[^-}])*-+\}/)),
 
     constructor: _ => /[A-Z][A-Za-z0-9_]*/,

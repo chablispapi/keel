@@ -206,13 +206,20 @@ exampleFiles =
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/std/array.kl", (Just "(Cons(Cons(110, box Cons(105, box Cons(108, box Nil))), box Cons(Cons(111, box Cons(110, box Cons(101, box Nil))), box Nil)), 100000)", "4999950000\n9592\nzero\nnil\n"))
+  , ("examples/lexer.kl", (Just "27", "1:1 keyword def\n1:5 ident f\n1:7 sym :\n1:9 ident i64\n1:13 sym ->\n1:15 sym {\n1:16 effvar e\n1:18 sym }\n1:20 ident i64\n1:24 sym =\n1:26 sym \\\n1:27 ident x\n1:28 sym .\n1:30 ident x\n1:32 sym +?\n1:35 num 7936\n1:42 sym ;\n2:1 str \"a\\\"bA\\n\"\n2:14 char 97\n2:18 char 10\n2:23 char 65\n2:47 num 250u8\n2:53 sym ..\n2:56 ident q\n2:57 sym .\n2:58 upper Name\n3:3 error unexpected letter after a number\n"))
   , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
   ]
 
 -- | What an example reads on stdin (none for the rest). QEMU gives it none: there, and in the
 -- evaluator run it is compared with, getc returns -1 straight away.
 exampleInput :: String -> String
-exampleInput name = maybe "" id (lookup name [("examples/words.kl", "the cat\nthe dog\nsat on the cat\n")])
+exampleInput name =
+  maybe "" id $
+    lookup
+      name
+      [ ("examples/words.kl", "the cat\nthe dog\nsat on the cat\n")
+      , ("examples/lexer.kl", "def f : i64 ->{'e} i64 = \\x. x +? 0x1F_00;\n\"a\\\"b\\x41\\n\" 'a' '\\n' '\\65' {- a {- b -} c -} 250u8 .. q.Name -- done\n12ab\n")
+      ]
 
 -- | The evaluator's view of the world for a program: its stdin, and the files on disk that the
 -- examples read (the native binaries open them for real).

@@ -89,6 +89,10 @@
           "named": true
         },
         {
+          "type": "character",
+          "named": true
+        },
+        {
           "type": "constructor",
           "named": true
         },
@@ -218,6 +222,10 @@
   {
     "type": "case",
     "named": false
+  },
+  {
+    "type": "character",
+    "named": true
   },
   {
     "type": "cocase",

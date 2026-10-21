@@ -1,5 +1,6 @@
 (comment) @comment
 (string) @string
+(character) @constant.character
 (number) @constant.numeric.integer
 (boolean) @constant.builtin.boolean
 

@@ -393,9 +393,17 @@ stringLit = do
       where
         n = toInteger (fromEnum c)
 
+-- | @'a'@, @'\\n'@: an ASCII character as a @u8@ (Haskell-style escapes). Only expressions
+-- have them, so @'a@ in a type is still an effect variable.
+charLit :: Parser Term
+charLit = do
+  c <- Tok.charLiteral lexer
+  if fromEnum c < 128 then pure (IntLit u8 (toInteger (fromEnum c))) else fail "a character literal must be ASCII; use a string"
+
 atom :: Parser Term
 atom =
   stringLit
+    <|> charLit
     <|> number
     <|> (reserved "true" $> BoolLit True)
     <|> (reserved "false" $> BoolLit False)

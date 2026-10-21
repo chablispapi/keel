@@ -43,6 +43,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "character"
+        },
+        {
+          "type": "SYMBOL",
           "name": "builtin_type"
         },
         {
@@ -428,6 +432,10 @@
     "string": {
       "type": "PATTERN",
       "value": "\"([^\"\\\\\\n]|\\\\.)*\""
+    },
+    "character": {
+      "type": "PATTERN",
+      "value": "'([^'\\\\\\n]|\\\\[^'\\n]+)'"
     },
     "comment": {
       "type": "TOKEN",

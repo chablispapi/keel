@@ -70,6 +70,7 @@ Arrows associate to the right. Effect variables start with `'`.
 | `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs |
 | `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
 | `"Hi!\n"` | a `List u8` of the string's UTF-8 bytes (Haskell-style escapes) |
+| `'a'`, `'\n'` | an ASCII character as a `u8` (in expressions only; in types `'a` is an effect variable) |
 | `/`, `%` | division truncating toward zero, remainder; panic on division by zero and `min / -1` |
 | `x land y`, `lor`, `lxor`, `lsl`, `lsr` | bitwise and, or, xor, shifts (logical for unsigned types, arithmetic for signed) |
 | `e as u8` | wrapping conversion between integer types |

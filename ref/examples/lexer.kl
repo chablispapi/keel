@@ -1,0 +1,216 @@
+-- A lexer for Keel, written in Keel: the first piece of a self-hosted compiler. It reads a
+-- source file on stdin and prints its tokens, one per line with line and column:
+--
+--   keelc run examples/lexer.kl < examples/fact.kl
+--
+-- The tokens are the ones keelc's parser (ref/src/Keel/Parser.hs) reads. Lexing stops at the
+-- first error. The result is the number of tokens.
+
+import std.string
+
+data Tok =
+    Ident(List u8) | Upper(List u8) | Keyword(List u8) | EffVar(List u8)
+  | Num(u64, List u8) | Char(u8) | Str(List u8) | Sym(List u8) | Error(List u8)
+
+-- A token and where it starts: line and column, both from 1, columns in bytes.
+data Token = At(i64, i64, Tok)
+
+-- An escape after a backslash: the byte, the rest of the input, and how many bytes it took.
+data Escape = Esc(u8, List u8, i64) | BadEscape
+
+def lex : List u8 -> i64 -> i64 ->{Diverge, Panic} List Token =
+  \s line col. case s of
+    { Nil -> Nil
+    | Cons(c, rest) ->
+        let r = unbox rest in
+        if c == '\n' then lex r (line + 1) 1
+        else if string.isSpace c then lex r line (col + 1)
+        else if two '-' '-' c r then lex (dropLine r) line col
+        else if two '{' '-' c r then block (tail r) 1 line (col + 2) line col
+        else if string.isAlpha c then
+          (let (w, more) = span isIdentChar s in
+           let kind = if isKeyword w then Keyword(w) else if isUpper c then Upper(w) else Ident(w) in
+           emit line col kind more (length w))
+        else if two '0' 'x' c r then number 16 0 0 (tail r) line col 2
+        else if string.isDigit c then number 10 0 0 s line col 0
+        else if c == '"' then str r Nil line (col + 1) line col
+        else if c == '\'' then quote r line col
+        else if isOpChar c then (let (w, more) = span isOpChar s in emit line col (Sym(w)) more (length w))
+        else if two '.' '.' c r then emit line col (Sym("..")) (tail r) 2
+        else if isPunct c then emit line col (Sym(Cons(c, box Nil))) r 1
+        else stop line col "unexpected character" }
+
+def emit : i64 -> i64 -> Tok -> List u8 -> i64 ->{Diverge, Panic} List Token =
+  \line col t rest width. Cons(At(line, col, t), box (lex rest line (col + width)))
+
+def stop : i64 -> i64 -> List u8 -> List Token =
+  \line col msg. Cons(At(line, col, Error(msg)), box Nil)
+
+-- {- … -}, nested; (sl, sc) is where it started.
+def block : List u8 -> i64 -> i64 -> i64 -> i64 -> i64 ->{Diverge, Panic} List Token =
+  \s depth line col sl sc. case s of
+    { Nil -> stop sl sc "unterminated comment"
+    | Cons(c, rest) ->
+        let r = unbox rest in
+        if two '-' '}' c r then
+          (if depth == 1 then lex (tail r) line (col + 2) else block (tail r) (depth - 1) line (col + 2) sl sc)
+        else if two '{' '-' c r then block (tail r) (depth + 1) line (col + 2) sl sc
+        else if c == '\n' then block r depth (line + 1) 1 sl sc
+        else block r depth line (col + 1) sl sc }
+
+-- Digits in base 10 or 16, _ between them, then an optional width suffix (250u8). n counts
+-- the digits; width the bytes so far.
+def number : i64 -> u64 -> i64 -> List u8 -> i64 -> i64 -> i64 ->{Diverge, Panic} List Token =
+  \base v n s line col width.
+    let d = digit base s in
+    if d == -2 then number base v n (tail s) line col (width + 1)
+    else if d < 0 then suffix v n s line col width
+    else case v *? (base as u64) of
+      { None -> stop line col "number too large"
+      | Some(m) -> case m +? (d as u64) of
+          { None -> stop line col "number too large"
+          | Some(v2) -> number base v2 (n + 1) (tail s) line col (width + 1) } }
+
+def suffix : u64 -> i64 -> List u8 -> i64 -> i64 -> i64 ->{Diverge, Panic} List Token =
+  \v n s line col width.
+    if n == 0 then stop line col "expected digits"
+    else
+      let (w, more) = span isIdentChar s in
+      case w of
+        { Nil -> emit line col (Num(v, Nil)) more width
+        | Cons(x, xs) ->
+            if member w (string.split ' ' "i8 i16 i32 i64 u8 u16 u32 u64")
+            then emit line col (Num(v, w)) more (width + length w)
+            else stop line (col + width) "unexpected letter after a number" }
+
+-- The value of the first byte as a digit in base, -2 for _, -1 for anything else.
+def digit : i64 -> List u8 ->{Panic} i64 =
+  \base s. case s of
+    { Nil -> -1
+    | Cons(c, rest) ->
+        let v = if string.isDigit c then (c as i64) - 48
+                else if c < 'A' then -1
+                else if c < 'G' then (c as i64) - 55
+                else if c < 'a' then -1
+                else if c < 'g' then (c as i64) - 87
+                else -1 in
+        if c == '_' then -2 else if v < base then v else -1 }
+
+-- A string's bytes after the opening quote, reversed onto acc.
+def str : List u8 -> List u8 -> i64 -> i64 -> i64 -> i64 ->{Diverge, Panic} List Token =
+  \s acc line col sl sc. case s of
+    { Nil -> stop sl sc "unterminated string"
+    | Cons(c, rest) ->
+        let r = unbox rest in
+        if c == '"' then Cons(At(sl, sc, Str(reverse acc)), box (lex r line (col + 1)))
+        else if c == '\n' then stop sl sc "unterminated string"
+        else if c == '\\' then
+          (case escape r of
+            { BadEscape -> stop line col "bad escape"
+            | Esc(b, more, w) -> str more (Cons(b, box acc)) line (col + 1 + w) sl sc })
+        else str r (Cons(c, box acc)) line (col + 1) sl sc }
+
+-- ponytail: \n \t \r \\ \" \' and ASCII codes (\65, \x41); Haskell's \NUL names, \& and
+-- string gaps are left out, and so are codes above 127.
+def escape : List u8 ->{Diverge, Panic} Escape =
+  \s. case s of
+    { Nil -> BadEscape
+    | Cons(c, rest) ->
+        let r = unbox rest in
+        if c == 'n' then Esc('\n', r, 1)
+        else if c == 't' then Esc('\t', r, 1)
+        else if c == 'r' then Esc('\r', r, 1)
+        else if c == '\\' then Esc(c, r, 1)
+        else if c == '"' then Esc(c, r, 1)
+        else if c == '\'' then Esc(c, r, 1)
+        else if string.isDigit c then code 10 0 0 s
+        else if c == 'x' then (case code 16 0 0 r of { BadEscape -> BadEscape | Esc(b, more, w) -> Esc(b, more, w + 1) })
+        else BadEscape }
+
+def code : i64 -> i64 -> i64 -> List u8 ->{Diverge, Panic} Escape =
+  \base v n s.
+    let d = digit base s in
+    if d < 0 then (if n == 0 then BadEscape else Esc(v as u8, s, n))
+    else if 127 < v * base + d then BadEscape
+    else code base (v * base + d) (n + 1) (tail s)
+
+-- After a quote: a character ('a', '\n') or an effect variable ('e).
+def quote : List u8 -> i64 -> i64 ->{Diverge, Panic} List Token =
+  \s line col. case s of
+    { Nil -> stop line col "unexpected '"
+    | Cons(c, rest) ->
+        let r = unbox rest in
+        if c == '\\' then
+          (case escape r of
+            { BadEscape -> stop line col "bad escape"
+            | Esc(b, more, w) ->
+                if starts '\'' more then emit line col (Char(b)) (tail more) (w + 3)
+                else stop line col "unterminated character" })
+        else if starts '\'' r then emit line col (Char(c)) (tail r) 3
+        else if isIdentChar c then (let (w, more) = span isIdentChar s in emit line col (EffVar(w)) more (1 + length w))
+        else stop line col "unexpected '" }
+
+-- Byte helpers -----------------------------------------------------------------------------
+
+def two : u8 -> u8 -> u8 -> List u8 -> Bool = \a b c rest. if c == a then starts b rest else false
+
+def starts : u8 -> List u8 -> Bool = \c s. case s of { Nil -> false | Cons(d, rest) -> c == d }
+
+def tail : List u8 -> List u8 = \s. case s of { Nil -> Nil | Cons(c, rest) -> unbox rest }
+
+def dropLine : List u8 ->{Diverge} List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == '\n' then Cons(c, rest) else dropLine (unbox rest) }
+
+def span : forall 'e. (u8 ->{'e} Bool) -> List u8 ->{'e, Diverge} (List u8, List u8) =
+  \p s. case s of
+    { Nil -> (Nil, Nil)
+    | Cons(c, rest) ->
+        if p c then (let (a, b) = span p (unbox rest) in (Cons(c, box a), b)) else (Nil, Cons(c, rest)) }
+
+def member : List u8 -> List (List u8) ->{Diverge} Bool =
+  \w ws. case ws of { Nil -> false | Cons(k, rest) -> if string.equal w k then true else member w (unbox rest) }
+
+def has : List u8 -> u8 ->{Diverge} Bool =
+  \s c. case s of { Nil -> false | Cons(d, rest) -> if c == d then true else has (unbox rest) c }
+
+def isKeyword : List u8 ->{Diverge} Bool =
+  \w. member w (string.split ' ' "data linear codata effect def main forall let in var if then else case of cocase handle with box unbox true false mut Box Unit Bool Free Lin bitdata land lor lxor lsl lsr as import private")
+
+def isUpper : u8 -> Bool = \c. if c < 'A' then false else c < 91
+
+def isIdentChar : u8 -> Bool = \c. if string.isAlpha c then true else string.isDigit c
+
+def isOpChar : u8 ->{Diverge} Bool = \c. has "-+*=<>&|:%?" c
+
+def isPunct : u8 ->{Diverge} Bool = \c. has "(){}[],;.\\/@" c
+
+-- Printing ---------------------------------------------------------------------------------
+
+def showTok : Tok ->{IO, Diverge, Panic} Unit =
+  \t. case t of
+    { Ident(w) -> print "ident "; print w
+    | Upper(w) -> print "upper "; print w
+    | Keyword(w) -> print "keyword "; print w
+    | EffVar(w) -> print "effvar "; print w
+    | Num(v, w) -> print "num "; printU64 v; print w
+    | Char(c) -> print "char "; printU64 (c as u64)
+    | Str(s) -> print "str \""; quoted s; putc('"')
+    | Sym(w) -> print "sym "; print w
+    | Error(msg) -> print "error "; print msg }
+
+def quoted : List u8 ->{IO, Diverge} Unit =
+  \s. case s of
+    { Nil -> ()
+    | Cons(c, rest) ->
+        (if c == '\n' then print "\\n" else if c == '"' then print "\\\"" else if c == '\\' then print "\\\\" else putc(c));
+        quoted (unbox rest) }
+
+def showAll : List Token -> i64 ->{IO, Diverge, Panic} i64 =
+  \ts n. case ts of
+    { Nil -> n
+    | Cons(t, rest) -> case t of
+        { At(line, col, k) ->
+            printInt line; putc(':'); printInt col; putc(' '); showTok k; putc('\n');
+            showAll (unbox rest) (n + 1) } }
+
+main = showAll (lex (readAll ()) 1 1) 0
