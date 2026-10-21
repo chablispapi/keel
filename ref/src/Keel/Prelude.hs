@@ -2,7 +2,7 @@
 -- may declare any of these names itself; the prelude's version is then left out, together
 -- with prelude definitions that refer to a left-out or redeclared name. Unused definitions
 -- cost nothing: the optimizer removes them.
-module Keel.Prelude (preludeSource, loadProgram, withPrelude) where
+module Keel.Prelude (preludeSource, preludeDecls, loadProgram, withPrelude, declared) where
 
 import Data.Set qualified as S
 import Keel.Parser (parseLibrary, parseProgram)
@@ -48,13 +48,17 @@ preludeSource =
     , "      else printU64 (n as u64)"
     ]
 
--- | Parse a program and add the prelude.
+-- | Parse a single-file program and add the prelude.
 loadProgram :: FilePath -> String -> Either String Program
 loadProgram path src = do
   user <- parseProgram path src
-  lib <- parseLibrary "<prelude>" preludeSource
-  -- Positions in the prelude would be read as positions in the program: drop them.
-  pure (withPrelude (map unlocate lib) user)
+  lib <- preludeDecls
+  pure (withPrelude lib user)
+
+-- | The prelude's declarations, without positions (errors in it are compiler bugs, and its
+-- positions would be read as the program's).
+preludeDecls :: Either String [Decl]
+preludeDecls = map unlocate <$> parseLibrary "<prelude>" preludeSource
   where
     unlocate (Def f t e) = Def f t (stripAt e)
     unlocate d = d

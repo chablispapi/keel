@@ -102,11 +102,15 @@ data Term
   | Borrow String                           -- ^ &x, surface: only as a function argument
   | BorrowMut String                        -- ^ &mut x, surface: only as a function argument
   | BitsLit String [(String, Term)]         -- ^ Status { field = e, … }, bitdata value, front end only
-  | At Pos Term                             -- ^ source position (line, column) of the term; stripped before optimization
+  | At Pos Term                             -- ^ source position of the term; stripped before optimization
   deriving (Eq, Show)
 
--- | A source position: line and column.
-type Pos = (Int, Int)
+-- | A source position: file, line and column.
+type Pos = (FilePath, Int, Int)
+
+-- | A parsed source file: its imports (module name and where), its declarations (with a
+-- @private@ flag), and its @main@ if it has one.
+data Module = Module {modImports :: [(String, Pos)], modDecls :: [(Bool, Decl)], modMain :: Maybe Term}
 
 -- | Remove source positions.
 stripAt :: Term -> Term

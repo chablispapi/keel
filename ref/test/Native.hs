@@ -21,7 +21,7 @@ import Data.Set qualified as S
 import Keel.AArch64 (compileNative)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
-import Keel.Prelude (loadProgram)
+import Keel.Modules (loadModules)
 import Keel.RiscV (compileRiscV)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
@@ -199,14 +199,30 @@ exampleFiles =
   , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", ""))
   , ("examples/reuse.kl", (Just "1500500", ""))
   , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
+  , ("examples/project/src/main.kl", (Just "100", "hello, modules\n42\n"))
   ]
+
+-- | Multi-file programs the module loader must refuse, and part of the message.
+moduleErrors :: [(FilePath, String)]
+moduleErrors =
+  [ ("test/modules/cycle/a.kl", "import cycle: a → b → a")
+  , ("test/modules/dup/main.kl", "shared is declared in both test/modules/dup/x.kl and test/modules/dup/y.kl")
+  , ("test/modules/missing/main.kl", "test/modules/missing/main.kl:1:1: module nowhere not found")
+  ]
+
+checkModuleError :: (FilePath, String) -> IO [String]
+checkModuleError (path, expected) =
+  loadModules path >>= \case
+    Left e | expected `isInfixOf` e -> pure []
+    Left e -> pure ["FAIL " ++ path ++ ": got " ++ show e]
+    Right _ -> pure ["FAIL " ++ path ++ ": loaded"]
 
 -- | Parse and infer an example; check the evaluator against the expected output, and return
 -- the program for the native comparison unless it uses handlers.
 loadExample :: (FilePath, Run) -> IO ([String], [(String, Program)])
 loadExample (path, expected) = do
-  src <- readFile path
-  case loadProgram path src >>= either (Left . show) Right . inferProgram of
+  loaded <- loadModules path
+  case loaded >>= either (Left . show) Right . inferProgram . fst of
     Left e -> pure (["FAIL " ++ path ++ ": " ++ e], [])
     Right core -> case compile core of
       Left e -> pure (["FAIL " ++ path ++ ": " ++ show e], [])
@@ -220,8 +236,9 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
+  modErrs <- concat <$> mapM checkModuleError moduleErrors
   let programs = cases ++ specCases ++ concatMap snd loaded
-  failures <- (concatMap fst loaded ++) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir))
+  failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir))
   let refused =
         [ "FAIL " ++ name ++ ": expected 'not supported yet', got " ++ either id (const "assembly") r
         | (name, p) <- unsupportedCases
@@ -229,7 +246,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ refused
-      total = length programs + length unsupportedCases + length exampleFiles
+      total = length programs + length unsupportedCases + length exampleFiles + length moduleErrors
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-
@@ -272,8 +289,8 @@ runRiscV tools dir i (name, prog) = case (compile prog, compileRiscV prog) of
 firmware :: RiscVTools -> FilePath -> IO [String]
 firmware tools dir = do
   let path = "examples/firmware/hello.kl"
-  src <- readFile path
-  case loadProgram path src >>= either (Left . show) Right . inferProgram >>= compileRiscV of
+  loaded <- loadModules path
+  case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileRiscV of
     Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
     Right asm ->
       buildRiscV tools (dir </> "firmware") asm >>= \case

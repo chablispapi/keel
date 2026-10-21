@@ -1,0 +1,5 @@
+# A Keel project: `keelc run`, `keelc build` and `keelc check` here use these settings.
+name = modules
+main = src/main.kl
+# native, or riscv64 for QEMU's virt board
+target = native

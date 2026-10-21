@@ -1,0 +1,4 @@
+-- Two modules can each have a private helper: private names are local to their module.
+private def helper : i64 -> i64 ->{Panic} i64 = \a b. a + b
+
+def double : i64 ->{Panic} i64 = \n. helper n n

@@ -13,14 +13,14 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval, Keel.Elab, Keel.Mono, Keel.Lower, Keel.AArch64,
-                   Keel.Infer, Keel.Parser, Keel.RiscV, Keel.Toolchain, Keel.Opt, Keel.Prelude
+                   Keel.Infer, Keel.Parser, Keel.RiscV, Keel.Toolchain, Keel.Opt, Keel.Prelude, Keel.Modules
   build-depends:   parsec, directory, filepath, process
 
 executable keelc
   import:         shared
   hs-source-dirs: app
   main-is:        keelc.hs
-  build-depends:  keel-ref, filepath, process
+  build-depends:  keel-ref, directory, filepath, process
 
 test-suite core
   import:         shared

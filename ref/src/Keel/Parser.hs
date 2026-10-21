@@ -8,7 +8,7 @@
 -- > def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
 -- >   \f xs. case xs of { Nil -> Nil | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
 -- > main = ...
-module Keel.Parser (parseProgram, parseLibrary) where
+module Keel.Parser (parseProgram, parseModule, parseLibrary) where
 
 import Data.Char (isUpper)
 import Data.Functor (($>))
@@ -18,8 +18,18 @@ import Text.Parsec hiding (lower, upper)
 import Text.Parsec.String (Parser)
 import Text.Parsec.Token qualified as Tok
 
+-- | A single-file program: no imports, a @main@.
 parseProgram :: FilePath -> String -> Either String Program
-parseProgram path src = either (Left . show) Right (parse (whiteSpace *> program <* eof) path src)
+parseProgram path src = do
+  Module imports decls main <- parseModule path src
+  case (imports, main) of
+    ((m, _) : _, _) -> Left (path ++ ": imports " ++ m ++ ": load it with keelc (the module loader)")
+    (_, Nothing) -> Left (path ++ ": no main")
+    ([], Just m) -> Right (Program (map snd decls) m)
+
+-- | One source file of a multi-file program (see "Keel.Modules").
+parseModule :: FilePath -> String -> Either String Module
+parseModule path src = either (Left . show) Right (parse (whiteSpace *> moduleP <* eof) path src)
 
 -- | Declarations without a @main@ (the prelude).
 parseLibrary :: FilePath -> String -> Either String [Decl]
@@ -43,7 +53,7 @@ lexer =
           [ "data", "linear", "codata", "effect", "def", "main", "forall", "let", "in", "var"
           , "if", "then", "else", "case", "of", "cocase", "handle", "with", "box", "unbox"
           , "true", "false", "mut", "Box", "Unit", "Bool", "Free", "Lin"
-          , "bitdata", "land", "lor", "lxor", "lsl", "lsr", "as"
+          , "bitdata", "land", "lor", "lxor", "lsl", "lsr", "as", "import", "private"
           ]
       , Tok.reservedOpNames = []
       , Tok.caseSensitive = True
@@ -116,12 +126,17 @@ negative e = e
 
 -- Declarations ------------------------------------------------------------------------------
 
-program :: Parser Program
-program = do
-  ds <- many decl
-  reserved "main"
-  op "="
-  Program ds <$> expr
+-- | @import a.b@ lines, then declarations (optionally @private@), then an optional @main@.
+moduleP :: Parser Module
+moduleP = do
+  imports <- many $ do
+    pos <- getPosition
+    reserved "import"
+    name <- sepBy1 lower (op ".")
+    pure (foldr1 (\a b -> a ++ "." ++ b) name, (sourceName pos, sourceLine pos, sourceColumn pos))
+  decls <- many ((,) <$> option False (reserved "private" $> True) <*> decl)
+  main <- optionMaybe (reserved "main" >> op "=" >> expr)
+  pure (Module imports decls main)
 
 decl :: Parser Decl
 decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
@@ -219,7 +234,7 @@ expr = foldr1 Seq <$> sepBy1 opExpr (op ";")
 located :: Parser Term -> Parser Term
 located p = do
   pos <- getPosition
-  At (sourceLine pos, sourceColumn pos) <$> p
+  At (sourceName pos, sourceLine pos, sourceColumn pos) <$> p
 
 opExpr :: Parser Term
 opExpr = located (lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> cmpE)

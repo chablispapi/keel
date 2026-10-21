@@ -1,0 +1,6 @@
+-- Imports are relative to this file's directory: util is src/util.kl,
+-- drivers.console is src/drivers/console.kl.
+import util
+import drivers.console
+
+main = greet "modules"; printInt (double 21); putc(10); double 50

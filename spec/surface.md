@@ -5,14 +5,18 @@ Keel Core needs explicitly (`ref/src/Keel/Infer.hs`), then runs the core pipelin
 `spec/core.md`. Examples are in `ref/examples/`.
 
 ```
-keelc check FILE.kl            type-check; print main's type and effects
-keelc run   FILE.kl            run with the reference evaluator
-keelc asm   FILE.kl            print the ARM64 assembly
-keelc build FILE.kl [-o OUT]   compile to a native executable (via the system cc)
-keelc build --target riscv64 FILE.kl [-o OUT]
-                               freestanding RISC-V image for QEMU's virt board
-keelc qemu  FILE.kl            build for RISC-V and boot it in QEMU
+keelc new NAME                 create a project: NAME/keel.project, NAME/src/main.kl
+keelc check [FILE.kl]          type-check; print main's type and effects
+keelc run   [FILE.kl]          run with the reference evaluator
+keelc asm   [FILE.kl]          print the ARM64 assembly
+keelc build [FILE.kl] [-o OUT] [--target native|riscv64]
+                               native executable (via the system cc), or a freestanding
+                               RISC-V image for QEMU's virt board
+keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
 ```
+
+Without a file, the commands use the project in the current directory (see "Projects and
+modules" below).
 
 The RISC-V target needs Homebrew's `llvm`, `lld` and `qemu`. It is freestanding: no operating
 system and no C library. Output goes through the board's 16550 UART, and the program exits
@@ -75,6 +79,38 @@ Precedence, loosest first: `;`, then `λ` / `let` / `var` / `if` / `handle` / `:
 extend as far as possible), then `==` `<`, then `+ -` (all variants), then `*` and the bitwise
 operators, then `as`, then application, then `.obs` and `[types]`. A `-` directly before a number at the start of an
 operand is a negative literal; `n -1` still means `n - 1`.
+
+## Projects and modules
+
+**Modules.** One file is one module. A file starts with its imports:
+
+```
+import util               -- util.kl
+import drivers.console    -- drivers/console.kl
+```
+
+Paths are relative to the entry file's directory, and imports load transitively. Imported
+declarations are visible by their plain names. A declaration marked `private` is visible only in
+its own file: private names are renamed per module, so two modules can each have a
+`private def helper`. Only the entry file may define `main`. The loader reports import cycles
+(`import cycle: a → b → a`), missing modules (with the position of the `import`), and a public
+name declared by two modules (naming both files). Errors anywhere name the right file.
+
+There are no namespaces yet: public names share one scope, so they must be unique across a
+program. Qualified names (`console.greet`) need a syntax that doesn't collide with observations
+(`e.obs`).
+
+**Projects.** `keelc new NAME` creates a directory with a manifest, a `src/main.kl` and a
+`.gitignore`. The manifest, `keel.project`, has `key = value` lines:
+
+```
+name = modules           # output: build/modules
+main = src/main.kl       # the entry file
+target = native          # or riscv64
+```
+
+In a project directory, `keelc run`, `keelc check`, `keelc build` and `keelc qemu` need no file
+argument. `ref/examples/project/` is an example with nested modules and private helpers.
 
 ## The prelude
 

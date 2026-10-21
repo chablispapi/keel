@@ -9,7 +9,6 @@ import Keel.Eval
 import Keel.Infer (inferProgram)
 import Keel.Mono
 import Keel.Parser (parseProgram)
-import Keel.Syntax (Pos)
 import System.Exit (exitFailure)
 
 -- Runner --------------------------------------------------------------------------------
@@ -27,7 +26,7 @@ main = do
       Left e -> [failMsg name ("parse error: " ++ e)]
       Right surface -> case inferProgram surface >>= compile of
         Left (TypeError k' _ pos')
-          | k' == k && pos' == Just pos -> []
+          | k' == k && fmap (\(_, l, c) -> (l, c)) pos' == Just pos -> []
           | otherwise -> [failMsg name ("got " ++ show k' ++ " at " ++ show pos' ++ ", expected " ++ show k ++ " at " ++ show pos)]
         Right _ -> [failMsg name "accepted"]
     run (name, prog, expect) = case (compile prog, expect) of
@@ -48,7 +47,7 @@ main = do
 render :: [Integer] -> String
 render = concatMap (\n -> show n ++ "\n")
 
-positionCases :: [(String, String, ErrKind, Pos)]
+positionCases :: [(String, String, ErrKind, (Int, Int))]
 positionCases =
   [ ( "position: linear value used twice"
     , unlines

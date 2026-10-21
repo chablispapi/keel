@@ -1,0 +1,2 @@
+import a
+def f : i64 -> i64 = \n. n
