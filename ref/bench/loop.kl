@@ -1,0 +1,3 @@
+-- A tail-recursive loop with two parameters: 200 million iterations.
+def loop : i64 -> i64 ->{Panic, Diverge} i64 = \i acc. if i < 1 then acc else loop (i - 1) (acc + i)
+main = loop 200000000 0

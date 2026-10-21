@@ -1,0 +1,24 @@
+-- Insertion sort of 3,000 elements with an explicit Ord dictionary (about 4.5 million steps).
+data List a = Nil | Cons(a, Box (List a))
+codata Ord a { lt : a -> a -> Bool }
+
+def insert : forall (a : Free). Ord a -> a -> List a ->{Diverge} List a =
+  \o x xs. case xs of
+    { Nil -> Cons(x, box Nil)
+    | Cons(y, rest) ->
+        if o.lt x y then Cons(x, box Cons(y, rest))
+        else Cons(y, box (insert o x (unbox rest))) }
+
+def sort : forall (a : Free). Ord a -> List a ->{Diverge} List a =
+  \o xs. case xs of { Nil -> Nil | Cons(y, rest) -> insert o y (sort o (unbox rest)) }
+
+def range : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \n acc. if n < 1 then acc else range (n - 1) (Cons(n, box acc))
+
+def sum : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> x + sum (unbox rest) }
+
+def ascending : Ord i64 = cocase Ord { lt -> \p q. p < q }
+def descending : Ord i64 = cocase Ord { lt -> \p q. q < p }
+
+main = sum (sort ascending (sort descending (range 3000 Nil)))

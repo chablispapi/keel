@@ -10,12 +10,12 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, emitProgram, prepare, bound, printerTypes, dataOf, header, heapSize, maxSmall) where
+module Keel.AArch64 (compileNative, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.List (nub)
+import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as M
 import Keel.Check (checkProgram)
 import Keel.Lower
@@ -110,21 +110,42 @@ emitProgram decls mainTy (LProg funs statics mainF) = unlines (reverse (gsLines 
 
 -- Functions -------------------------------------------------------------------------------
 
--- | A function with its stack frame: one 8-byte slot per variable.
+-- | Register allocation (M4): the most-used variables of a function each get their own
+-- callee-saved register for the whole function; the rest live in 8-byte stack slots. Every
+-- callee preserves these registers (Keel functions save what they use; the runtime and the C
+-- library never touch them), so values survive calls. Returns the locations and the
+-- (register, save offset) pairs; the save area follows the slots.
+allocate :: [String] -> Fun -> [String] -> (M.Map String Loc, [(String, Int)], Int)
+allocate calleeSaved (Fun _ params _ env _ _ body) vars0 =
+  (M.fromList ([(v, InReg r) | (v, r) <- inRegs] ++ zip spilled (map InSlot [0 ..])), saved, frame)
+  where
+    vars = nub vars0
+    counts = M.fromListWith (+) [(v, 1 :: Int) | v <- uses body ++ params ++ env]
+    inRegs = zip (sortOn (\v -> negate (M.findWithDefault 0 v counts)) vars) calleeSaved
+    spilled = [v | v <- vars, v `notElem` map fst inRegs]
+    saved = [(r, 8 * (length spilled + i)) | (i, (_, r)) <- zip [0 ..] inRegs]
+    frame = 16 * ((8 * (length spilled + length inRegs) + 15) `div` 16)
+
+data Loc = InReg String | InSlot Int
+
+-- | A function's frame: where each variable lives and which registers to restore.
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)]}
+
 emitFun :: String -> Fun -> G ()
-emitFun lbl (Fun name x base env envPtrs dropsSelf body) = do
-  let vars = nub (x : env ++ bound body)
-      slots = M.fromList (zip vars [0 :: Int ..])
-      frame = 16 * ((8 * length vars + 15) `div` 16)
+emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
+  when (length params > 7) $ error "more than 7 parameters"
+  let (locs, saved, frame) = allocate ["x" ++ show r | r <- [19 .. 28 :: Int]] f (params ++ env ++ bound body)
+      slots = Slots locs saved
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t// " ++ name)
   ins "stp x29, x30, [sp, #-16]!"
   ins "mov x29, sp"
   when (frame > 0) $ subSp frame
+  forM_ saved $ \(r, off) -> ins ("str " ++ r ++ ", [sp, #" ++ show off ++ "]")
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ldr x9, [x0, #" ++ show (8 * j) ++ "]")
     store slots "x9" v
-  store slots "x1" x
+  forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("x" ++ show r) p
   -- Own the captured pointers, then release the block (x0 is still the block: dup uses x16/x17).
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "bl _keel_drop"
@@ -138,6 +159,41 @@ subSp n
 epilogue :: G ()
 epilogue = ins "mov sp, x29" >> ins "ldp x29, x30, [sp], #16"
 
+-- | Leave a Keel function: restore its callee-saved registers, then the frame.
+leave :: Slots -> G ()
+leave slots = do
+  forM_ (fSaved slots) $ \(r, off) -> ins ("ldr " ++ r ++ ", [sp, #" ++ show off ++ "]")
+  epilogue
+
+-- | Every occurrence of a variable in a body (for ranking variables by use).
+uses :: Expr -> [String]
+uses e = case e of
+  Ret a -> av a
+  Bind x rhs rest -> x : rhsVars rhs ++ uses rest
+  BindIf x c a b rest -> x : av c ++ uses a ++ uses b ++ uses rest
+  BindCase x s bs rest -> x : av s ++ concat [uses b | (_, _, b) <- bs] ++ uses rest
+  Dup v rest -> v : uses rest
+  Drop v rest -> v : uses rest
+  DropReuse v t rest -> v : t : uses rest
+  where
+    av (AVar v) = [v]
+    av _ = []
+    rhsVars rhs = case rhs of
+      RAtom a -> av a
+      RPrim _ _ a b -> av a ++ av b
+      RCall f a -> av f ++ av a
+      RCallKnown _ as -> concatMap av as
+      RClosure _ fvs _ -> fvs
+      RCodata _ fvs _ -> fvs
+      RProj a _ -> av a
+      RAlloc _ _ as -> concatMap av as
+      RAllocAt t _ _ as -> t : concatMap av as
+      RField a _ -> av a
+      RPushHandler cs _ -> concatMap (av . snd) cs
+      RPopHandler a -> av a
+      RPerform _ a -> av a
+      RConv _ a -> av a
+
 -- | Variables bound in a body.
 bound :: Expr -> [String]
 bound e = case e of
@@ -149,14 +205,13 @@ bound e = case e of
   Drop _ rest -> bound rest
   DropReuse _ tok rest -> tok : bound rest
 
-type Slots = M.Map String Int
-
-slotOf :: Slots -> String -> String
-slotOf slots v = "[sp, #" ++ show (8 * slots M.! v) ++ "]"
-
 store, load' :: Slots -> String -> String -> G ()
-store slots r v = ins ("str " ++ r ++ ", " ++ slotOf slots v)
-load' slots r v = ins ("ldr " ++ r ++ ", " ++ slotOf slots v)
+store slots r v = case fLocs slots M.! v of
+  InReg x -> unless (x == r) $ ins ("mov " ++ x ++ ", " ++ r)
+  InSlot i -> ins ("str " ++ r ++ ", [sp, #" ++ show (8 * i) ++ "]")
+load' slots r v = case fLocs slots M.! v of
+  InReg x -> unless (x == r) $ ins ("mov " ++ r ++ ", " ++ x)
+  InSlot i -> ins ("ldr " ++ r ++ ", [sp, #" ++ show (8 * i) ++ "]")
 
 atom :: Slots -> String -> Atom -> G ()
 atom slots r a = case a of
@@ -201,7 +256,7 @@ expr slots join e = case e of
   Ret a -> do
     atom slots "x0" a
     case join of
-      Nothing -> epilogue >> ins "ret"
+      Nothing -> leave slots >> ins "ret"
       Just (v, lbl) -> store slots "x0" v >> ins ("b " ++ lbl)
   Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> tc
   Bind x rhs rest -> do
@@ -261,20 +316,21 @@ expr slots join e = case e of
         atom slots "x0" f
         atom slots "x1" a
         ins "ldr x16, [x0]"
-        epilogue
+        leave slots
         ins "br x16"
-      RCallKnown i a -> Just $ do
-        address "x0" ("_kc_" ++ show i)
-        atom slots "x1" a
-        epilogue
+      RCallKnown i as -> Just $ do
+        args as
+        leave slots
         ins ("b _kf_" ++ show i)
       RProj a i -> Just $ do
         atom slots "x0" a
         ins "mov x1, #0"
         ins ("ldr x16, [x0, #" ++ show (8 * i) ++ "]")
-        epilogue
+        leave slots
         ins "br x16"
       _ -> Nothing
+
+    args as = forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
 
 -- | Allocate a block of @n@ payload words with a pointer map into x0 (header written).
 -- The runtime allocator clobbers only x0, x1 and x13–x16.
@@ -305,9 +361,8 @@ rhsCode slots rhs = case rhs of
     atom slots "x1" a
     ins "ldr x16, [x0]"
     ins "blr x16"
-  RCallKnown i a -> do
-    address "x0" ("_kc_" ++ show i)
-    atom slots "x1" a
+  RCallKnown i as -> do
+    forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
     ins ("bl _kf_" ++ show i)
   RClosure i fvs bm -> do
     alloc (1 + length fvs) bm

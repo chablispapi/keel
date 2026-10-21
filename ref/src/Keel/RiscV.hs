@@ -13,9 +13,8 @@ module Keel.RiscV (compileRiscV, linkerScript) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
-import Data.List (nub)
 import Data.Map.Strict qualified as M
-import Keel.AArch64 (bound, dataOf, header, heapSize, maxSmall, prepare, printerTypes)
+import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, maxSmall, prepare, printerTypes)
 import Keel.Lower
 import Keel.Syntax
 
@@ -153,13 +152,14 @@ emitProgram decls mainTy (LProg funs statics mainF) = case gsErr final of
 
 -- Functions -------------------------------------------------------------------------------
 
-type Slots = M.Map String Int
+-- | A function's frame: where each variable lives and which registers to restore
+-- (register allocation as in "Keel.AArch64", with s1–s11).
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)]}
 
 emitFun :: String -> Fun -> G ()
-emitFun lbl (Fun name x base env envPtrs dropsSelf body) = do
-  let vars = nub (x : env ++ bound body)
-      slots = M.fromList (zip vars [0 :: Int ..])
-      frame = 16 * ((8 * length vars + 15) `div` 16)
+emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
+  let (locs, saved, frame) = allocate ["s" ++ show r | r <- [1 .. 11 :: Int]] f (params ++ env ++ bound body)
+      slots = Slots locs saved
   when (frame > 2032) $ failG ("function " ++ name ++ " has too many variables for the RISC-V back end")
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t# " ++ name)
@@ -168,13 +168,20 @@ emitFun lbl (Fun name x base env envPtrs dropsSelf body) = do
   ins "sd s0, 0(sp)"
   ins "mv s0, sp"
   when (frame > 0) $ ins ("addi sp, sp, -" ++ show frame)
+  forM_ saved $ \(r, off) -> ins ("sd " ++ r ++ ", " ++ show off ++ "(sp)")
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ld t0, " ++ show (8 * j) ++ "(a0)")
     store slots "t0" v
-  store slots "a1" x
+  forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("a" ++ show r) p
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "call _keel_drop"
   expr slots Nothing body
+
+-- | Leave a Keel function: restore its callee-saved registers, then the frame.
+leave :: Slots -> G ()
+leave slots = do
+  forM_ (fSaved slots) $ \(r, off) -> ins ("ld " ++ r ++ ", " ++ show off ++ "(sp)")
+  epilogue
 
 epilogue :: G ()
 epilogue = do
@@ -183,12 +190,13 @@ epilogue = do
   ins "ld s0, 0(sp)"
   ins "addi sp, sp, 16"
 
-slotOf :: Slots -> String -> String
-slotOf slots v = show (8 * slots M.! v) ++ "(sp)"
-
 store, load' :: Slots -> String -> String -> G ()
-store slots r v = ins ("sd " ++ r ++ ", " ++ slotOf slots v)
-load' slots r v = ins ("ld " ++ r ++ ", " ++ slotOf slots v)
+store slots r v = case fLocs slots M.! v of
+  InReg x -> unless (x == r) $ ins ("mv " ++ x ++ ", " ++ r)
+  InSlot i -> ins ("sd " ++ r ++ ", " ++ show (8 * i) ++ "(sp)")
+load' slots r v = case fLocs slots M.! v of
+  InReg x -> unless (x == r) $ ins ("mv " ++ r ++ ", " ++ x)
+  InSlot i -> ins ("ld " ++ r ++ ", " ++ show (8 * i) ++ "(sp)")
 
 atom :: Slots -> String -> Atom -> G ()
 atom slots r a = case a of
@@ -214,7 +222,7 @@ expr slots join e = case e of
   Ret a -> do
     atom slots "a0" a
     case join of
-      Nothing -> epilogue >> ins "ret"
+      Nothing -> leave slots >> ins "ret"
       Just (v, lbl) -> store slots "a0" v >> ins ("j " ++ lbl)
   Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> tc
   Bind x rhs rest -> do
@@ -272,18 +280,17 @@ expr slots join e = case e of
         atom slots "a0" f
         atom slots "a1" a
         ins "ld t6, 0(a0)"
-        epilogue
+        leave slots
         ins "jr t6"
-      RCallKnown i a -> Just $ do
-        ins ("la a0, _kc_" ++ show i)
-        atom slots "a1" a
-        epilogue
+      RCallKnown i as -> Just $ do
+        forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
+        leave slots
         ins ("tail _kf_" ++ show i)
       RProj a i -> Just $ do
         atom slots "a0" a
         ins "li a1, 0"
         ins ("ld t6, " ++ show (8 * i) ++ "(a0)")
-        epilogue
+        leave slots
         ins "jr t6"
       _ -> Nothing
 
@@ -310,9 +317,8 @@ rhsCode slots rhs = case rhs of
     atom slots "a1" a
     ins "ld t6, 0(a0)"
     ins "jalr t6"
-  RCallKnown i a -> do
-    ins ("la a0, _kc_" ++ show i)
-    atom slots "a1" a
+  RCallKnown i as -> do
+    forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
     ins ("call _kf_" ++ show i)
   RClosure i fvs bm -> do
     alloc (1 + length fvs) bm

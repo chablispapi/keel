@@ -1,0 +1,4 @@
+-- Allocation and freeing: a pair per iteration, 10 million times.
+def churn : i64 -> i64 ->{Panic, Diverge} i64 =
+  \i acc. if i < 1 then acc else let (p, q) = (i, acc) in churn (p - 1) (q + 1)
+main = churn 10000000 0

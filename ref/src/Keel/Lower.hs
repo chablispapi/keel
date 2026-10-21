@@ -13,7 +13,7 @@
 module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (foldM, forM)
+import Control.Monad (foldM, forM, forM_)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (State, StateT, evalState, get, modify, put, runStateT)
 import Data.Bits (setBit)
@@ -35,7 +35,7 @@ data Rhs
   = RAtom Atom
   | RPrim Prim IntTy Atom Atom          -- ^ arithmetic or comparison at an integer type
   | RCall Atom Atom                     -- ^ call an unknown closure (consumes both)
-  | RCallKnown Int Atom                 -- ^ direct call to top-level function i
+  | RCallKnown Int [Atom]               -- ^ direct call to function i with all its arguments
   | RClosure Int [String] Integer       -- ^ allocate a closure for function i
   | RCodata [Int] [String] Integer      -- ^ allocate a codata value: one function per observation
   | RProj Atom Int                      -- ^ observe: call the i-th function of a codata value
@@ -58,12 +58,14 @@ data Expr
   | DropReuse String String Expr              -- ^ drop, keeping the block as a reuse token if unique
   deriving (Show)
 
--- | A closure-converted function, called with its block in x0 (which it owns, and drops after
--- taking its captured values) and one argument in x1 (owned). Captured values start at word
--- @funEnvBase@ of the block; @funEnvPtrs@ are the captured pointers, duplicated on entry.
+-- | A closure-converted function, called with its block in x0 and its arguments (owned) in
+-- x1, x2, …: one for closures, several for the uncurried entry points of top-level
+-- definitions. A function with @funDropsSelf@ owns its block and drops it after taking the
+-- captured values, which start at word @funEnvBase@; @funEnvPtrs@ are the captured pointers,
+-- duplicated on entry.
 data Fun = Fun
   { funName :: String
-  , funParam :: String
+  , funParams :: [String]
   , funEnvBase :: Int
   , funEnv :: [String]
   , funEnvPtrs :: [String]
@@ -82,6 +84,7 @@ data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], 
 data Info = Info
   { iGlobals :: M.Map String (Int, Ty)
   , iKnown :: S.Set String                        -- ^ top-level λs: callable directly
+  , iUncurried :: M.Map String (Int, Int)         -- ^ multi-parameter definitions: (function, arity)
   , iCons :: M.Map String (Integer, String, [Ty]) -- ^ constructor ↦ (tag, data name, field types)
   , iParams :: M.Map String [String]              -- ^ data / codata name ↦ parameters
   , iObs :: M.Map String [(String, Ty)]           -- ^ codata name ↦ observations in order
@@ -142,15 +145,26 @@ lower (Program userDecls main) = do
         Info
           { iGlobals = M.fromList [(f, (i, t)) | (i, (f, t, _)) <- zip [0 ..] defs]
           , iKnown = S.fromList [f | (f, _, e) <- defs, isLam e]
+          , iUncurried = M.fromList [(f, (i, length ps)) | (i, (f, ps, _)) <- uncurried]
           , iCons = M.fromList [(c, (tag, d, fs)) | Data _ d _ cs <- decls, (tag, (c, fs)) <- zip [0 ..] cs]
           , iParams = M.fromList ([(d, ps) | Data _ d ps _ <- decls] ++ [(d, ps) | Codata d ps _ <- decls])
           , iObs = M.fromList [(d, os) | Codata d _ os <- decls]
           , iOps = M.fromList [(op, (n, a, r)) | (n, (op, a, r)) <- zip [0 ..] allOps]
           }
       allOps = concat (map snd builtinEffects) ++ [o | Effect _ os <- decls, o <- os]
+      -- Definitions taking several parameters (λx y. …) also get an uncurried entry point,
+      -- numbered right after the definitions, so full applications need no closures.
+      uncurried =
+        zip [length defs ..] [(f, ps, b) | (f, _, e) <- defs, let (ps, b) = lams e, length ps >= 2]
   ((statics, mainF), s) <-
     runStateT
       ( do
+          -- Reserve the uncurried functions' numbers before anything is lifted.
+          modify (\st -> st {lsFuns = M.fromList [(i, Fun f [] 1 [] [] False (Ret (AInt 0))) | (i, (f, _, _)) <- uncurried]})
+          forM_ uncurried $ \(i, (f, ps, b)) -> do
+            ps' <- mapM (uncurry newVar) ps
+            body <- expr info (M.fromList (zip (map fst ps) (zip ps' (map snd ps)))) b (pure . Ret)
+            modify (\st -> st {lsFuns = M.insert i (Fun (f ++ "/" ++ show (length ps)) ps' 1 [] [] False body) (lsFuns st)})
           statics <- forM (zip [0 ..] defs) $ \(i, (f, _, e)) -> case e of
             Lam x t b -> topLam info i f x t b
             LLam x t b -> topLam info i f x t b
@@ -159,11 +173,11 @@ lower (Program userDecls main) = do
               let obs = M.findWithDefault [] d (iObs info)
               is <- forM obs $ \(o, _) -> do
                 body <- expr info M.empty (fromMaybe UnitLit (lookup o bs)) (pure . Ret)
-                liftFun info (Fun (f ++ "." ++ o) "%self" (length obs) [] [] True body)
+                liftFun info (Fun (f ++ "." ++ o) ["%self"] (length obs) [] [] True body)
               pure (i, f, is)
             _ -> unsupported ("top-level definition " ++ f ++ " that is neither a λ nor a cocase")
           m <- expr info M.empty main (pure . Ret)
-          pure (statics, Fun "main" "%unused" 1 [] [] False m)
+          pure (statics, Fun "main" [] 1 [] [] False m)
       )
       (LS 0 M.empty S.empty)
   let ptrs = lsPtrs s
@@ -174,12 +188,27 @@ lower (Program userDecls main) = do
       LLam {} -> True
       _ -> False
 
+-- | The leading parameters of a definition (at most 7: they are passed in registers).
+lams :: Term -> ([(String, Ty)], Term)
+lams = go []
+  where
+    go ps tm | length ps == 7 = (reverse ps, tm)
+    go ps (Lam x t b) = go ((x, t) : ps) b
+    go ps (LLam x t b) = go ((x, t) : ps) b
+    go ps tm = (reverse ps, tm)
+
+-- | The head of an application and its arguments in order.
+spine :: Term -> (Term, [Term])
+spine (App f a) = let (h, as) = spine f in (h, as ++ [a])
+spine t = (t, [])
+
 -- | A top-level λ keeps its definition's index; its static block is its closure.
 topLam :: Info -> Int -> String -> String -> Ty -> Term -> M (Int, String, [Int])
 topLam info i f x t b = do
   x' <- newVar x t
   body <- expr info (M.singleton x (x', t)) b (pure . Ret)
-  modify (\s -> s {lsFuns = M.insert i (Fun f x' 1 [] [] True body) (lsFuns s)})
+  -- Its block is static, so it never drops it.
+  modify (\s -> s {lsFuns = M.insert i (Fun f [x'] 1 [] [] False body) (lsFuns s)})
   pure (i, f, [i])
 
 -- | Locals in scope: source name ↦ (IR name, type).
@@ -209,11 +238,18 @@ expr info env tm k = case tm of
     BindIf x vc ea eb <$> k (AVar x)
   Lam x t b -> closure x t b k
   LLam x t b -> closure x t b k
+  -- f a₁ … aₙ with all of a multi-parameter definition's arguments: one direct call.
+  App _ _
+    | (Var g, args) <- spine tm
+    , not (M.member g env)
+    , Just (i, n) <- M.lookup g (iUncurried info)
+    , length args == n ->
+        subs args $ \vs -> bindRhs (RCallKnown i vs)
   App (Var g) a
     | Just (i, _) <- M.lookup g (iGlobals info)
     , g `S.member` iKnown info
     , not (M.member g env) ->
-        sub a $ \va -> bindRhs (RCallKnown i va)
+        sub a $ \va -> bindRhs (RCallKnown i [va])
   App f a -> sub f $ \vf -> sub a $ \va -> bindRhs (RCall vf va)
   Con c _ args -> do
     (tag, _, _) <- con c
@@ -255,7 +291,7 @@ expr info env tm k = case tm of
         envB = M.fromList [(v, (ir, t)) | (v, ir, t) <- captured]
     is <- forM (zip obs ordered) $ \((o, _), e) -> do
       body <- expr info envB e (pure . Ret)
-      liftFun info (Fun (d ++ "." ++ o) "%self" base fvs (ptrsOf captured) True body)
+      liftFun info (Fun (d ++ "." ++ o) ["%self"] base fvs (ptrsOf captured) True body)
     bm <- bitmap base [isPtr t | (_, _, t) <- captured]
     bindRhs (RCodata is fvs bm)
   Proj e o -> sub e $ \ve -> case typeOf info env e of
@@ -303,7 +339,7 @@ expr info env tm k = case tm of
       x' <- newVar x t
       let env' = M.insert x (x', t) (M.fromList [(v, (ir, vt)) | (v, ir, vt) <- captured])
       body <- expr info env' b (pure . Ret)
-      i <- liftFun info (Fun ("λ" ++ x) x' 1 fvs (ptrsOf captured) True body)
+      i <- liftFun info (Fun ("λ" ++ x) [x'] 1 fvs (ptrsOf captured) True body)
       bm <- bitmap 1 [isPtr vt | (_, _, vt) <- captured]
       c <- newVar "clo" (TFun t S.empty TUnit)
       Bind c (RClosure i fvs bm) <$> kk (AVar c)
@@ -378,7 +414,7 @@ refcount :: S.Set String -> Fun -> Fun
 refcount ptrs f = f {funBody = evalState (go owned0 S.empty M.empty (funBody f)) 0}
   where
     isP v = v `S.member` ptrs
-    owned0 = S.fromList (filter isP (funParam f : funEnvPtrs f))
+    owned0 = S.fromList (filter isP (funParams f ++ funEnvPtrs f))
 
     go :: S.Set String -> S.Set String -> M.Map String Int -> Expr -> State Int Expr
     go scope keep reuse e = case e of
@@ -455,7 +491,7 @@ consumed :: Rhs -> [String]
 consumed rhs = case rhs of
   RAtom a -> atomVars a
   RCall f a -> atomVars f ++ atomVars a
-  RCallKnown _ a -> atomVars a
+  RCallKnown _ as -> concatMap atomVars as
   RClosure _ fvs _ -> fvs
   RCodata _ fvs _ -> fvs
   RProj a _ -> atomVars a
