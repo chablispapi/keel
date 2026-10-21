@@ -59,9 +59,11 @@ Arrows associate to the right. Effect variables start with `'`.
 | `case e of { Nil -> a \| Cons(x, rest) -> b }` | pattern matching |
 | `cocase Ord { lt -> \p q. p < q }`, `e.lt` | codata value, observation |
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |
-| `read(4)`, `out(x)` | performing an operation |
+| `read8(4)`, `out(x)`, `putc(c)` | performing an operation (`out` prints a number and a newline, `putc` one byte) |
 | `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs |
 | `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
+| `"Hi!\n"` | a `List u8` of the string's UTF-8 bytes (Haskell-style escapes) |
+| `/`, `%` | division truncating toward zero, remainder; panic on division by zero and `min / -1` |
 | `x land y`, `lor`, `lxor`, `lsl`, `lsr` | bitwise and, or, xor, shifts (logical for unsigned types, arithmetic for signed) |
 | `e as u8` | wrapping conversion between integer types |
 | `s.thr_empty`, `s.raw`, `LineStatus(x)`, `LineStatus { thr_empty = 1 }` | bitdata field, raw value, from raw, from fields |
@@ -73,6 +75,38 @@ Precedence, loosest first: `;`, then `λ` / `let` / `var` / `if` / `handle` / `:
 extend as far as possible), then `==` `<`, then `+ -` (all variants), then `*` and the bitwise
 operators, then `as`, then application, then `.obs` and `[types]`. A `-` directly before a number at the start of an
 operand is a negative literal; `n -1` still means `n - 1`.
+
+## The prelude
+
+Every program starts with the declarations in `ref/src/Keel/Prelude.hs`, written in Keel:
+
+| Name | What it is |
+|---|---|
+| `List a` | `Nil \| Cons(a, Box (List a))`; string literals are `List u8` |
+| `map`, `foldl` | the usual, effect-polymorphic in the function argument |
+| `length`, `append`, `reverse` | list utilities |
+| `print`, `println` | print a `List u8` (`println` adds a newline) |
+| `printInt`, `printU64` | print a number in decimal, without a newline |
+
+A program may declare any of these names itself. The prelude's version is then left out, along
+with every prelude definition that mentions a left-out or redeclared name. A program that defines
+its own `List`, or its own `putc` UART driver, gets none of the prelude's list or printing
+functions instead of ones silently built on its definitions. Unused prelude definitions cost
+nothing: the optimizer removes them.
+
+## Error messages
+
+Errors name the file, line and column of the innermost expression involved, and show the line:
+
+```
+twice.kl:5:7: error [Duplicate]: ["t"] used twice
+5 |   \t. consume t + consume t
+          ^
+```
+
+This covers errors from inference and from the core checker (linearity, effects, references).
+Parts elaborated from `&`/`&mut`/`var` code keep the position of the nearest enclosing
+expression without references.
 
 ## Hardware access
 
@@ -114,5 +148,4 @@ the final word on linearity, effects and references.
 
 - `e.obs` needs `e`'s codata type to be known at that point; add an annotation if it isn't.
 - Effect handlers run in the evaluator (`keelc run`) but are not compiled natively until M3.
-- Error messages report the kind of error and the types involved, not yet source positions
-  for type errors (parse errors do have positions).
+- Strings are lists of bytes: simple and uniform, but each character is a heap cell.
