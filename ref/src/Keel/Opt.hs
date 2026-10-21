@@ -2,8 +2,10 @@
 -- + monomorphization" free (notes.md §4, §16):
 --
 -- 1. __Specialization on constants.__ A call @f … c …@ where @c@ is a top-level cocase (a
---    dictionary or interface implementation) uses a copy of @f@ with that parameter replaced
---    by @c@. Recursive calls pass @c@ along, so they reach the same copy.
+--    dictionary or interface implementation) or a top-level function uses a copy of @f@ with
+--    that parameter replaced by @c@. Recursive calls pass @c@ along, so they reach the same
+--    copy. Closed λ arguments (@map (\x. x + 1) xs@) are first lifted to top-level definitions,
+--    so they specialize too, and the inliner then removes the call through the closure.
 -- 2. __Inlining.__ @c.o@ on a known cocase becomes the branch; calls to small non-recursive
 --    definitions are replaced by their bodies.
 -- 3. __β-reduction.__ @(λx. b) a@ becomes @let x = a in b@, and a @let@ in function position
@@ -15,16 +17,55 @@
 module Keel.Opt (optimize) where
 
 import Control.Monad (forM)
-import Control.Monad.Trans.State.Strict (State, evalState, get, gets, modify, put)
+import Control.Monad.Trans.State.Strict (State, evalState, get, gets, modify, put, runState)
 import Data.List (intercalate)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
-import Keel.Check (recursiveGroups)
+import Keel.Check (recursiveGroups, typeOfClosed)
 import Keel.Syntax
 
 optimize :: Program -> Program
-optimize = removeDead . simplify . specialize
+optimize = removeDead . simplify . specialize . liftClosed
+
+-- Lifting closed λ arguments ------------------------------------------------------------------
+
+-- | Give every closed λ passed to a top-level function its own top-level definition. A λ whose
+-- type can't be computed (which can't happen for checked programs) is left in place.
+liftClosed :: Program -> Program
+liftClosed (Program decls main) = Program (decls' ++ [Def f t e | (f, t, e) <- reverse lifted]) main'
+  where
+    globals = S.fromList [f | Def f _ _ <- decls]
+    ((decls', main'), (_, lifted)) = runState ((,) <$> mapM liftDecl decls <*> go main) (0 :: Int, [])
+    liftDecl d = case d of
+      Def f t e -> Def f t <$> go e
+      _ -> pure d
+    go tm = case spine tm of
+      (Var f, args@(_ : _)) | f `S.member` globals -> foldl App (Var f) <$> mapM liftArg args
+      _ -> descendM go tm
+    liftArg a = do
+      a' <- go a
+      case a' of
+        _ | isLam a', S.null (freeVars a' S.\\ globals), Right t <- typeOfClosed decls a' -> do
+          (n, acc) <- get
+          let name = "lam'" ++ show n
+          put (n + 1, (name, t, a') : acc)
+          pure (Var name)
+        _ -> pure a'
+    isLam Lam {} = True
+    isLam LLam {} = True
+    isLam _ = False
+
+freeVars :: Term -> S.Set String
+freeVars tm = case tm of
+  Var x -> S.singleton x
+  Lam x _ b -> S.delete x (freeVars b)
+  LLam x _ b -> S.delete x (freeVars b)
+  Let x e b -> freeVars e <> S.delete x (freeVars b)
+  LetPair x y e b -> freeVars e <> (freeVars b S.\\ S.fromList [x, y])
+  Case e alts -> freeVars e <> S.unions [freeVars b S.\\ S.fromList xs | (_, xs, b) <- alts]
+  Handle _ e cs -> freeVars e <> S.unions [S.delete x (freeVars b) | (_, x, b) <- cs]
+  _ -> S.unions (map freeVars (children tm))
 
 -- Specialization -----------------------------------------------------------------------------
 
@@ -55,7 +96,13 @@ specialize (Program decls main) = Program (others ++ [Def f t e | (f, (t, e)) <-
     others = [d | d <- decls, not (isDef d)]
     isDef Def {} = True
     isDef _ = False
-    consts = S.fromList [g | Def g _ Cocase {} <- decls]
+    -- Constants: dictionaries (cocases) and top-level functions.
+    consts = S.fromList [g | Def g _ e <- decls, isConst e]
+    isConst e = case e of
+      Cocase {} -> True
+      Lam {} -> True
+      LLam {} -> True
+      _ -> False
     original = M.fromList [(f, (t, e)) | Def f t e <- decls]
     (main', order) = evalState run (SS original M.empty (M.keys original))
     run = do

@@ -4,7 +4,7 @@
 --
 -- @infer@ implements Γ ⊢ e ⇒ τ ! ε ▷ U: it synthesizes a type, the effect of evaluating the
 -- term, and the set U of linear local variables the term uses.
-module Keel.Check (ErrKind (..), TypeError (..), checkProgram, recursiveGroups) where
+module Keel.Check (ErrKind (..), TypeError (..), checkProgram, recursiveGroups, typeOfClosed) where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.List (nub, sort)
@@ -126,6 +126,14 @@ checkProgram (Program decls main) = do
   let extra = eff S.\\ topLevelEffects
   unless (S.null extra) $ err Unhandled ("main performs " ++ prettyEff extra)
   pure (t, eff)
+
+-- | The type of a closed term (no free locals) in a program's signature; used by the optimizer
+-- to give lifted λs their declared types.
+typeOfClosed :: [Decl] -> Term -> TC Ty
+typeOfClosed decls tm = do
+  sig <- buildSig decls
+  (t, _, _) <- infer sig S.empty M.empty tm
+  pure t
 
 -- | For each definition, its recursive group: the definitions it reaches that reach it back.
 recursiveGroups :: [Decl] -> M.Map String (S.Set String)
