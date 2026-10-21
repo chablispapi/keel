@@ -166,6 +166,10 @@ expression without references.
   project, from the project's entry file.
 - **Hover** shows the declared type of a top-level name: definitions, constructors and effect
   operations, from the program, the prelude or the built-in effects.
+- **Go to definition** jumps to where a top-level name is declared, in this file or an
+  imported module (`uart.putc` looks in the module imported as `uart`); on an `import` line,
+  to the imported file. Helix: `gd`. It matches by name, so a local variable that shadows a
+  top-level name jumps to the top-level one, and prelude names go nowhere.
 
 Put `keelc` on your `PATH` (`cabal install exe:keelc` in `ref/`), then point the editor at it.
 For Neovim:
@@ -203,7 +207,7 @@ tree-sitter build -o ~/.config/helix/runtime/grammars/keel.so .
 ln -sfn "$PWD/queries" ~/.config/helix/runtime/queries/keel
 ```
 
-Not yet: types of local variables on hover, go-to-definition, completion.
+Not yet: types of local variables on hover, completion.
 
 ## Debugging
 

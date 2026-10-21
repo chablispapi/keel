@@ -11,7 +11,7 @@
 -- ponytail: only values (definitions, effect operations) can be qualified; @uart.Status@ needs
 -- the parser to read qualified names in types and patterns. An ambiguous type or constructor
 -- is reported, and the fix is to rename one.
-module Keel.Modules (loadModules, loadModulesWith) where
+module Keel.Modules (loadModules, loadModulesWith, importPath) where
 
 import Control.Monad (foldM, forM, forM_, when)
 import Data.List (intercalate, nub)
@@ -76,13 +76,16 @@ loadModulesWith readSource entry = do
                     ( \acc (imp, _, pos) -> case acc of
                         Left e -> pure (Left e)
                         Right (l, order) -> do
-                          r <- visit l (name : stack) imp (root </> map dotToSlash imp <.> "kl") (Just pos)
+                          r <- visit l (name : stack) imp (importPath root imp) (Just pos)
                           pure (fmap (\(l', o) -> (l', order ++ o)) r)
                     )
                     (Right (loaded0, []))
                     (modImports m)
                     >>= pure . fmap (\(l, order) -> (l, order ++ [name]))
-    dotToSlash c = if c == '.' then '/' else c
+
+-- | The file of an import: @drivers.uart@ is @ROOT/drivers/uart.kl@.
+importPath :: FilePath -> String -> FilePath
+importPath root imp = root </> map (\c -> if c == '.' then '/' else c) imp <.> "kl"
 
 -- | Every module's public and private names, and the prelude's.
 data Scope = Scope {publics, privates :: M.Map String (S.Set String), preludeNames :: S.Set String}
@@ -100,7 +103,7 @@ internal scope m private n
 
 -- | Resolve a module's names to program-wide names: its declarations and its main.
 resolveModule :: Scope -> String -> FilePath -> Module -> Either String ([Decl], Maybe Term)
-resolveModule scope self path (Module imports decls main) = do
+resolveModule scope self path (Module imports decls main _) = do
   decls' <- forM decls $ \(_, d) -> renameDecl d
   main' <- traverse (term (Just (path, 1, 1)) S.empty) main
   pure (decls', main')

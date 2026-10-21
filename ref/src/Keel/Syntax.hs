@@ -110,7 +110,9 @@ type Pos = (FilePath, Int, Int)
 
 -- | A parsed source file: its imports (module name, the qualifier it is known by, and where),
 -- its declarations (with a @private@ flag), and its @main@ if it has one.
-data Module = Module {modImports :: [(String, String, Pos)], modDecls :: [(Bool, Decl)], modMain :: Maybe Term}
+-- | One source file. 'modSites' is where each declared name (type, constructor, operation,
+-- definition) is written, for the language server's go-to-definition.
+data Module = Module {modImports :: [(String, String, Pos)], modDecls :: [(Bool, Decl)], modMain :: Maybe Term, modSites :: [(String, Pos)]}
 
 -- | Remove source positions.
 stripAt :: Term -> Term

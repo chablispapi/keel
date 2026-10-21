@@ -22,7 +22,7 @@ import Text.Parsec.Token qualified as Tok
 -- | A single-file program: no imports, a @main@.
 parseProgram :: FilePath -> String -> Either String Program
 parseProgram path src = do
-  Module imports decls main <- parseModule path src
+  Module imports decls main _ <- parseModule path src
   case (imports, main) of
     ((m, _, _) : _, _) -> Left (path ++ ": imports " ++ m ++ ": load it with keelc (the module loader)")
     (_, Nothing) -> Left (path ++ ": no main")
@@ -34,7 +34,7 @@ parseModule path src = either (Left . parseError) Right (parse (whiteSpace *> mo
 
 -- | Declarations without a @main@ (the prelude).
 parseLibrary :: FilePath -> String -> Either String [Decl]
-parseLibrary path src = either (Left . parseError) Right (parse (whiteSpace *> many decl <* eof) path src)
+parseLibrary path src = either (Left . parseError) Right (parse (whiteSpace *> many (fst <$> decl) <* eof) path src)
 
 -- | @file:line:col: parse error@ and parsec's messages, like the loader's other errors.
 parseError :: ParseError -> String
@@ -147,19 +147,26 @@ moduleP = do
     pure (foldr1 (\a b -> a ++ "." ++ b) name, q, (sourceName pos, sourceLine pos, sourceColumn pos))
   decls <- many ((,) <$> option False (reserved "private" $> True) <*> decl)
   main <- optionMaybe (reserved "main" >> op "=" >> expr)
-  pure (Module imports decls main)
+  pure (Module imports [(p, d) | (p, (d, _)) <- decls] main (concat [ss | (_, (_, ss)) <- decls]))
 
-decl :: Parser Decl
+-- | A declaration, and where each name it declares is written.
+decl :: Parser (Decl, [(String, Pos)])
 decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
   where
+    -- A declared name and its position.
+    site p = do
+      pos <- getPosition
+      n <- p
+      pure (n, (n, (sourceName pos, sourceLine pos, sourceColumn pos)))
     -- bitdata Name : u8 { field @ bit ; field @ lo..hi }
     bitdataDecl = do
       reserved "bitdata"
-      name <- upper
+      (name, s) <- site upper
       op ":"
-      it <- choice [reserved' s $> i | (s, i) <- intTypes]
-      Bitdata name it <$> braces (sepEndBy bitField semi)
-    reserved' s = try (do n <- lower; if n == s then pure () else unexpected n)
+      it <- choice [reserved' t $> i | (t, i) <- intTypes]
+      fs <- braces (sepEndBy bitField semi)
+      pure (Bitdata name it fs, [s])
+    reserved' t = try (do n <- lower; if n == t then pure () else unexpected n)
     bitField = do
       f <- lower
       op "@"
@@ -169,27 +176,34 @@ decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
     dataDecl = do
       lin <- option False (reserved "linear" $> True)
       reserved "data"
-      name <- upper
+      (name, s) <- site upper
       ps <- many lower
       op "="
-      Data lin name ps <$> sepBy1 ctor (op "|")
-    ctor = (,) <$> upper <*> option [] (parens (sepBy ty comma))
+      cs <- sepBy1 ctor (op "|")
+      pure (Data lin name ps [c | (c, _) <- cs], s : map snd cs)
+    ctor = do
+      (c, s) <- site upper
+      fs <- option [] (parens (sepBy ty comma))
+      pure ((c, fs), s)
     codataDecl = do
       reserved "codata"
-      name <- upper
+      (name, s) <- site upper
       ps <- many lower
-      Codata name ps <$> braces (sepEndBy ((,) <$> lower <* op ":" <*> ty) semi)
+      os <- braces (sepEndBy ((,) <$> site lower <* op ":" <*> ty) semi)
+      pure (Codata name ps [(o, t) | ((o, _), t) <- os], s : [o | ((_, o), _) <- os])
     effectDecl = do
       reserved "effect"
-      name <- upper
-      Effect name <$> braces (sepEndBy ((,,) <$> lower <* op ":" <*> ty <* op "=>" <*> ty) semi)
+      (name, s) <- site upper
+      ops <- braces (sepEndBy ((,,) <$> site lower <* op ":" <*> ty <* op "=>" <*> ty) semi)
+      pure (Effect name [(o, a, b) | ((o, _), a, b) <- ops], s : [o | ((_, o), _, _) <- ops])
     defDecl = do
       reserved "def"
-      name <- lower
+      (name, s) <- site lower
       op ":"
       t <- ty
       op "="
-      Def name t <$> expr
+      e <- expr
+      pure (Def name t e, [s])
 
 -- Types -----------------------------------------------------------------------------------
 

@@ -22,7 +22,7 @@ import Data.Set qualified as S
 import Keel.AArch64 (compileNative, compileNativeWith)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
-import Keel.Lsp (Diag (..), Json (..), diagnose, hover, parseJson, renderJson)
+import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
 import Keel.RiscV (compileRiscV)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
@@ -227,6 +227,8 @@ lspChecks = do
   typeErr <- diagnose (edit "a + b" "a + true") util
   parseErr <- diagnose (edit "def double" "def double double") util
   h <- hover M.empty "examples/project/src/main.kl" 8 60
+  let dir = "examples/project/src/"
+  defs <- sequence [definition M.empty (dir ++ f) l c | (f, l, c) <- [("main.kl", 8, 32), ("main.kl", 8, 67), ("util.kl", 4, 40), ("main.kl", 6, 3)]]
   let json = "{\"a\":[1,-2.5,true,null,\"x\\n\\u00e9\"],\"b\":{}}"
   pure $
     [ "FAIL lsp: " ++ what ++ ": got " ++ got
@@ -234,6 +236,7 @@ lspChecks = do
         [ (null clean, "clean project", show clean)
         , (typeErr == [Diag util 2 59 "expected i64, got Bool [Mismatch]"], "type error", show typeErr)
         , (case parseErr of [Diag f 4 _ _] -> f == util; _ -> False, "parse error", show parseErr)
+        , (defs == map Just [(dir ++ "drivers/led.kl", 1, 5), (dir ++ "util.kl", 4, 5), (dir ++ "util.kl", 2, 13), (dir ++ "drivers/led.kl", 1, 1)], "definition", show defs)
         , (h == Just "printInt : i64 →{Diverge, IO, Panic} Unit", "hover", show h)
         , (fmap renderJson (parseJson json) == Just "{\"a\":[1,-2.5,true,null,\"x\\n\233\"],\"b\":{}}", "json", show (parseJson json))
         ]
