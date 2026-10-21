@@ -13,7 +13,7 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval, Keel.Elab, Keel.Mono, Keel.Lower, Keel.AArch64,
-                   Keel.Infer, Keel.Parser, Keel.RiscV, Keel.Toolchain
+                   Keel.Infer, Keel.Parser, Keel.RiscV, Keel.Toolchain, Keel.Opt
   build-depends:   parsec, directory, filepath, process
 
 executable keelc

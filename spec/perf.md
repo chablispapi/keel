@@ -4,13 +4,13 @@ Benchmarks are in `ref/bench/` and run with `ref/bench/run.sh`. It builds each p
 with `keelc` and reports the best of 5 wall-clock runs on the development Mac (Apple Silicon).
 Every number is a full process run: startup, the computation, and freeing the heap.
 
-| Benchmark | What it stresses | M3 | + known-arity calls | + register allocation | Speedup |
-|---|---|---|---|---|---|
-| `loop` | 200M iterations of a two-parameter tail-recursive loop | 1566 ms | 635 ms | 354 ms | 4.4× |
-| `sort` | two insertion sorts of 3,000 elements, dictionary passing | 507 ms | 206 ms | 218 ms | 2.3× |
-| `churn` | 10M pair allocations and frees | 113 ms | 77 ms | 66 ms | 1.7× |
-| `map` | 1,000 in-place maps over 1,000 elements | 24 ms | 18 ms | 18 ms | 1.3× |
-| `fib` | fib 32: about 7M non-tail calls | 20.7 ms | 19.1 ms | 16.7 ms | 1.2× |
+| Benchmark | What it stresses | M3 | + known-arity calls | + register allocation | + specialization and inlining | Speedup |
+|---|---|---|---|---|---|---|
+| `loop` | 200M iterations of a two-parameter tail-recursive loop | 1566 ms | 635 ms | 354 ms | 355 ms | 4.4× |
+| `sort` | two insertion sorts of 3,000 elements, dictionary passing | 507 ms | 206 ms | 218 ms | 151 ms | 3.4× |
+| `churn` | 10M pair allocations and frees | 113 ms | 77 ms | 66 ms | 66 ms | 1.7× |
+| `map` | 1,000 in-place maps over 1,000 elements | 24 ms | 18 ms | 18 ms | 18 ms | 1.3× |
+| `fib` | fib 32: about 7M non-tail calls | 20.7 ms | 19.1 ms | 16.7 ms | 17.3 ms | 1.2× |
 
 ## What changed
 
@@ -27,25 +27,36 @@ and restored before each return or tail call. The rest stay in stack slots. Ever
 preserves these registers (Keel functions save what they use; the runtime and the C library
 never touch them), so values survive calls without spilling around each one.
 
+**Specialization and inlining** (`ref/src/Keel/Opt.hs`, after monomorphization). A call that
+passes a top-level `cocase` constant, such as `sort ascending xs`, uses a copy of the function
+with that parameter replaced by the constant; recursive calls pass it along and reach the same
+copy. Then an observation of a known constant (`ascending.lt`) is replaced by its branch, small
+non-recursive definitions are inlined, `(λx. b) a` becomes `let x = a in b`, and unreachable
+definitions are removed. For `sort` this leaves `sort[i64]{0=ascending}` and
+`insert[i64]{0=ascending}` comparing with a plain `<`: the dictionary is gone at run time, which
+is what notes.md §16 promised for explicit dictionaries + monomorphization. The optimized program
+is type-checked again, and the test runner checks it computes the same result as the
+unoptimized one on every test.
+
 Both back ends (ARM64 and RISC-V) share the allocation (`allocate` in `ref/src/Keel/AArch64.hs`),
 and the full test suite passes on both after each step.
 
 ## Where the time still goes
 
-- **`sort`**: each comparison calls the dictionary's `lt` through a codata value, as a curried
-  closure: `o.lt x` builds a closure and `(o.lt x) y` calls it. Uncurrying observations, or
-  inlining the dictionary after monomorphization (it is a known constant), would remove that.
-  The small `lt` λ also pays for saving registers it barely uses.
+- **Dictionaries that aren't constants**: specialization only fires when the argument is a
+  top-level `cocase`. A dictionary built at run time (e.g. one that captures a value) is still
+  called through closures; uncurrying codata observations would help there.
 - **Register allocation is per function, not per live range**: one variable per register, so
   functions with more than 10 hot variables spill. A liveness-based allocator (linear scan) would
   share registers between variables that are never live at the same time.
-- **No inlining**: small functions (`inc`, `lt`, the bodies of `map`'s argument) are always
-  calls.
+- **Inlining is limited** to calls of small non-recursive top-level definitions and known
+  observations; λs passed as arguments (`map (\x. x + 1)`) are still called through closures.
 - **Reference counting is not optimized**: every field read is a dup and every case a drop.
   Borrowing parameters, and cancelling a dup against a drop of the parent when it is unique,
   are the standard Perceus refinements (`spec/memory.md`).
 
 ## Not done from the M4 roadmap
 
-SSA form, a general register allocator, inlining, defunctionalization, and our own Mach-O/ELF
-writers (`cc`, `clang` and `ld.lld` still assemble and link). These are the remaining M4 items.
+SSA form, a liveness-based register allocator, general inlining (of λ arguments into
+specialized copies), defunctionalization, and our own Mach-O/ELF writers (`cc`, `clang` and
+`ld.lld` still assemble and link). These are the remaining M4 items.

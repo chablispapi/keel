@@ -11,10 +11,11 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.Check (ErrKind (..), TypeError (..), checkProgram, recursiveGroups)
 import Keel.Elab (checkRefs, elaborate)
+import Keel.Opt (optimize)
 import Keel.Syntax
 
--- | The whole pipeline: place rules, elaboration, type checking, monomorphization, and a
--- final check of the monomorphic program.
+-- | The whole pipeline: place rules, elaboration, type checking, monomorphization,
+-- optimization, and a final check of the result.
 compile :: Program -> Either TypeError Program
 compile p = do
   checkRefs p
@@ -22,7 +23,10 @@ compile p = do
   _ <- checkProgram core
   mono <- monomorphize core
   _ <- checkProgram mono
-  pure mono
+  -- Optimize (spec/perf.md) and check again: an optimizer bug shows up as a type error.
+  let opt = optimize mono
+  _ <- checkProgram opt
+  pure opt
 
 monomorphize :: Program -> Either TypeError Program
 monomorphize (Program decls main) = do
