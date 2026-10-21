@@ -1,0 +1,19 @@
+-- A UART driver written against an MMIO effect, run against a mock device.
+-- Handlers are not compiled natively yet (milestone M3): use `keelc run`.
+
+data List a = Nil | Cons(a, Box (List a))
+data W = W(i64, i64)
+
+effect MMIO { read : i64 => i64 ; write : W => Unit }
+
+def send : List i64 ->{MMIO, Diverge} Unit =
+  \xs. case xs of
+    { Nil -> ()
+    | Cons(c, rest) ->
+        if read(4) == 1 then write(W(0, c)); send (unbox rest)
+        else send (Cons(c, rest)) }
+
+main =
+  handle send (Cons(72, box Cons(105, box Nil))) with MMIO
+    { read addr -> 1
+    | write w -> case w of { W(reg, v) -> out(v) } }

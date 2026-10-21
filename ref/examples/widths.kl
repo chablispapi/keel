@@ -1,0 +1,4 @@
+-- Fixed-width integers and the four overflow modes: + checked, +% wrapping,
+-- +| saturating, +? returning Option.
+
+main = (250u8 +% 10, (250u8 +| 10, (200u8 +? 100, 1i32 +? 2)))

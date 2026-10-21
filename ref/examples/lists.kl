@@ -1,0 +1,16 @@
+-- A polymorphic list, an effect-polymorphic map, and inference of everything else:
+-- the λ's parameter type, the literals' widths, and map's type and effect arguments.
+
+data List a = Nil | Cons(a, Box (List a))
+
+def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
+  \f xs. case xs of
+    { Nil -> Nil
+    | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
+
+def sum : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of
+    { Nil -> 0
+    | Cons(x, rest) -> x + sum (unbox rest) }
+
+main = sum (map (\n. n * 10) (Cons(1, box Cons(2, box Cons(3, box Nil)))))

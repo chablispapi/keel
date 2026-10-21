@@ -158,10 +158,13 @@ prim op (VInt t a) (VInt _ b) = case op of
           then pure (if ov == Optional then VCon "Some" [VInt t r] else VInt t r)
           else case ov of
             Optional -> pure (VCon "None" [])
-            Checked -> throwE ("overflow: " ++ show aop ++ " " ++ show a ++ " " ++ show b ++ " in " ++ show t)
+            Checked -> throwE ("arithmetic overflow: " ++ show a ++ sym aop ++ show b ++ " in " ++ prettyTy (TInt t))
             Wrap -> pure (VInt t (lo + (r - lo) `mod` (hi - lo + 1)))
             Saturate -> pure (VInt t (max lo (min hi r)))
   where
+    sym Add = " + "
+    sym Sub = " - "
+    sym Mul = " * "
     arith Add = (+)
     arith Sub = (-)
     arith Mul = (*)

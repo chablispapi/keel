@@ -1,13 +1,20 @@
--- | M0 differential tests: each program is compiled to ARM64 assembly, linked with the system
--- @cc@ and run. Its output must match the reference evaluator: same @out@ trace, and the same
--- result (last line @result: …@) or a panic (exit status 101).
+-- | Native differential tests: each program is compiled to ARM64 assembly, linked with the
+-- system @cc@ and run. Its output must match the reference evaluator: same @out@ trace, and
+-- the same result (last line @result: …@, printed like the evaluator) or a panic (exit 101).
+--
+-- Programs: every accepted example of spec/core.md (test/Cases.hs), back-end tests below, and
+-- the example files (examples/*.kl), which also have hand-written expected output.
 module Main (main) where
 
+import Cases (Expect (..))
+import Cases qualified
 import Control.Monad (forM, unless)
 import Data.List (isInfixOf, stripPrefix)
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative)
 import Keel.Eval (Outcome (..), evalProgram)
+import Keel.Infer (inferProgram)
+import Keel.Parser (parseProgram)
 import Keel.Mono (compile)
 import Keel.Syntax
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
@@ -70,6 +77,16 @@ polyDefs =
       Lam "y" (TVar "b") (App (TyApp "id" [TVar "b"] []) (App (TyApp "id" [TVar "b"] []) (Var "y")))
   ]
 
+-- def loop : i64 → i64 →{Panic, Diverge} i64, tail recursive with an accumulator
+loopDef :: Decl
+loopDef =
+  Def "loop" (fn tI (fnE [panicE, divergeE] tI tI)) $
+    Lam "i" tI $
+      Lam "acc" tI (If (lt (Var "i") (int 1)) (Var "acc") (App (App (Var "loop") (sub (Var "i") (int 1))) (add (Var "acc") (Var "i"))))
+
+u64Max :: Integer
+u64Max = 18446744073709551615
+
 sumToDef :: Decl
 sumToDef =
   Def "sumTo" (fnE [panicE, divergeE] tI tI) $
@@ -108,30 +125,79 @@ cases =
   , ("known call returning a closure", Program [adderDef] (App (App (Var "adder") (int 40)) (int 2)))
   , ("Unit result", Program [] (out (int 5)))
   , ("deep recursion", Program [sumToDef] (App (Var "sumTo") (int 10000)))
+  , ("tail calls run in constant stack", Program [loopDef] (App (App (Var "loop") (int 3000000)) (int 0)))
+  , ("u64 wrapping add", Program [] (Prim (Arith Wrap Add) (IntLit u64 u64Max) (IntLit u64 2)))
+  , ("u64 checked add overflows", Program [] (Prim (Arith Checked Add) (IntLit u64 u64Max) (IntLit u64 1)))
+  , ("u64 saturating sub", Program [] (Prim (Arith Saturate Sub) (IntLit u64 3) (IntLit u64 5)))
+  , ("u64 saturating mul", Program [] (Prim (Arith Saturate Mul) (IntLit u64 u64Max) (IntLit u64 2)))
+  , ("u64 compare is unsigned", Program [] (Prim Lt (IntLit u64 1) (IntLit u64 u64Max)))
+  , ("i64 saturating mul, negative", Program [] (Prim (Arith Saturate Mul) (int (-4611686018427387904)) (int 3)))
+  , ("i32 checked mul overflows", Program [] (Prim (Arith Checked Mul) (IntLit i32 65536) (IntLit i32 65536)))
+  , ("u32 saturating mul", Program [] (Prim (Arith Saturate Mul) (IntLit u32 4000000000) (IntLit u32 4000000000)))
+  , ("u16 +? overflow", Program [] (Prim (Arith Optional Add) (IntLit u16 65535) (IntLit u16 1)))
+  , ("i16 wrapping sub", Program [] (Prim (Arith Wrap Sub) (IntLit i16 (-32768)) (IntLit i16 1)))
   ]
 
 -- | Programs M0 must refuse cleanly.
 unsupportedCases :: [(String, Program)]
 unsupportedCases =
-  [ ( "data types (M1)"
-    , Program [Data False "Two" [] [("A", []), ("B", [])]] (Case (Con "A" [] []) [("A", [], int 1), ("B", [], int 2)])
-    )
-  , ("narrow integers (M1)", Program [] (IntLit u8 3))
+  [("effect handlers (M3)", Program [] (Handle ioE (Perform "out" (int 5)) [("out", "x", UnitLit)]))]
+
+-- | Accepted spec examples; those using handlers are skipped until M3.
+specCases :: [(String, Program)]
+specCases = [("spec: " ++ name, p) | (name, p, e) <- Cases.cases, runs e, not (usesHandlers p)]
+  where
+    runs (Rejects _) = False
+    runs _ = True
+
+usesHandlers :: Program -> Bool
+usesHandlers (Program _ m) = any isHandle (universe m)
+  where
+    isHandle Handle {} = True
+    isHandle _ = False
+
+-- | Example files and what they must print: (result, or Nothing for a panic; out trace).
+exampleFiles :: [(FilePath, Run)]
+exampleFiles =
+  [ ("examples/hello.kl", (Just "25", [9, 16]))
+  , ("examples/fact.kl", (Just "500000500000", [2432902008176640000]))
+  , ("examples/lists.kl", (Just "60", []))
+  , ("examples/sort.kl", (Just "Cons(3, box Cons(2, box Cons(1, box Nil)))", []))
+  , ("examples/counter.kl", (Just "44", []))
+  , ("examples/uart.kl", (Just "()", [72, 105]))
+  , ("examples/overflow.kl", (Nothing, [1, 2]))
+  , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", []))
   ]
+
+-- | Parse and infer an example; check the evaluator against the expected output, and return
+-- the program for the native comparison unless it uses handlers.
+loadExample :: (FilePath, Run) -> IO ([String], [(String, Program)])
+loadExample (path, expected) = do
+  src <- readFile path
+  case parseProgram path src >>= either (Left . show) Right . inferProgram of
+    Left e -> pure (["FAIL " ++ path ++ ": " ++ e], [])
+    Right core -> case compile core of
+      Left e -> pure (["FAIL " ++ path ++ ": " ++ show e], [])
+      Right mono -> do
+        let got = reduce (evalProgram mono)
+            fails = ["FAIL " ++ path ++ ": evaluator gave " ++ show got ++ ", expected " ++ show expected | got /= expected]
+        pure (fails, [(path, core) | not (usesHandlers core)])
 
 main :: IO ()
 main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
-  failures <- concat <$> forM (zip [0 :: Int ..] cases) (uncurry (runCase dir))
+  loaded <- mapM loadExample exampleFiles
+  let programs = cases ++ specCases ++ concatMap snd loaded
+  failures <- (concatMap fst loaded ++) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir))
   let refused =
-        [ "FAIL " ++ name ++ ": expected 'not supported in M0', got " ++ either id (const "assembly") r
+        [ "FAIL " ++ name ++ ": expected 'not supported yet', got " ++ either id (const "assembly") r
         | (name, p) <- unsupportedCases
         , let r = compileNative p
-        , either (not . ("not supported in M0" `isInfixOf`)) (const True) r
+        , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ refused
-      total = length cases + length unsupportedCases
+      total = length programs + length unsupportedCases + length exampleFiles
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   unless (null allFailures) exitFailure

@@ -12,13 +12,22 @@ common shared
 library
   import:          shared
   hs-source-dirs:  src
-  exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval, Keel.Elab, Keel.Mono, Keel.Lower, Keel.AArch64
+  exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval, Keel.Elab, Keel.Mono, Keel.Lower, Keel.AArch64,
+                   Keel.Infer, Keel.Parser
+  build-depends:   parsec
+
+executable keelc
+  import:         shared
+  hs-source-dirs: app
+  main-is:        keelc.hs
+  build-depends:  keel-ref, filepath, process
 
 test-suite core
   import:         shared
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        Main.hs
+  other-modules:  Cases
   build-depends:  keel-ref
 
 test-suite native
@@ -26,4 +35,5 @@ test-suite native
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        Native.hs
+  other-modules:  Cases
   build-depends:  keel-ref, directory, filepath, process

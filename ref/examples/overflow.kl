@@ -1,0 +1,4 @@
+-- Checked arithmetic: the overflow panics (exit status 101), and the output
+-- written before it is kept.
+
+main = out(1); out(2); 9223372036854775807 + 1

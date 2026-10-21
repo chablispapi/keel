@@ -50,6 +50,7 @@ data Ty
   | TForall [(String, Kind)] [String] Ty -- ^ ∀ types and effect variables; only at the top of a def's type
   | TRef Ty          -- ^ &τ, surface: only as a parameter type
   | TMut Ty          -- ^ &mut τ, surface: only as a parameter type
+  | TMeta Int        -- ^ inference variable, front end only ("Keel.Infer"); -1 is an unfilled hole
   deriving (Eq, Show)
 
 data Kind = Free | Lin
@@ -68,6 +69,7 @@ data Term
   = Var String
   | UnitLit
   | IntLit IntTy Integer
+  | NumLit (Maybe Ty) Integer -- ^ literal whose width is inferred, front end only
   | BoolLit Bool
   | Prim Prim Term Term
   | If Term Term Term
@@ -141,6 +143,30 @@ descend f tm = case tm of
   LetVar x e b -> LetVar x (f e) (f b)
   _ -> tm
 
+-- | Monadic 'descend': rewrite every immediate subterm, left to right.
+descendM :: (Monad m) => (Term -> m Term) -> Term -> m Term
+descendM f tm = case tm of
+  Prim op a b -> Prim op <$> f a <*> f b
+  If c a b -> If <$> f c <*> f a <*> f b
+  Lam x t b -> Lam x t <$> f b
+  LLam x t b -> LLam x t <$> f b
+  App g a -> App <$> f g <*> f a
+  Let x e b -> Let x <$> f e <*> f b
+  Con c ts as -> Con c ts <$> mapM f as
+  Case e alts -> Case <$> f e <*> mapM (\(c, xs, b) -> (c,xs,) <$> f b) alts
+  Box e -> Box <$> f e
+  Unbox e -> Unbox <$> f e
+  Perform op e -> Perform op <$> f e
+  Handle l e cs -> Handle l <$> f e <*> mapM (\(op, x, b) -> (op,x,) <$> f b) cs
+  Pair a b -> Pair <$> f a <*> f b
+  LetPair x y e b -> LetPair x y <$> f e <*> f b
+  Cocase d ts bs -> Cocase d ts <$> mapM (\(o, b) -> (o,) <$> f b) bs
+  Proj e o -> (`Proj` o) <$> f e
+  Assign x e -> Assign x <$> f e
+  Seq a b -> Seq <$> f a <*> f b
+  LetVar x e b -> LetVar x <$> f e <*> f b
+  _ -> pure tm
+
 -- | All subterms, including the term itself.
 universe :: Term -> [Term]
 universe tm = tm : concatMap universe (children tm)
@@ -199,6 +225,7 @@ prettyTy t = case t of
   TForall vs es b -> "∀" ++ unwords (map fst vs ++ es) ++ ". " ++ prettyTy b
   TRef a -> "&" ++ paren a
   TMut a -> "&mut " ++ paren a
+  TMeta n -> "?" ++ show n
   where
     paren x = case x of
       TFun {} -> "(" ++ prettyTy x ++ ")"

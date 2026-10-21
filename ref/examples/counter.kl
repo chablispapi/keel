@@ -1,0 +1,16 @@
+-- Mutation with second-class references. tick updates a linear value in place;
+-- under the hood both functions are pure state passing (spec/core.md §3).
+
+linear data Counter = Counter(i64)
+
+def tick : &mut Counter -> Unit =
+  \&mut c. case c of { Counter(n) -> c := Counter(n +% 1) }
+
+def bump : &mut i64 ->{Panic} Unit = \&mut n. n := n + 1
+
+main =
+  var k = Counter(0) in
+  var total = 40 in
+  tick(&mut k); tick(&mut k);
+  bump(&mut total); bump(&mut total);
+  case k of { Counter(v) -> total + v }

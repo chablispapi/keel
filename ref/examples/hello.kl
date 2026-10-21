@@ -1,0 +1,5 @@
+-- Print two squares, then return their sum.
+
+def square : i64 ->{Panic} i64 = \n. n * n
+
+main = out(square 3); out(square 4); square 3 + square 4
