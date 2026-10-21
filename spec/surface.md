@@ -144,8 +144,7 @@ Keel Core is explicitly typed (`spec/core.md` §4.1). Inference supplies:
 Inference only fills in annotations. The result goes through the full core checker, which has
 the final word on linearity, effects and references.
 
-## Limits (M1)
+## Limits
 
 - `e.obs` needs `e`'s codata type to be known at that point; add an annotation if it isn't.
-- Effect handlers run in the evaluator (`keelc run`) but are not compiled natively until M3.
 - Strings are lists of bytes: simple and uniform, but each character is a heap cell.
