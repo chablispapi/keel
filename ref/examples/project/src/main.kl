@@ -1,6 +1,8 @@
 -- Imports are relative to this file's directory: util is src/util.kl,
--- drivers.console is src/drivers/console.kl.
+-- drivers.console is src/drivers/console.kl. A module is known by its last segment
+-- (console), or by the name after as.
 import util
 import drivers.console
+import drivers.led as light
 
-main = greet "modules"; printInt (double 21); putc(10); double 50
+main = console.init (); light.init (); greet "modules"; printInt (double 21); putc(10); double 50

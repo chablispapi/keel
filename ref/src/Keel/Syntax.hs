@@ -108,9 +108,9 @@ data Term
 -- | A source position: file, line and column.
 type Pos = (FilePath, Int, Int)
 
--- | A parsed source file: its imports (module name and where), its declarations (with a
--- @private@ flag), and its @main@ if it has one.
-data Module = Module {modImports :: [(String, Pos)], modDecls :: [(Bool, Decl)], modMain :: Maybe Term}
+-- | A parsed source file: its imports (module name, the qualifier it is known by, and where),
+-- its declarations (with a @private@ flag), and its @main@ if it has one.
+data Module = Module {modImports :: [(String, String, Pos)], modDecls :: [(Bool, Decl)], modMain :: Maybe Term}
 
 -- | Remove source positions.
 stripAt :: Term -> Term

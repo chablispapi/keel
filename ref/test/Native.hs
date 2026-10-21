@@ -201,14 +201,16 @@ exampleFiles =
   , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", ""))
   , ("examples/reuse.kl", (Just "1500500", ""))
   , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
-  , ("examples/project/src/main.kl", (Just "100", "hello, modules\n42\n"))
+  , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
   ]
 
 -- | Multi-file programs the module loader must refuse, and part of the message.
 moduleErrors :: [(FilePath, String)]
 moduleErrors =
   [ ("test/modules/cycle/a.kl", "import cycle: a → b → a")
-  , ("test/modules/dup/main.kl", "shared is declared in both test/modules/dup/x.kl and test/modules/dup/y.kl")
+  , ("test/modules/dup/main.kl", "main.kl:3:8: shared is ambiguous: it is declared in x and y; write x.shared or y.shared")
+  , ("test/modules/scope/hidden.kl", "hidden.kl:3:8: hidden is declared in module b; import b to use it")
+  , ("test/modules/scope/private.kl", "private.kl:3:8: secret is private to module a")
   , ("test/modules/missing/main.kl", "test/modules/missing/main.kl:1:1: module nowhere not found")
   ]
 
@@ -224,7 +226,7 @@ lspChecks = do
   clean <- diagnose M.empty util
   typeErr <- diagnose (edit "a + b" "a + true") util
   parseErr <- diagnose (edit "def double" "def double double") util
-  h <- hover M.empty "examples/project/src/main.kl" 6 30
+  h <- hover M.empty "examples/project/src/main.kl" 8 60
   let json = "{\"a\":[1,-2.5,true,null,\"x\\n\\u00e9\"],\"b\":{}}"
   pure $
     [ "FAIL lsp: " ++ what ++ ": got " ++ got

@@ -86,20 +86,32 @@ operand is a negative literal; `n -1` still means `n - 1`.
 **Modules.** One file is one module. A file starts with its imports:
 
 ```
-import util               -- util.kl
-import drivers.console    -- drivers/console.kl
+import util                  -- util.kl
+import drivers.console       -- drivers/console.kl, known as console
+import drivers.led as light  -- drivers/led.kl, known as light
 ```
 
-Paths are relative to the entry file's directory, and imports load transitively. Imported
-declarations are visible by their plain names. A declaration marked `private` is visible only in
-its own file: private names are renamed per module, so two modules can each have a
-`private def helper`. Only the entry file may define `main`. The loader reports import cycles
-(`import cycle: a → b → a`), missing modules (with the position of the `import`), and a public
-name declared by two modules (naming both files). Errors anywhere name the right file.
+Paths are relative to the entry file's directory, and imports load transitively. Only the entry
+file may define `main`.
 
-There are no namespaces yet: public names share one scope, so they must be unique across a
-program. Qualified names (`console.greet`) need a syntax that doesn't collide with observations
-(`e.obs`).
+**Names.** A module sees its own declarations, the public declarations of the modules it
+imports, and the prelude. An imported name can be used plain (`greet`) or qualified by its
+module (`console.greet`, `light.init`). Two imported modules may declare the same name; a plain
+use is then ambiguous, and the qualified form picks one:
+
+```
+main.kl:8:8: init is ambiguous: it is declared in drivers.console and drivers.led; write console.init or light.init
+```
+
+A declaration marked `private` is visible only in its own file, so two modules can each have a
+`private def helper`. A qualifier wins over a projection only when no local variable has that
+name: with a local `console`, `console.greet` observes it. Only definitions and effect
+operations can be qualified; types and constructors are used plain, so an ambiguous one has to
+be renamed.
+
+The loader reports import cycles (`import cycle: a → b → a`), missing modules (at the
+`import`), names from a module that isn't imported (`hidden is declared in module b; import b
+to use it`), and qualified uses of private or missing names.
 
 **Projects.** `keelc new NAME` creates a directory with a manifest, a `src/main.kl` and a
 `.gitignore`. The manifest, `keel.project`, has `key = value` lines:

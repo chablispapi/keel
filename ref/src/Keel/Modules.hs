@@ -1,16 +1,22 @@
 -- | Multi-file programs (M5). One file is one module; @import drivers.uart@ loads
--- @drivers/uart.kl@ relative to the entry file's directory. Imported declarations are visible
--- by their plain names, except those marked @private@, which are renamed per module so two
--- modules can each have a @private def helper@.
+-- @drivers/uart.kl@ relative to the entry file's directory.
 --
--- ponytail: no namespaces yet. Two modules declaring the same public name is an error that
--- names both files. Qualified names (@uart.putc@) need syntax that doesn't collide with
--- projection (@e.obs@).
+-- Namespaces: a module sees its own declarations and the public declarations of the modules it
+-- imports, by plain name (@putc@) or qualified by the import (@uart.putc@, or @u.putc@ after
+-- @import drivers.uart as u@). The prelude is visible everywhere. Two imported modules may
+-- declare the same name; using it unqualified is then an error. Names are resolved here, so
+-- later phases see one flat program: a name declared by one module only keeps its name, and
+-- private names and names declared by several modules become @name\@module@.
+--
+-- ponytail: only values (definitions, effect operations) can be qualified; @uart.Status@ needs
+-- the parser to read qualified names in types and patterns. An ambiguous type or constructor
+-- is reported, and the fix is to rename one.
 module Keel.Modules (loadModules, loadModulesWith) where
 
-import Control.Monad (foldM, forM_)
-import Data.List (intercalate)
+import Control.Monad (foldM, forM, forM_, when)
+import Data.List (intercalate, nub)
 import Data.Map.Strict qualified as M
+import Data.Maybe (listToMaybe)
 import Data.Set qualified as S
 import Keel.Parser (parseModule)
 import Keel.Prelude (declared, preludeDecls, withPrelude)
@@ -32,15 +38,16 @@ loadModulesWith readSource entry = do
   pure $ do
     (loaded, order) <- r
     let mods = [(name, loaded M.! name) | name <- order]
-        renamed = [(name, path, renameModule name m) | (name, (path, _, m)) <- mods]
-    checkDuplicates [(path, decls) | (_, path, (decls, _)) <- renamed]
-    forM_ [(path, m) | (name, path, (_, m)) <- renamed, name /= takeBaseName entry, Just _ <- [m]] $ \(path, _) ->
+    forM_ [path | (name, (path, _, m)) <- mods, name /= takeBaseName entry, Just _ <- [modMain m]] $ \path ->
       Left (path ++ ": only the entry file may define main")
-    main <- case [m | (name, _, (_, Just m)) <- renamed, name == takeBaseName entry] of
+    lib <- preludeDecls
+    let names private = M.fromList [(name, S.unions [declared d | (p, d) <- modDecls m, p == private]) | (name, (_, _, m)) <- mods]
+        scope = Scope (names False) (names True) (S.unions (map declared lib))
+    resolved <- forM mods $ \(name, (path, _, m)) -> resolveModule scope name path m
+    main <- case [m | (name, (_, Just m)) <- zip order resolved, name == takeBaseName entry] of
       m : _ -> Right m
       [] -> Left (entry ++ ": no main")
-    lib <- preludeDecls
-    let program = withPrelude lib (Program (concat [decls | (_, _, (decls, _)) <- renamed]) main)
+    let program = withPrelude lib (Program (concatMap fst resolved) main)
     pure (program, M.fromList [(path, src) | (_, (path, src, _)) <- mods])
   where
     root = takeDirectory entry
@@ -51,7 +58,7 @@ loadModulesWith readSource entry = do
       [String] ->
       String ->
       FilePath ->
-      Maybe (String, Pos) ->
+      Maybe Pos ->
       IO (Either String (M.Map String (FilePath, String, Module), [String]))
     visit loaded stack name path from
       | name `elem` stack = pure (Left ("import cycle: " ++ intercalate " → " (reverse (name : stack))))
@@ -59,92 +66,121 @@ loadModulesWith readSource entry = do
       | otherwise = do
           source <- readSource path
           case source of
-            Nothing -> pure (Left (where' from ++ "module " ++ name ++ " not found (looked for " ++ path ++ ")"))
+            Nothing -> pure (Left (at from ++ "module " ++ name ++ " not found (looked for " ++ path ++ ")"))
             Just src ->
               case parseModule path src of
                 Left e -> pure (Left e)
                 Right m -> do
                   let loaded0 = M.insert name (path, src, m) loaded
                   foldM
-                    ( \acc (imp, pos) -> case acc of
+                    ( \acc (imp, _, pos) -> case acc of
                         Left e -> pure (Left e)
                         Right (l, order) -> do
-                          r <- visit l (name : stack) imp (root </> map dotToSlash imp <.> "kl") (Just (imp, pos))
+                          r <- visit l (name : stack) imp (root </> map dotToSlash imp <.> "kl") (Just pos)
                           pure (fmap (\(l', o) -> (l', order ++ o)) r)
                     )
                     (Right (loaded0, []))
                     (modImports m)
                     >>= pure . fmap (\(l, order) -> (l, order ++ [name]))
     dotToSlash c = if c == '.' then '/' else c
-    where' (Just (_, (f, l, c))) = f ++ ":" ++ show l ++ ":" ++ show c ++ ": "
-    where' Nothing = ""
 
--- | Rename the module's private names apart (@name\@module@); returns its declarations and main.
-renameModule :: String -> Module -> ([Decl], Maybe Term)
-renameModule name (Module _ decls main) =
-  (map (renameDecl s . snd) decls, renameTerm s S.empty <$> main)
+-- | Every module's public and private names, and the prelude's.
+data Scope = Scope {publics, privates :: M.Map String (S.Set String), preludeNames :: S.Set String}
+
+at :: Maybe Pos -> String
+at (Just (f, l, c)) = f ++ ":" ++ show l ++ ":" ++ show c ++ ": "
+at Nothing = ""
+
+-- | The program-wide name of a module's declaration: its own name, unless it is private or
+-- another module declares the same public name.
+internal :: Scope -> String -> Bool -> String -> String
+internal scope m private n
+  | private || length [() | ns <- M.elems (publics scope), n `S.member` ns] > 1 = n ++ "@" ++ m
+  | otherwise = n
+
+-- | Resolve a module's names to program-wide names: its declarations and its main.
+resolveModule :: Scope -> String -> FilePath -> Module -> Either String ([Decl], Maybe Term)
+resolveModule scope self path (Module imports decls main) = do
+  decls' <- forM decls $ \(_, d) -> renameDecl d
+  main' <- traverse (term (Just (path, 1, 1)) S.empty) main
+  pure (decls', main')
   where
-    s = M.fromList [(n, n ++ "@" ++ name) | (True, d) <- decls, n <- S.toList (declared d)]
+    own = M.fromList [(n, internal scope self p n) | (p, d) <- decls, n <- S.toList (declared d)]
+    quals = M.fromList [(q, imp) | (imp, q, _) <- imports]
+    imported = nub [imp | (imp, _, _) <- imports]
+    pubs m = M.findWithDefault S.empty m (publics scope)
 
--- | Public names declared by two modules.
-checkDuplicates :: [(FilePath, [Decl])] -> Either String ()
-checkDuplicates mods = do
-  _ <-
-    foldM
-      ( \seen (path, decls) -> do
-          let names = S.toList (S.unions (map declared decls))
-          forM_ names $ \n -> case M.lookup n seen of
-            Just other | other /= path -> Left (n ++ " is declared in both " ++ other ++ " and " ++ path)
-            _ -> Right ()
-          pure (M.union seen (M.fromList [(n, path) | n <- names]))
-      )
-      M.empty
-      mods
-  pure ()
+    -- An unqualified name: this module's, else an import's, else the prelude's (or unbound,
+    -- which inference reports).
+    plain pos n
+      | Just i <- M.lookup n own = Right i
+      | otherwise = case [m | m <- imported, n `S.member` pubs m] of
+          [m] -> Right (internal scope m False n)
+          ms@(_ : _ : _) ->
+            Left (at pos ++ n ++ " is ambiguous: it is declared in " ++ intercalate " and " ms ++ "; write " ++ intercalate " or " [qualifier m ++ "." ++ n | m <- ms])
+          []
+            | n `S.notMember` preludeNames scope
+            , m : _ <- [m | (m, ns) <- M.toList (publics scope), m /= self, n `S.member` ns] ->
+                Left (at pos ++ n ++ " is declared in module " ++ m ++ "; import " ++ m ++ " to use it")
+            | otherwise -> Right n
+    qualifier m = case [q | (imp, q, _) <- imports, imp == m] of
+      q : _ -> q
+      [] -> m
 
-renameDecl :: M.Map String String -> Decl -> Decl
-renameDecl s d = case d of
-  Data lin n ps cs -> Data lin (r n) ps [(r c, map (renameTy s) fs) | (c, fs) <- cs]
-  Codata n ps os -> Codata (r n) ps [(o, renameTy s t) | (o, t) <- os]
-  Effect l ops -> Effect (r l) [(r o, renameTy s a, renameTy s b) | (o, a, b) <- ops]
-  Def f t e -> Def (r f) (renameTy s t) (renameTerm s S.empty e)
-  Bitdata n it fs -> Bitdata (r n) it fs
-  where
-    r x = M.findWithDefault x x s
+    qualified pos q n = do
+      let m = quals M.! q
+      when (n `S.member` M.findWithDefault S.empty m (privates scope)) $
+        Left (at pos ++ n ++ " is private to module " ++ m)
+      when (n `S.notMember` pubs m) $
+        Left (at pos ++ "module " ++ m ++ " has no " ++ n)
+      Right (internal scope m False n)
 
-renameTy :: M.Map String String -> Ty -> Ty
-renameTy s t = case t of
-  TData n as -> TData (r n) (map go as)
-  TFun a e b -> TFun (go a) (S.map r e) (go b)
-  TLFun a e b -> TLFun (go a) (S.map r e) (go b)
-  TBox a -> TBox (go a)
-  TPair a b -> TPair (go a) (go b)
-  TRef a -> TRef (go a)
-  TMut a -> TMut (go a)
-  TForall vs es b -> TForall vs es (go b)
-  _ -> t
-  where
-    r x = M.findWithDefault x x s
-    go = renameTy s
+    -- A dotted name from explicit type arguments (q.f[t]).
+    name pos n = case break (== '.') n of
+      (q, '.' : f) | M.member q quals -> qualified pos q f
+      _ -> plain pos n
 
--- | Rename global references, leaving local variables (which may shadow) alone.
-renameTerm :: M.Map String String -> S.Set String -> Term -> Term
-renameTerm s bound tm = case tm of
-  Var x | x `S.notMember` bound -> Var (r x)
-  Lam x t b -> Lam x (ty t) (go (S.insert x bound) b)
-  LLam x t b -> LLam x (ty t) (go (S.insert x bound) b)
-  Let x e b -> Let x (go bound e) (go (S.insert x bound) b)
-  LetVar x e b -> LetVar x (go bound e) (go (S.insert x bound) b)
-  LetPair x y e b -> LetPair x y (go bound e) (go (S.insert x (S.insert y bound)) b)
-  Case e alts -> Case (go bound e) [(r c, xs, go (bound <> S.fromList xs) b) | (c, xs, b) <- alts]
-  Handle l e cs -> Handle (r l) (go bound e) [(r op, x, go (S.insert x bound) b) | (op, x, b) <- cs]
-  Con c ts as -> Con (r c) (map ty ts) (map (go bound) as)
-  TyApp f ts es -> TyApp (r f) (map ty ts) (map (S.map r) es)
-  Cocase dn ts bs -> Cocase (r dn) (map ty ts) [(o, go bound b) | (o, b) <- bs]
-  BitsLit b fs -> BitsLit (r b) [(f, go bound e) | (f, e) <- fs]
-  Perform op e -> Perform (r op) (go bound e)
-  _ -> descend (go bound) tm
-  where
-    r x = M.findWithDefault x x s
-    ty = renameTy s
-    go = renameTerm s
+    -- Types carry no positions: their errors point at the declaration's first expression.
+    renameDecl d = case d of
+      Data lin n ps cs -> Data lin (r n) ps <$> mapM (\(c, fs) -> (r c,) <$> mapM (ty top) fs) cs
+      Codata n ps os -> Codata (r n) ps <$> mapM (\(o, t) -> (o,) <$> ty top t) os
+      Effect l ops -> Effect (r l) <$> mapM (\(o, a, b) -> (r o,,) <$> ty top a <*> ty top b) ops
+      Def f t e -> let p = listToMaybe [q | At q _ <- universe e] in Def (r f) <$> ty p t <*> term p S.empty e
+      Bitdata n it fs -> Right (Bitdata (r n) it fs)
+      where
+        r n = own M.! n
+        top = Just (path, 1, 1)
+
+    ty pos t = case t of
+      TData n as -> TData <$> plain pos n <*> mapM (ty pos) as
+      TFun a e b -> TFun <$> ty pos a <*> effs pos e <*> ty pos b
+      TLFun a e b -> TLFun <$> ty pos a <*> effs pos e <*> ty pos b
+      TBox a -> TBox <$> ty pos a
+      TPair a b -> TPair <$> ty pos a <*> ty pos b
+      TRef a -> TRef <$> ty pos a
+      TMut a -> TMut <$> ty pos a
+      TForall vs es b -> TForall vs es <$> ty pos b
+      _ -> Right t
+    effs pos e = S.fromList <$> mapM (\l -> if take 1 l == "'" then Right l else plain pos l) (S.toList e)
+
+    -- Global names in a term, leaving local variables (which may shadow) alone. pos is the
+    -- innermost enclosing source position, for errors.
+    term pos bound tm = case tm of
+      At p e -> At p <$> term (Just p) bound e
+      Var x | x `S.notMember` bound -> Var <$> plain pos x
+      Proj (Var q) n | q `S.notMember` bound, M.member q quals -> Var <$> qualified pos q n
+      Lam x t b -> Lam x <$> ty pos t <*> go (S.insert x bound) b
+      LLam x t b -> LLam x <$> ty pos t <*> go (S.insert x bound) b
+      Let x e b -> Let x <$> go bound e <*> go (S.insert x bound) b
+      LetVar x e b -> LetVar x <$> go bound e <*> go (S.insert x bound) b
+      LetPair x y e b -> LetPair x y <$> go bound e <*> go (S.insert x (S.insert y bound)) b
+      Case e alts -> Case <$> go bound e <*> mapM (\(c, xs, b) -> (,xs,) <$> plain pos c <*> go (bound <> S.fromList xs) b) alts
+      Handle l e cs -> Handle <$> plain pos l <*> go bound e <*> mapM (\(op, x, b) -> (,x,) <$> plain pos op <*> go (S.insert x bound) b) cs
+      Con c ts as -> Con <$> plain pos c <*> mapM (ty pos) ts <*> mapM (go bound) as
+      TyApp f ts es -> TyApp <$> name pos f <*> mapM (ty pos) ts <*> mapM (effs pos) es
+      Cocase dn ts bs -> Cocase <$> plain pos dn <*> mapM (ty pos) ts <*> mapM (\(o, b) -> (o,) <$> go bound b) bs
+      BitsLit b fs -> BitsLit <$> plain pos b <*> mapM (\(f, e) -> (f,) <$> go bound e) fs
+      Perform op e -> Perform <$> plain pos op <*> go bound e
+      _ -> descendM (go bound) tm
+      where
+        go = term pos

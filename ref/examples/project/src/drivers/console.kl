@@ -1,3 +1,6 @@
 private def helper : List u8 ->{IO, Diverge} Unit = \s. print s
 
 def greet : List u8 ->{IO, Diverge} Unit = \name. helper "hello, "; println name
+
+-- led.kl has an init too: main calls each by its module (console.init, light.init).
+def init : Unit ->{IO, Diverge} Unit = \u. println "console ready"

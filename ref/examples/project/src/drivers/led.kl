@@ -1,0 +1,1 @@
+def init : Unit ->{IO, Diverge} Unit = \u. println "led ready"

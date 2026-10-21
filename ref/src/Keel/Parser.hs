@@ -24,7 +24,7 @@ parseProgram :: FilePath -> String -> Either String Program
 parseProgram path src = do
   Module imports decls main <- parseModule path src
   case (imports, main) of
-    ((m, _) : _, _) -> Left (path ++ ": imports " ++ m ++ ": load it with keelc (the module loader)")
+    ((m, _, _) : _, _) -> Left (path ++ ": imports " ++ m ++ ": load it with keelc (the module loader)")
     (_, Nothing) -> Left (path ++ ": no main")
     ([], Just m) -> Right (Program (map snd decls) m)
 
@@ -135,14 +135,16 @@ negative e = e
 
 -- Declarations ------------------------------------------------------------------------------
 
--- | @import a.b@ lines, then declarations (optionally @private@), then an optional @main@.
+-- | @import a.b [as q]@ lines, then declarations (optionally @private@), then an optional
+-- @main@. Without @as@, the module is known by its last segment (@b@).
 moduleP :: Parser Module
 moduleP = do
   imports <- many $ do
     pos <- getPosition
     reserved "import"
     name <- sepBy1 lower (op ".")
-    pure (foldr1 (\a b -> a ++ "." ++ b) name, (sourceName pos, sourceLine pos, sourceColumn pos))
+    q <- option (last name) (reserved "as" >> lower)
+    pure (foldr1 (\a b -> a ++ "." ++ b) name, q, (sourceName pos, sourceLine pos, sourceColumn pos))
   decls <- many ((,) <$> option False (reserved "private" $> True) <*> decl)
   main <- optionMaybe (reserved "main" >> op "=" >> expr)
   pure (Module imports decls main)
@@ -354,6 +356,7 @@ postfix = do
       ts <- brackets (sepBy ty comma)
       pure $ \t -> case t of
         Var f -> TyApp f ts []
+        Proj (Var q) f -> TyApp (q ++ "." ++ f) ts [] -- a qualified name (resolved by "Keel.Modules")
         Con c [] as -> Con c ts as
         _ -> t
 

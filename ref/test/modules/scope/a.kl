@@ -1,0 +1,5 @@
+import b
+
+private def secret : i64 -> i64 = \n. n
+
+def open : i64 -> i64 = \n. secret n
