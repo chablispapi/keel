@@ -302,7 +302,7 @@ annotations.
 
 | Label | Operations | Handleable | Raised by |
 |---|---|---|---|
-| `IO` | `out : i64 ⇒ Unit` | yes | `out(e)`; at top level, appends to the program's output trace |
+| `IO` | `out : i64 ⇒ Unit`, `putc : u8 ⇒ Unit` | yes | at top level, `out` prints a number and a newline, `putc` one byte |
 | `Panic` | none | no | checked arithmetic overflow |
 | `Diverge` | none | no | referencing a definition from its own recursive group (§2.4) |
 
@@ -482,7 +482,7 @@ main = handle send([72, 105]) with MMIO {        -- a mock UART
 | Program | Result |
 |---|---|
 | the mock UART above | `()`, output `[72, 105]` |
-| `handle out(5) with IO { out x → out(x * 10) }` | `()`, output `[50]` (clause reaches the outer handler) |
+| `handle out(5) with IO { out x → out(x * 10) ; putc c → putc(c) }` | `()`, output `[50]` (clause reaches the outer handler) |
 | `250:u8 +% 10:u8` | `4:u8` |
 | `100:i8 *% 2:i8` | `-56:i8` |
 | `250:u8 +| 10:u8` | `255:u8` |

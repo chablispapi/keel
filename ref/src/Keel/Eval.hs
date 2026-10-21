@@ -51,15 +51,15 @@ instance Eq Value where
 data Outcome = Done Value | Panicked String
   deriving (Eq, Show)
 
--- | Evaluation can panic and appends @out@ values to a trace (kept in reverse).
-type Run = ExceptT String (State [Integer])
+-- | Evaluation can panic and appends output text, in reversed chunks.
+type Run = ExceptT String (State [String])
 
 -- | A handler frame: operation ↦ (parameter, clause body), and the clause environment.
 data Handler = Handler (M.Map String (String, Term)) Env
 
 -- | Run @main@; returns the outcome and the values written with the built-in @out@ operation.
-evalProgram :: Program -> (Outcome, [Integer])
-evalProgram (Program decls main) = (either Panicked Done r, reverse trace)
+evalProgram :: Program -> (Outcome, String)
+evalProgram (Program decls main) = (either Panicked Done r, concat (reverse trace))
   where
     (r, trace) = runState (runExceptT (eval [] globals main)) []
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
@@ -152,7 +152,8 @@ perform hs op v = case break handles hs of
 -- | Operations no handler caught are performed by the machine. The evaluator has no device
 -- memory, so an unhandled MMIO operation panics (handle MMIO with a mock to run drivers here).
 machine :: String -> Value -> Run Value
-machine "out" (VInt _ n) = lift (modify (n :)) >> pure VUnit
+machine "out" (VInt _ n) = lift (modify ((show n ++ "\n") :)) >> pure VUnit
+machine "putc" (VInt _ b) = lift (modify ([toEnum (fromInteger b)] :)) >> pure VUnit
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
 
 prim :: Prim -> Value -> Value -> Run Value
@@ -171,6 +172,7 @@ prim op (VInt t a) (VInt _ b) = case op of
           Xor -> xor a b
           Shl -> wrap (a `shiftL` amount)
           Shr -> a `shiftR` amount
+  Arith _ aop | aop `elem` [Div, Rem], b == 0 -> throwE "division by zero"
   Arith ov aop ->
     let r = arith aop a b
         (lo, hi) = intRange t
@@ -185,6 +187,10 @@ prim op (VInt t a) (VInt _ b) = case op of
     sym Add = " + "
     sym Sub = " - "
     sym Mul = " * "
+    sym Div = " / "
+    sym Rem = " % "
+    arith Div = quot
+    arith Rem = rem
     arith Add = (+)
     arith Sub = (-)
     arith Mul = (*)

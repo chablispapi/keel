@@ -275,7 +275,11 @@ cmpE = do
 
 addE, mulE :: Parser Term
 addE = chainl1 mulE (arithOp [("+", Add), ("-", Sub)])
-mulE = chainl1 convE (arithOp [("*", Mul)] <|> bitOp)
+mulE = chainl1 convE (arithOp [("*", Mul)] <|> divOp <|> bitOp)
+
+-- | @/@ and @%@: checked division and remainder (no wrapping or saturating forms).
+divOp :: Parser (Term -> Term -> Term)
+divOp = (op "/" $> Prim (Arith Checked Div)) <|> (op "%" $> Prim (Arith Checked Rem))
 
 -- | @e as u8@: wrapping integer conversion, binding tighter than the operators.
 convE :: Parser Term

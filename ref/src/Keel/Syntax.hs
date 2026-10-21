@@ -59,7 +59,9 @@ data Kind = Free | Lin
 data Overflow = Checked | Wrap | Saturate | Optional -- ^ Optional: @+?@ returns Option
   deriving (Eq, Show)
 
-data ArithOp = Add | Sub | Mul
+-- | Division truncates toward zero; @Rem@ has the sign of the dividend. Only the checked forms
+-- exist: dividing by zero, and @min / -1@, panic.
+data ArithOp = Add | Sub | Mul | Div | Rem
   deriving (Eq, Show)
 
 -- | Bitwise operations: never overflow; shifts are logical for unsigned types and
@@ -283,10 +285,11 @@ divergeE = "Diverge"
 
 -- | Built-in effects and their operations, in operation-number order (the native runtime
 -- numbers operations this way, then user operations in declaration order). Unhandled, @out@
--- prints and the MMIO operations access device memory (freestanding targets only).
+-- prints a number and a newline, @putc@ one byte, and the MMIO operations access device
+-- memory (freestanding targets only).
 builtinEffects :: [(String, [(String, Ty, Ty)])]
 builtinEffects =
-  [ (ioE, [("out", TInt i64, TUnit)])
+  [ (ioE, [("out", TInt i64, TUnit), ("putc", TInt u8, TUnit)])
   , ( mmioE
     , [ ("read8", TInt u64, TInt u8)
       , ("read32", TInt u64, TInt u32)

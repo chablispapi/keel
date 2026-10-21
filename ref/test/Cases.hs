@@ -347,7 +347,7 @@ cases =
     , Gives VUnit [72, 105]
     )
   , ( "handler clause reaches the outer handler"
-    , Program [] (Handle ioE (Perform "out" (int 5)) [("out", "x", Perform "out" (mul (Var "x") (int 10)))])
+    , Program [] (Handle ioE (Perform "out" (int 5)) [("out", "x", Perform "out" (mul (Var "x") (int 10))), ("putc", "ch", Perform "putc" (Var "ch"))])
     , Gives VUnit [50]
     )
   , ("wrapping add", Program [] (Prim (Arith Wrap Add) (IntLit u8 250) (IntLit u8 10)), ok (VInt u8 4))
@@ -390,7 +390,7 @@ cases =
     )
   , ("non-positive data", Program [Data False "T" [] [("MkT", [fn (TData "T" []) tI])]] (int 0), Rejects NonPositive)
   , ( "handler clause captures linear"
-    , withToken (letTok (Handle ioE (Perform "out" (int 1)) [("out", "x", Let "r" (App (Var "consume") (Var "t")) UnitLit)]))
+    , withToken (letTok (Handle ioE (Perform "out" (int 1)) [("out", "x", Let "r" (App (Var "consume") (Var "t")) UnitLit), ("putc", "ch", Perform "putc" (Var "ch"))]))
     , Rejects LinearCapture
     )
   , ( "handler misses an operation"
@@ -452,11 +452,11 @@ cases =
     , Rejects Duplicate
     )
   , ( "changing an outer place inside a handled expression"
-    , Program [] (LetVar "x" (int 0) (Handle ioE (Assign "x" (int 1)) [("out", "v", UnitLit)]))
+    , Program [] (LetVar "x" (int 0) (Handle ioE (Assign "x" (int 1)) [("out", "v", UnitLit), ("putc", "ch", Perform "putc" (Var "ch"))]))
     , Rejects PlaceCapture
     )
   , ( "handler clause reads a place"
-    , Program [] (LetVar "x" (int 0) (Handle ioE (Perform "out" (int 1)) [("out", "v", Perform "out" (Var "x"))]))
+    , Program [] (LetVar "x" (int 0) (Handle ioE (Perform "out" (int 1)) [("out", "v", Perform "out" (Var "x")), ("putc", "ch", Perform "putc" (Var "ch"))]))
     , Rejects PlaceCapture
     )
   -- Stage 4 -------------------------------------------------------------------------------

@@ -39,10 +39,14 @@ main = do
          in [failMsg name "monomorphized program still has type variables" | not (isClosed mono)]
               ++ [failMsg name ("monomorphization changed the result: " ++ show (evalProgram mono)) | evalProgram mono /= got]
               ++ case (got, expect) of
-                ((Done v, tr), Gives v' tr') | v == v' && tr == tr' -> []
-                ((Panicked _, tr), Panics tr') | tr == tr' -> []
+                ((Done v, tr), Gives v' tr') | v == v' && tr == render tr' -> []
+                ((Panicked _, tr), Panics tr') | tr == render tr' -> []
                 _ -> [failMsg name ("got " ++ show got)]
     failMsg name msg = "FAIL " ++ name ++ ": " ++ msg
+
+-- | The output text of a list of @out@ values.
+render :: [Integer] -> String
+render = concatMap (\n -> show n ++ "\n")
 
 positionCases :: [(String, String, ErrKind, Pos)]
 positionCases =

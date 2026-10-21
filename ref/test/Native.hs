@@ -1,8 +1,8 @@
 {-# LANGUAGE LambdaCase #-}
 
 -- | Native differential tests: each program is compiled to ARM64 assembly, linked with the
--- system @cc@ and run. Its output must match the reference evaluator: same @out@ trace, and
--- the same result (last line @result: …@, printed like the evaluator) or a panic (exit 101).
+-- system @cc@ and run. Its output must match the reference evaluator: the same output text,
+-- then the same result (@result: …@, printed like the evaluator) or a panic (exit 101).
 -- Every run also reports its allocator counters (KEEL_STATS): a program that finishes must
 -- end with no live heap blocks, so a missing drop (a leak) fails the test.
 --
@@ -147,7 +147,18 @@ cases =
   , ("u16 +? overflow", Program [] (Prim (Arith Optional Add) (IntLit u16 65535) (IntLit u16 1)))
   , ("i16 wrapping sub", Program [] (Prim (Arith Wrap Sub) (IntLit i16 (-32768)) (IntLit i16 1)))
   , ("memory is freed: 10M pairs in a 64 MB heap", Program [churnDef] (App (App (Var "churn") (int 10000000)) (int 0)))
+  , ("division truncates toward zero", Program [] (Pair (divide (int (-7)) (int 2)) (remainder (int (-7)) (int 2))))
+  , ("u64 division", Program [] (Prim (Arith Checked Div) (IntLit u64 u64Max) (IntLit u64 10)))
+  , ("division by zero panics", Program [] (Seq (out (int 3)) (divide (int 1) (int 0))))
+  , ("i64 min / -1 panics", Program [] (divide (int (-9223372036854775808)) (int (-1))))
+  , ("i64 min % -1 is 0", Program [] (remainder (int (-9223372036854775808)) (int (-1))))
+  , ("i8 min / -1 panics", Program [] (Prim (Arith Checked Div) (IntLit i8 (-128)) (IntLit i8 (-1))))
+  , ("u8 remainder", Program [] (Prim (Arith Checked Rem) (IntLit u8 250) (IntLit u8 7)))
   ]
+
+divide, remainder :: Term -> Term -> Term
+divide = Prim (Arith Checked Div)
+remainder = Prim (Arith Checked Rem)
 
 -- def churn : i64 → i64 →{Panic, Diverge} i64: allocates a pair per iteration and drops it.
 -- 10 million pairs are ~320 MB, five times the heap: this only finishes if memory is freed.
@@ -175,18 +186,18 @@ specCases = [("spec: " ++ name, p) | (name, p, e) <- Cases.cases, runs e]
     runs (Rejects _) = False
     runs _ = True
 
--- | Example files and what they must print: (result, or Nothing for a panic; out trace).
+-- | Example files and what they must print: (result, or Nothing for a panic; output text).
 exampleFiles :: [(FilePath, Run)]
 exampleFiles =
-  [ ("examples/hello.kl", (Just "25", [9, 16]))
-  , ("examples/fact.kl", (Just "500000500000", [2432902008176640000]))
-  , ("examples/lists.kl", (Just "60", []))
-  , ("examples/sort.kl", (Just "Cons(3, box Cons(2, box Cons(1, box Nil)))", []))
-  , ("examples/counter.kl", (Just "44", []))
-  , ("examples/uart.kl", (Just "()", [72, 105]))
-  , ("examples/overflow.kl", (Nothing, [1, 2]))
-  , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", []))
-  , ("examples/reuse.kl", (Just "1500500", []))
+  [ ("examples/hello.kl", (Just "25", "9\n16\n"))
+  , ("examples/fact.kl", (Just "500000500000", "2432902008176640000\n"))
+  , ("examples/lists.kl", (Just "60", ""))
+  , ("examples/sort.kl", (Just "Cons(3, box Cons(2, box Cons(1, box Nil)))", ""))
+  , ("examples/counter.kl", (Just "44", ""))
+  , ("examples/uart.kl", (Just "()", "72\n105\n"))
+  , ("examples/overflow.kl", (Nothing, "1\n2\n"))
+  , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", ""))
+  , ("examples/reuse.kl", (Just "1500500", ""))
   ]
 
 -- | Parse and infer an example; check the evaluator against the expected output, and return
@@ -243,10 +254,12 @@ runRiscV tools dir i (name, prog) = case (compile prog, compileRiscV prog) of
       Left e -> pure [failMsg e]
       Right elf -> do
         (code, uart) <- runQemu tools elf
-        let ls = lines uart
-            stats = parseStats (unlines (filter ("keel-stats:" `isPrefixOf`) ls))
-            rest = filter (\l -> not ("keel-stats:" `isPrefixOf` l || "panic:" `isPrefixOf` l)) ls
-            native = parseRun code rest
+        -- The UART carries everything: the program's output, then a panic message or the
+        -- result and statistics lines.
+        let (body, stats) = case breakLast "keel-stats:" uart of
+              Just (before, after) -> (before, parseStats ("keel-stats:" ++ after))
+              Nothing -> (maybe uart fst (breakLast "panic: " uart), Nothing)
+            native = parseRun code body
             reference = reduce (evalProgram mono)
         pure $
           [failMsg ("RISC-V " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]
@@ -282,7 +295,7 @@ runCase dir i (name, prog) = case (compile prog, compileNative prog) of
       ExitSuccess -> do
         environment <- getEnvironment
         (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) ""
-        let native = parseRun code (lines stdout)
+        let native = parseRun code stdout
             reference = reduce (evalProgram mono)
             stats = parseStats stderr
         pure $
@@ -310,19 +323,28 @@ parseStats err = case [l | l <- lines err, "keel-stats:" `isInfixOf` l] of
       [(n, "")] -> Just n
       _ -> Nothing
 
--- | (result line or Nothing for a panic, out trace)
-type Run = (Maybe String, [Integer])
+-- | (result line or Nothing for a panic, output text)
+type Run = (Maybe String, String)
 
-reduce :: (Outcome, [Integer]) -> Run
-reduce (Done v, tr) = (Just (show v), tr)
-reduce (Panicked _, tr) = (Nothing, tr)
+reduce :: (Outcome, String) -> Run
+reduce (Done v, out') = (Just (show v), out')
+reduce (Panicked _, out') = (Nothing, out')
 
-parseRun :: ExitCode -> [String] -> Maybe Run
-parseRun code ls = case code of
-  ExitSuccess | not (null ls), Just r <- stripPrefix "result: " (last ls) -> (Just r,) <$> mapM readInt (init ls)
-  ExitFailure 101 -> (Nothing,) <$> mapM readInt ls
+-- | Split at the last occurrence of a marker: (before, after it).
+breakLast :: String -> String -> Maybe (String, String)
+breakLast needle hay = case [i | i <- [0 .. length hay - length needle], needle `isPrefixOf` drop i hay] of
+  [] -> Nothing
+  is -> let i = last is in Just (take i hay, drop (i + length needle) hay)
+
+-- | A finished run prints its output, then @result: …@ and a newline; a panic (exit 101)
+-- leaves just the output.
+parseRun :: ExitCode -> String -> Maybe Run
+parseRun code text = case code of
+  ExitSuccess
+    | Just (before, after) <- breakLast "result: " text
+    , Just r <- stripSuffix' "\n" after ->
+        Just (Just r, before)
+  ExitFailure 101 -> Just (Nothing, text)
   _ -> Nothing
   where
-    readInt s = case reads s of
-      [(n, "")] -> Just n
-      _ -> Nothing
+    stripSuffix' suf s = reverse <$> stripPrefix (reverse suf) (reverse s)

@@ -354,6 +354,7 @@ rhsCode slots rhs = case rhs of
     case op of
       Eq -> ins "cmp x9, x10" >> ins "cset x0, eq"
       Lt -> ins "cmp x9, x10" >> ins ("cset x0, " ++ if signed it then "lt" else "lo")
+      Arith _ aop | aop `elem` [Div, Rem] -> divide it aop
       Arith ov aop -> arith it ov aop
       Bits bop -> bitwise it bop
   RCall f a -> do
@@ -480,7 +481,7 @@ arith it@(IntTy sgn n) ov aop
     opName = case aop of
       Add -> "add"
       Sub -> "sub"
-      Mul -> "mul"
+      _ -> "mul"
     plain = ins (opName ++ " x0, x9, x10")
     extend
       | sgn = ins ((case n of 8 -> "sxtb"; 16 -> "sxth"; _ -> "sxtw") ++ " x0, w0")
@@ -503,14 +504,14 @@ arith it@(IntTy sgn n) ov aop
       | otherwise = case (aop, sgn) of
           (Add, True) -> ins "adds x0, x9, x10" >> ins ("b.vs " ++ lOvf)
           (Sub, True) -> ins "subs x0, x9, x10" >> ins ("b.vs " ++ lOvf)
-          (Mul, True) -> do
+          (_, True) -> do -- Mul (division never reaches here: see divide)
             ins "mul x0, x9, x10"
             ins "smulh x11, x9, x10"
             ins "cmp x11, x0, asr #63"
             ins ("b.ne " ++ lOvf)
           (Add, False) -> ins "adds x0, x9, x10" >> ins ("b.cs " ++ lOvf)
           (Sub, False) -> ins "subs x0, x9, x10" >> ins ("b.lo " ++ lOvf)
-          (Mul, False) -> do
+          (_, False) -> do -- Mul
             ins "mul x0, x9, x10"
             ins "umulh x11, x9, x10"
             ins ("cbnz x11, " ++ lOvf)
@@ -528,6 +529,29 @@ arith it@(IntTy sgn n) ov aop
           -- add/sub overflow toward the sign of a; mul toward the sign of a·b
           if aop == Mul then ins "eor x13, x9, x10" >> ins "cmp x13, #0" else ins "cmp x9, #0"
           ins "csel x0, x11, x12, lt"
+
+-- | Checked division with x9, x10 as operands and the result in x0. Canonical values divide
+-- exactly in 64 bits; the only overflow is min / -1, caught by a range check for narrow types
+-- and explicitly for i64 (the hardware returns min without trapping).
+divide :: IntTy -> ArithOp -> G ()
+divide it@(IntTy sgn n) aop = do
+  ins "cbz x10, _keel_panic_div"
+  when (sgn && n == 64 && aop == Div) $ do
+    lOk <- newLabel
+    ins "cmn x10, #1"
+    ins ("b.ne " ++ lOk)
+    movImm "x11" (fst (intRange it))
+    ins "cmp x9, x11"
+    ins "b.eq _keel_panic_overflow"
+    line (lOk ++ ":")
+  let d = if sgn then "sdiv" else "udiv"
+  case aop of
+    Div -> ins (d ++ " x0, x9, x10")
+    _ -> ins (d ++ " x11, x9, x10") >> ins "msub x0, x11, x10, x9"
+  when (sgn && n < 64 && aop == Div) $ do
+    movImm "x11" (snd (intRange it))
+    ins "cmp x0, x11"
+    ins "b.gt _keel_panic_overflow"
 
 -- | Re-extend x0 to the canonical form of an integer type (no-op for 64-bit types).
 canonical :: IntTy -> G ()
@@ -871,6 +895,8 @@ emitRuntime = do
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
   line "L_perform_machine:"
+  ins "cmp x0, #1" -- putc
+  ins "b.eq L_perform_putc"
   ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
   ins "sub sp, sp, #16"
   ins "str x1, [sp]" -- printf's variadic argument
@@ -881,8 +907,15 @@ emitRuntime = do
   ins "mov x0, #0"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
+  line "L_perform_putc:"
+  ins "mov x0, x1"
+  ins "bl _putchar"
+  ins "mov x0, #0"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
 
   panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO needs a freestanding target)\n"
+  panic "_keel_panic_div" "panic: division by zero\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"

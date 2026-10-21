@@ -339,10 +339,14 @@ infer s rec ctx tm = case tm of
       _ -> err Mismatch ("arithmetic on " ++ prettyTy ta)
     (eb, ub) <- expect ta b
     u <- join2 ua ub
+    case op of
+      Arith ov aop | aop `elem` [Div, Rem], ov /= Checked -> err Mismatch "division has only the checked forms / and %"
+      _ -> pure ()
     let (t, extra) = case op of
           Eq -> (TBool, S.empty)
           Lt -> (TBool, S.empty)
           Arith Checked _ -> (ta, S.singleton panicE)
+          Arith _ aop | aop `elem` [Div, Rem] -> (ta, S.singleton panicE) -- rejected below
           Arith Optional _ -> (TData "Option" [ta], S.empty)
           Arith _ _ -> (ta, S.empty)
           Bits _ -> (ta, S.empty)

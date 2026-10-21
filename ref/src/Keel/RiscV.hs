@@ -310,6 +310,7 @@ rhsCode slots rhs = case rhs of
     case op of
       Eq -> ins "xor a0, t0, t1" >> ins "seqz a0, a0"
       Lt -> ins ((if signed it then "slt" else "sltu") ++ " a0, t0, t1")
+      Arith _ aop | aop `elem` [Div, Rem] -> divide it aop
       Arith ov aop -> arith it ov aop
       Bits bop -> bitwise it bop
   RCall f a -> do
@@ -396,6 +397,23 @@ rhsCode slots rhs = case rhs of
         atom slots "t2" a
         ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
 
+-- | Checked division (t0 / t1 into a0), as in "Keel.AArch64": RISC-V doesn't trap on a zero
+-- divisor or on min / -1, so both are checked.
+divide :: IntTy -> ArithOp -> G ()
+divide it@(IntTy sgn n) aop = do
+  jumpIf "beqz" ["t1"] "_keel_panic_div"
+  when (sgn && n == 64 && aop == Div) $ do
+    lOk <- newLabel
+    ins "li t2, -1"
+    ins ("bne t1, t2, " ++ lOk)
+    li "t2" (fst (intRange it))
+    jumpIf "beq" ["t0", "t2"] "_keel_panic_overflow"
+    line (lOk ++ ":")
+  ins ((case aop of Div -> "div"; _ -> "rem") ++ (if sgn then "" else "u") ++ " a0, t0, t1")
+  when (sgn && n < 64 && aop == Div) $ do
+    li "t2" (snd (intRange it))
+    jumpIf "bgt" ["a0", "t2"] "_keel_panic_overflow"
+
 -- | Re-extend a0 to the canonical form of an integer type.
 canonical :: IntTy -> G ()
 canonical (IntTy sgn n)
@@ -438,7 +456,7 @@ arith it@(IntTy sgn n) ov aop
     opName = case aop of
       Add -> "add"
       Sub -> "sub"
-      Mul -> "mul"
+      _ -> "mul"
     plain = ins (opName ++ " a0, t0, t1")
     detect lOvf
       | narrow && sgn = do
@@ -465,14 +483,14 @@ arith it@(IntTy sgn n) ov aop
             ins "xor t3, t0, a0"
             ins "and t2, t2, t3"
             jumpIf "bltz" ["t2"] lOvf
-          (Mul, True) -> do
+          (_, True) -> do -- Mul (division never reaches here: see divide)
             ins "mul a0, t0, t1"
             ins "mulh t2, t0, t1"
             ins "srai t3, a0, 63"
             jumpIf "bne" ["t2", "t3"] lOvf
           (Add, False) -> ins "add a0, t0, t1" >> jumpIf "bltu" ["a0", "t0"] lOvf
           (Sub, False) -> ins "sub a0, t0, t1" >> jumpIf "bltu" ["t0", "t1"] lOvf
-          (Mul, False) -> do
+          (_, False) -> do -- Mul
             ins "mul a0, t0, t1"
             ins "mulhu t2, t0, t1"
             jumpIf "bnez" ["t2"] lOvf
@@ -802,20 +820,27 @@ emitRuntime = do
   ins "ld ra, 24(sp)"
   ins "addi sp, sp, 32"
   ins "ret"
-  -- The machine: out (0) prints; MMIO reads and writes device memory.
+  -- The machine: out (0) and putc (1) print; MMIO reads and writes device memory.
   line ".L_perform_machine:"
   ins "li t0, 1"
-  ins "beq a0, t0, .L_read8"
+  ins "beq a0, t0, .L_putc_op"
   ins "li t0, 2"
-  ins "beq a0, t0, .L_read32"
+  ins "beq a0, t0, .L_read8"
   ins "li t0, 3"
-  ins "beq a0, t0, .L_write8"
+  ins "beq a0, t0, .L_read32"
   ins "li t0, 4"
+  ins "beq a0, t0, .L_write8"
+  ins "li t0, 5"
   ins "beq a0, t0, .L_write32"
   ins "bnez a0, .L_perform_unhandled"
   ins "mv a0, a1"
   ins "call _keel_print_i64"
   ins "li a0, 10"
+  ins "call _keel_putc"
+  ins "li a0, 0"
+  ins "j .L_machine_ret"
+  line ".L_putc_op:"
+  ins "mv a0, a1"
   ins "call _keel_putc"
   ins "li a0, 0"
   ins "j .L_machine_ret"
@@ -917,6 +942,7 @@ emitRuntime = do
   ins "j .L_exit_hang"
 
   panic "_keel_panic_unhandled" "panic: unhandled operation\n"
+  panic "_keel_panic_div" "panic: division by zero\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"

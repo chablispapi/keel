@@ -39,8 +39,8 @@ main = do
     ["run", f] -> do
       (src, core) <- load f
       mono <- orDie (showErr f src (compile core))
-      let (outcome, trace) = evalProgram mono
-      mapM_ print trace
+      let (outcome, output) = evalProgram mono
+      putStr output
       case outcome of
         Done v -> putStrLn ("result: " ++ show v)
         Panicked msg -> hPutStrLn stderr ("panic: " ++ msg) >> exitWith (ExitFailure 101)
