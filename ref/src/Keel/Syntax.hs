@@ -311,11 +311,12 @@ data Decl
 data Program = Program [Decl] Term
   deriving (Eq, Show)
 
--- | Built-in effect labels. @IO@ (output), @Input@ and @MMIO@ have the operations in
+-- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@ and @Files@ have the operations in
 -- 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
-ioE, inputE, mmioE, panicE, divergeE :: String
+ioE, inputE, mmioE, filesE, panicE, divergeE :: String
 ioE = "IO"
 inputE = "Input"
+filesE = "Files"
 mmioE = "MMIO"
 panicE = "Panic"
 divergeE = "Diverge"
@@ -323,7 +324,10 @@ divergeE = "Diverge"
 -- | Built-in effects and their operations, in operation-number order (the native runtime
 -- numbers operations this way, then user operations in declaration order). Unhandled, @out@
 -- prints a number and a newline, @putc@ one byte, @getc@ reads one byte of input (-1 at its
--- end), and the MMIO operations access device memory (freestanding targets only).
+-- end), the MMIO operations access device memory (freestanding targets only), and the Files
+-- operations read files: @openFile@ takes a path's bytes and gives a handle (-1 if it can't be
+-- opened), @readByte@ a byte (-1 at the end), @closeFile@ releases the handle (hosted targets
+-- only). "std.file" wraps them.
 builtinEffects :: [(String, [(String, Ty, Ty)])]
 builtinEffects =
   [ (ioE, [("out", TInt i64, TUnit), ("putc", TInt u8, TUnit)])
@@ -335,6 +339,7 @@ builtinEffects =
       , ("write32", TPair (TInt u64) (TInt u32), TUnit)
       ]
     )
+  , (filesE, [("openFile", TData "Array" [TInt u8], TInt i64), ("readByte", TInt i64, TInt i64), ("closeFile", TInt i64, TUnit)])
   ]
 
 -- | Built-in data: @data Option a = None | Some(a)@, the result of @+?@.

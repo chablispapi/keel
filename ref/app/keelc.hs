@@ -19,7 +19,11 @@ import Data.Char (isSpace)
 import Data.Map.Strict qualified as M
 import Keel.AArch64 (compileNativeWith)
 import Keel.Check (TypeError (..), checkProgram)
-import Keel.Eval (Outcome (..), evalProgramWith)
+import Control.Exception (IOException, try)
+import Data.ByteString qualified as B
+import Data.ByteString.Char8 qualified as BC
+import Keel.Eval (Machine (..), Outcome (..), evalProgramOn)
+import System.IO.Unsafe (unsafePerformIO)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (serve)
 import Keel.Modules (loadModules)
@@ -72,7 +76,7 @@ main = do
           hSetBinaryMode stdin True
           hSetBinaryMode stdout True
           input <- getContents
-          let (outcome, output) = evalProgramWith input mono
+          let (outcome, output) = evalProgramOn (Machine input readBytes) mono
           putStr output
           case outcome of
             Done v -> putStrLn ("result: " ++ show v)
@@ -196,6 +200,15 @@ showErr sources = either (Left . render) Right
          in f ++ ":" ++ show l ++ ":" ++ show c ++ ": error [" ++ show k ++ "]: " ++ msg ++ "\n"
               ++ gutter ++ srcLine ++ "\n"
               ++ replicate (length gutter + c - 1) ' ' ++ "^"
+
+-- | The files keelc run's programs can open, read when they open them.
+-- ponytail: unsafePerformIO keeps the evaluator pure; a file changed while the program runs is
+-- read as it is when opened, which is what fopen gives too.
+readBytes :: FilePath -> Maybe String
+readBytes path = unsafePerformIO $ do
+  r <- try (B.readFile path)
+  pure (either (\(_ :: IOException) -> Nothing) (Just . BC.unpack) r)
+{-# NOINLINE readBytes #-}
 
 orDie :: Either String a -> IO a
 orDie = either die pure

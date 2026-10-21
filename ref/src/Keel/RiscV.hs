@@ -1117,8 +1117,8 @@ emitRuntime = do
   ins "ld ra, 24(sp)"
   ins "addi sp, sp, 32"
   ins "ret"
-  -- The machine: out (0) and putc (1) print, getc (2) reads the UART; MMIO reads and writes
-  -- device memory.
+  -- The machine: out (0) and putc (1) print, getc (2) reads the UART; MMIO (3–6) reads and
+  -- writes device memory; there are no files (7–9).
   line ".L_perform_machine:"
   ins "li t0, 1"
   ins "beq a0, t0, .L_putc_op"
@@ -1132,6 +1132,12 @@ emitRuntime = do
   ins "beq a0, t0, .L_write8"
   ins "li t0, 6"
   ins "beq a0, t0, .L_write32"
+  ins "li t0, 7"
+  ins "beq a0, t0, .L_open_op"
+  ins "li t0, 8"
+  ins "beq a0, t0, .L_no_file"
+  ins "li t0, 9"
+  ins "beq a0, t0, .L_no_file"
   ins "bnez a0, .L_perform_unhandled"
   ins "mv a0, a1"
   ins "call _keel_print_i64"
@@ -1154,6 +1160,14 @@ emitRuntime = do
   ins "li a0, -1"
   ins "beqz t1, .L_machine_ret"
   ins "lbu a0, 0(t0)"
+  ins "j .L_machine_ret"
+  -- No file system: openFile fails (after dropping the path it was given), and readByte and
+  -- closeFile, which only a successful open would reach, give -1.
+  line ".L_open_op:"
+  ins "mv a0, a1"
+  ins "call _keel_drop"
+  line ".L_no_file:"
+  ins "li a0, -1"
   ins "j .L_machine_ret"
   line ".L_read8:"
   ins "lbu a0, 0(a1)"

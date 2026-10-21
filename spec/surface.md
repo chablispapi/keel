@@ -163,6 +163,7 @@ other: `import std.map`, then `map.insert`.
 |---|---|
 | `std.map` | `Map k v`: ordered maps (AVL trees). `Tip` is the empty map; `insert`, `lookup`, `member`, `delete` take a comparison (`compareInt`, `string.compare`); `size`, `height`, `toList` (in key order) |
 | `std.array` | `Array a`: growable arrays with constant-time indexing. `empty`, `make n x`, `length`, `get`, `set`, `push`, `pop`, `fromList`, `toList`, `foldl` |
+| `std.file` | `read path`: a file's bytes as `Option (List u8)` (`None` if it can't be opened); `open`, `getByte`, `close` to stream one (effect `Files`) |
 | `std.string` | for `List u8`: `compare`, `equal`, `fromInt`, `parseInt` (`Option i64`), `split`, `lines`, `join`, `isDigit`, `isSpace`, `isAlpha` |
 
 ```
@@ -186,8 +187,6 @@ through `set` and `push` runs as fast as mutation (spec/memory.md). The built-in
 `arrayEmpty`, `arrayNew`, `arrayLength`, `arrayGet`, `arraySet`, `arrayPush` and `arrayPop`,
 always applied to all their arguments; `std.array` has them as functions. An index out of range
 panics.
-
-Not yet: reading files by name.
 
 ## Error messages
 
@@ -283,6 +282,12 @@ RISC-V target has no debug info yet.
 **Input** has one operation, `getc : Unit => i64`: stdin on the Mac and in the evaluator
 (`keelc run` passes its stdin through); on RISC-V, the UART's receive register, with `-1` when no
 byte is waiting.
+
+**Files** reads files by name: `openFile : Array u8 => i64` (a handle, or -1), `readByte : i64
+=> i64` (a byte, or -1 at the end), `closeFile : i64 => Unit`. On the Mac they are `fopen`,
+`fgetc` and `fclose`, with paths relative to the current directory; `keelc run` reads the same
+files. RISC-V has no file system, so every `openFile` there gives -1. Use `std.file` rather
+than the handles: `examples/files.kl`.
 
 **MMIO** is a built-in effect, like `IO`:
 

@@ -1,0 +1,13 @@
+-- Reading files by name with std.file: count the lines of a few files. Paths are relative to
+-- the directory keelc (or the program) runs in. On RISC-V there are no files, so every read
+-- gives None.
+import std.file
+import std.string
+
+def show : List u8 ->{IO, Files, Diverge, Panic} Unit =
+  \path. print path; print ": ";
+    case file.read path of
+      { None -> println "can't open"
+      | Some(text) -> printInt (length (string.lines text)); println " lines" }
+
+main = show "examples/fact.kl"; show "examples/no-such-file.kl"; 0

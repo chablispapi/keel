@@ -1,7 +1,7 @@
 -- | Call-by-value, environment-based evaluator for Keel Core, stages 1–4
 -- (spec/core.md §1.4, §2.5, §3.4, §4.5). Types are erased: @f[τ̄]@ evaluates like @f@. Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
-module Keel.Eval (Value (..), Outcome (..), evalProgram, evalProgramWith) where
+module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn) where
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
@@ -56,9 +56,15 @@ instance Eq Value where
 data Outcome = Done Value | Panicked String
   deriving (Eq, Show)
 
--- | Evaluation can panic and appends output text, in reversed chunks.
--- | The state: input not yet read (bytes as characters), and output written, newest first.
-type Run = ExceptT String (State (String, [String]))
+-- | What a program sees of the world: the bytes @getc@ reads, and the files @openFile@ can
+-- open (bytes as characters; Nothing if a path can't be opened).
+data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String}
+
+-- | Evaluation can panic, and changes the world: input not yet read, output written (newest
+-- chunk first), and the open files' unread bytes by handle.
+data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String}
+
+type Run = ExceptT String (State World)
 
 -- | A handler frame: operation ↦ (parameter, clause body), and the clause environment.
 data Handler = Handler (M.Map String (String, Term)) Env
@@ -67,15 +73,18 @@ data Handler = Handler (M.Map String (String, Term)) Env
 evalProgram :: Program -> (Outcome, String)
 evalProgram = evalProgramWith ""
 
--- | Run @main@ with the bytes @getc@ reads (as characters).
+-- | Run @main@ with the bytes @getc@ reads (as characters), and no files.
 evalProgramWith :: String -> Program -> (Outcome, String)
-evalProgramWith input (Program decls main) = (either Panicked Done r, concat (reverse trace))
+evalProgramWith input = evalProgramOn (Machine input (const Nothing))
+
+evalProgramOn :: Machine -> Program -> (Outcome, String)
+evalProgramOn (Machine input files) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)))
   where
-    (r, (_, trace)) = runState (runExceptT (eval [] globals main)) (input, [])
+    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty)
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
     globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
-    pureValue m = case runState (runExceptT m) ("", []) of
-      (Right v, (_, [])) -> v
+    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty) of
+      (Right v, World _ [] _ _) -> v
       _ -> stuck "effectful top-level definition"
 
 -- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
@@ -166,10 +175,25 @@ machine :: String -> Value -> Run Value
 machine "out" (VInt _ n) = write (show n ++ "\n")
 machine "putc" (VInt _ b) = write [toEnum (fromInteger b)]
 machine "getc" _ = do
-  (input, out) <- lift get
-  case input of
-    c : rest -> lift (put (rest, out)) >> pure (VInt i64 (toInteger (fromEnum c)))
+  w <- lift get
+  case wInput w of
+    c : rest -> lift (put w {wInput = rest}) >> pure (byte c)
     [] -> pure (VInt i64 (-1))
+-- Handles count up from 3, like file descriptors after stdin, stdout and stderr.
+machine "openFile" (VArray path) = do
+  w <- lift get
+  let name = [toEnum (fromInteger b) | VInt _ b <- toList path]
+      h = maybe 3 ((+ 1) . fst) (M.lookupMax (wOpen w))
+  case wFiles w name of
+    Just bytes -> lift (put w {wOpen = M.insert h bytes (wOpen w)}) >> pure (VInt i64 h)
+    Nothing -> pure (VInt i64 (-1))
+machine "readByte" (VInt _ h) = do
+  w <- lift get
+  case M.lookup h (wOpen w) of
+    Just (c : rest) -> lift (put w {wOpen = M.insert h rest (wOpen w)}) >> pure (byte c)
+    Just [] -> pure (VInt i64 (-1))
+    Nothing -> throwE "readByte on a handle that isn't open"
+machine "closeFile" (VInt _ h) = lift (modify (\w -> w {wOpen = M.delete h (wOpen w)})) >> pure VUnit
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
 
 -- | Arrays are values: an update returns a new sequence (the native code updates in place
@@ -193,7 +217,10 @@ array op args = case (op, args) of
     outOfBounds = throwE "array index out of bounds"
 
 write :: String -> Run Value
-write s = lift (modify (\(i, o) -> (i, s : o))) >> pure VUnit
+write s = lift (modify (\w -> w {wOutput = s : wOutput w})) >> pure VUnit
+
+byte :: Char -> Value
+byte c = VInt i64 (toInteger (fromEnum c))
 
 prim :: Prim -> Value -> Value -> Run Value
 prim op (VInt t a) (VInt _ b) = case op of

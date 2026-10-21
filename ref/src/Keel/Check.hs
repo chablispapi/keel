@@ -66,7 +66,7 @@ data Sig = Sig
 -- | Effects @main@ may leave unhandled: the machine provides them (MMIO only on freestanding
 -- targets; elsewhere an unhandled MMIO operation panics at run time).
 topLevelEffects :: Eff
-topLevelEffects = S.fromList [ioE, inputE, mmioE, panicE, divergeE]
+topLevelEffects = S.fromList [ioE, inputE, mmioE, filesE, panicE, divergeE]
 
 -- | §1.2 and §4.2: a data type is linear if declared so or if any type argument is linear;
 -- codata is always Free; a type variable has its declared kind.

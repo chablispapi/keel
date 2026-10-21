@@ -20,7 +20,7 @@ import Data.List (isInfixOf, isPrefixOf, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative, compileNativeWith)
-import Keel.Eval (Outcome (..), evalProgram, evalProgramWith)
+import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
@@ -203,6 +203,7 @@ exampleFiles =
   , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
   , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
   , ("test/modules/qual/main.kl", (Just "48", ""))
+  , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/std/array.kl", (Just "(Cons(Cons(110, box Cons(105, box Cons(108, box Nil))), box Cons(Cons(111, box Cons(110, box Cons(101, box Nil))), box Nil)), 100000)", "4999950000\n9592\nzero\nnil\n"))
   , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
@@ -212,6 +213,13 @@ exampleFiles =
 -- evaluator run it is compared with, getc returns -1 straight away.
 exampleInput :: String -> String
 exampleInput name = maybe "" id (lookup name [("examples/words.kl", "the cat\nthe dog\nsat on the cat\n")])
+
+-- | The evaluator's view of the world for a program: its stdin, and the files on disk that the
+-- examples read (the native binaries open them for real).
+machineFor :: String -> IO Machine
+machineFor name = do
+  fact <- readFile "examples/fact.kl"
+  pure (Machine (exampleInput name) (`lookup` [("examples/fact.kl", fact)]))
 
 -- | Multi-file programs the module loader must refuse, and part of the message.
 moduleErrors :: [(FilePath, String)]
@@ -270,7 +278,8 @@ loadExample (path, expected) = do
     Right core -> case compile core of
       Left e -> pure (["FAIL " ++ path ++ ": " ++ show e], [])
       Right mono -> do
-        let got = reduce (evalProgramWith (exampleInput path) mono)
+        machine <- machineFor path
+        let got = reduce (evalProgramOn machine mono)
             fails = ["FAIL " ++ path ++ ": evaluator gave " ++ show got ++ ", expected " ++ show expected | got /= expected]
         pure (fails, [(path, core)])
 
@@ -364,8 +373,9 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
       ExitSuccess -> do
         environment <- getEnvironment
         (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) (exampleInput name)
+        machine <- machineFor name
         let native = parseRun code stdout
-            reference = reduce (evalProgramWith (exampleInput name) mono)
+            reference = reduce (evalProgramOn machine mono)
             stats = parseStats stderr
         pure $
           [failMsg ("native " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]

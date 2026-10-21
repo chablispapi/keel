@@ -1261,6 +1261,12 @@ emitRuntime = do
   ins "b.eq L_perform_putc"
   ins "cmp x0, #2" -- getc
   ins "b.eq L_perform_getc"
+  ins "cmp x0, #7" -- openFile
+  ins "b.eq L_perform_open"
+  ins "cmp x0, #8" -- readByte
+  ins "b.eq L_perform_read"
+  ins "cmp x0, #9" -- closeFile
+  ins "b.eq L_perform_close"
   ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
   ins "sub sp, sp, #16"
   ins "str x1, [sp]" -- printf's variadic argument
@@ -1280,6 +1286,50 @@ emitRuntime = do
   line "L_perform_getc:"
   ins "bl _getchar" -- a byte, or EOF (-1)
   ins "sxtw x0, w0"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+  -- openFile: x1 = the path, an Array u8 (owned). Copy it to the stack with a NUL, fopen it,
+  -- and drop the array. The handle is the FILE pointer, or -1.
+  line "L_perform_open:"
+  ins "str x1, [x29, #16]"
+  ins "ldr x9, [x1]"
+  ins "add x10, x9, #16"
+  ins "and x10, x10, #-16"
+  ins "sub sp, sp, x10"
+  ins "mov x11, #0"
+  line "L_open_copy:"
+  ins "cmp x11, x9"
+  ins "b.hs L_open_copied"
+  ins "add x12, x1, x11, lsl #3"
+  ins "ldr x12, [x12, #16]"
+  ins "strb w12, [sp, x11]"
+  ins "add x11, x11, #1"
+  ins "b L_open_copy"
+  line "L_open_copied:"
+  ins "strb wzr, [sp, x9]"
+  ins "mov x0, sp"
+  mode <- str "rb"
+  address "x1" mode
+  ins "bl _fopen"
+  ins "mov sp, x29"
+  ins "cmp x0, #0"
+  ins "csinv x0, x0, xzr, ne" -- NULL becomes -1
+  ins "str x0, [x29, #24]"
+  ins "ldr x0, [x29, #16]"
+  ins "bl _keel_drop"
+  ins "ldr x0, [x29, #24]"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+  line "L_perform_read:"
+  ins "mov x0, x1"
+  ins "bl _fgetc" -- a byte, or EOF (-1)
+  ins "sxtw x0, w0"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+  line "L_perform_close:"
+  ins "mov x0, x1"
+  ins "bl _fclose"
+  ins "mov x0, #0"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 

@@ -25,7 +25,7 @@ executable keelc
   import:         shared
   hs-source-dirs: app
   main-is:        keelc.hs
-  build-depends:  keel-ref, directory, filepath, process
+  build-depends:  keel-ref, directory, filepath, process, bytestring
 
 test-suite core
   import:         shared
