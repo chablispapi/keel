@@ -8,6 +8,7 @@
 -- >                                compile (native: via the system cc; riscv64: a freestanding
 -- >                                image for QEMU's virt board)
 -- > keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
+-- > keelc lsp                      the language server, over stdin/stdout ("Keel.Lsp")
 --
 -- Without a file, the commands use the project in the current directory (keel.project): its
 -- entry file, its target, and build/NAME as the output. A file's imports are loaded relative
@@ -20,6 +21,7 @@ import Keel.AArch64 (compileNative)
 import Keel.Check (TypeError (..), checkProgram)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
+import Keel.Lsp (serve)
 import Keel.Modules (loadModules)
 import Keel.Mono (compile)
 import Keel.RiscV (compileRiscV)
@@ -29,7 +31,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileE
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath (dropExtension, takeDirectory, (<.>), (</>))
-import System.IO (hPutStr, hPutStrLn, stderr)
+import System.IO (hPutStr, hPutStrLn, stderr, stdin, stdout)
 import System.Process (readProcessWithExitCode)
 
 usage :: String
@@ -38,6 +40,7 @@ usage =
     [ "usage: keelc new NAME"
     , "       keelc (check | run | asm | qemu) [FILE.kl]"
     , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64]"
+    , "       keelc lsp"
     , "Without FILE.kl, keelc uses keel.project in the current directory."
     ]
 
@@ -52,6 +55,7 @@ main = do
   args <- getArgs
   case args of
     ["new", name] -> newProject name
+    ["lsp"] -> serve stdin stdout
     cmd : rest | cmd `elem` ["check", "run", "asm", "qemu", "build"] -> do
       job <- jobFor rest
       case cmd of

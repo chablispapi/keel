@@ -6,7 +6,7 @@
 -- ponytail: no namespaces yet. Two modules declaring the same public name is an error that
 -- names both files. Qualified names (@uart.putc@) need syntax that doesn't collide with
 -- projection (@e.obs@).
-module Keel.Modules (loadModules) where
+module Keel.Modules (loadModules, loadModulesWith) where
 
 import Control.Monad (foldM, forM_)
 import Data.List (intercalate)
@@ -21,7 +21,13 @@ import System.FilePath (takeBaseName, takeDirectory, (<.>), (</>))
 -- | Load a program from its entry file. Returns the program (with the prelude) and every
 -- source file read, for error messages.
 loadModules :: FilePath -> IO (Either String (Program, M.Map FilePath String))
-loadModules entry = do
+loadModules = loadModulesWith $ \path -> do
+  exists <- doesFileExist path
+  if exists then Just <$> readFile path else pure Nothing
+
+-- | 'loadModules' with a file reader: the language server reads unsaved editor buffers.
+loadModulesWith :: (FilePath -> IO (Maybe String)) -> FilePath -> IO (Either String (Program, M.Map FilePath String))
+loadModulesWith readSource entry = do
   r <- visit M.empty [] (takeBaseName entry) entry Nothing
   pure $ do
     (loaded, order) <- r
@@ -51,11 +57,10 @@ loadModules entry = do
       | name `elem` stack = pure (Left ("import cycle: " ++ intercalate " → " (reverse (name : stack))))
       | M.member name loaded = pure (Right (loaded, []))
       | otherwise = do
-          exists <- doesFileExist path
-          if not exists
-            then pure (Left (where' from ++ "module " ++ name ++ " not found (looked for " ++ path ++ ")"))
-            else do
-              src <- readFile path
+          source <- readSource path
+          case source of
+            Nothing -> pure (Left (where' from ++ "module " ++ name ++ " not found (looked for " ++ path ++ ")"))
+            Just src ->
               case parseModule path src of
                 Left e -> pure (Left e)
                 Right m -> do

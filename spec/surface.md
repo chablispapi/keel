@@ -13,6 +13,7 @@ keelc build [FILE.kl] [-o OUT] [--target native|riscv64]
                                native executable (via the system cc), or a freestanding
                                RISC-V image for QEMU's virt board
 keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
+keelc lsp                      the language server, over stdin/stdout
 ```
 
 Without a file, the commands use the project in the current directory (see "Projects and
@@ -143,6 +144,44 @@ twice.kl:5:7: error [Duplicate]: ["t"] used twice
 This covers errors from inference and from the core checker (linearity, effects, references).
 Parts elaborated from `&`/`&mut`/`var` code keep the position of the nearest enclosing
 expression without references.
+
+## Editor support
+
+`keelc lsp` is a language server (LSP over stdin/stdout):
+
+- **Diagnostics** while you type: parse, module and type errors, from unsaved buffers too. A
+  file in a project (a `keel.project` in its directory or above) is checked as part of the
+  project, from the project's entry file.
+- **Hover** shows the declared type of a top-level name: definitions, constructors and effect
+  operations, from the program, the prelude or the built-in effects.
+
+Put `keelc` on your `PATH` (`cabal install exe:keelc` in `ref/`), then point the editor at it.
+For Neovim:
+
+```lua
+vim.filetype.add({ extension = { kl = "keel" } })
+vim.api.nvim_create_autocmd("FileType", { pattern = "keel", callback = function()
+  vim.lsp.start({ name = "keel", cmd = { "keelc", "lsp" },
+    root_dir = vim.fs.root(0, { "keel.project" }) or vim.fn.getcwd() })
+end })
+```
+
+For Helix (`languages.toml`):
+
+```toml
+[language-server.keel]
+command = "keelc"
+args = ["lsp"]
+
+[[language]]
+name = "keel"
+scope = "source.keel"
+file-types = ["kl"]
+roots = ["keel.project"]
+language-servers = ["keel"]
+```
+
+Not yet: types of local variables on hover, go-to-definition, completion.
 
 ## Hardware access
 

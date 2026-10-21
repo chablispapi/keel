@@ -17,10 +17,12 @@ import Cases (Expect (..))
 import Cases qualified
 import Control.Monad (forM, unless)
 import Data.List (isInfixOf, isPrefixOf, stripPrefix)
+import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
+import Keel.Lsp (Diag (..), Json (..), diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
 import Keel.RiscV (compileRiscV)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
@@ -210,6 +212,32 @@ moduleErrors =
   , ("test/modules/missing/main.kl", "test/modules/missing/main.kl:1:1: module nowhere not found")
   ]
 
+-- | The language server's checks on the example project, with an unsaved edit to util.kl.
+lspChecks :: IO [String]
+lspChecks = do
+  let util = "examples/project/src/util.kl"
+  src <- readFile util
+  let edit from to = M.singleton util (replaceOnce from to src)
+      replaceOnce from to s = case stripPrefix from s of
+        Just rest -> to ++ rest
+        Nothing -> case s of c : rest -> c : replaceOnce from to rest; [] -> []
+  clean <- diagnose M.empty util
+  typeErr <- diagnose (edit "a + b" "a + true") util
+  parseErr <- diagnose (edit "def double" "def double double") util
+  h <- hover M.empty "examples/project/src/main.kl" 6 30
+  let json = "{\"a\":[1,-2.5,true,null,\"x\\n\\u00e9\"],\"b\":{}}"
+  pure $
+    [ "FAIL lsp: " ++ what ++ ": got " ++ got
+    | (ok, what, got) <-
+        [ (null clean, "clean project", show clean)
+        , (typeErr == [Diag util 2 59 "expected i64, got Bool [Mismatch]"], "type error", show typeErr)
+        , (case parseErr of [Diag f 4 _ _] -> f == util; _ -> False, "parse error", show parseErr)
+        , (h == Just "printInt : i64 →{Diverge, IO, Panic} Unit", "hover", show h)
+        , (fmap renderJson (parseJson json) == Just "{\"a\":[1,-2.5,true,null,\"x\\n\233\"],\"b\":{}}", "json", show (parseJson json))
+        ]
+    , not ok
+    ]
+
 checkModuleError :: (FilePath, String) -> IO [String]
 checkModuleError (path, expected) =
   loadModules path >>= \case
@@ -236,7 +264,7 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
-  modErrs <- concat <$> mapM checkModuleError moduleErrors
+  modErrs <- (++) <$> (concat <$> mapM checkModuleError moduleErrors) <*> lspChecks
   let programs = cases ++ specCases ++ concatMap snd loaded
   failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir))
   let refused =
@@ -246,7 +274,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ refused
-      total = length programs + length unsupportedCases + length exampleFiles + length moduleErrors
+      total = length programs + length unsupportedCases + length exampleFiles + length moduleErrors + 1
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-

@@ -15,6 +15,7 @@ import Data.Functor (($>))
 import Data.Set qualified as S
 import Keel.Syntax
 import Text.Parsec hiding (lower, upper)
+import Text.Parsec.Error (errorMessages, showErrorMessages)
 import Text.Parsec.String (Parser)
 import Text.Parsec.Token qualified as Tok
 
@@ -29,11 +30,19 @@ parseProgram path src = do
 
 -- | One source file of a multi-file program (see "Keel.Modules").
 parseModule :: FilePath -> String -> Either String Module
-parseModule path src = either (Left . show) Right (parse (whiteSpace *> moduleP <* eof) path src)
+parseModule path src = either (Left . parseError) Right (parse (whiteSpace *> moduleP <* eof) path src)
 
 -- | Declarations without a @main@ (the prelude).
 parseLibrary :: FilePath -> String -> Either String [Decl]
-parseLibrary path src = either (Left . show) Right (parse (whiteSpace *> many decl <* eof) path src)
+parseLibrary path src = either (Left . parseError) Right (parse (whiteSpace *> many decl <* eof) path src)
+
+-- | @file:line:col: parse error@ and parsec's messages, like the loader's other errors.
+parseError :: ParseError -> String
+parseError e =
+  sourceName p ++ ":" ++ show (sourceLine p) ++ ":" ++ show (sourceColumn p) ++ ": parse error"
+    ++ showErrorMessages "or" "unknown parse error" "expecting" "unexpected" "end of input" (errorMessages e)
+  where
+    p = errorPos e
 
 -- Lexer -------------------------------------------------------------------------------------
 
