@@ -1,0 +1,18 @@
+-- std.map: 100 inserts in scrambled order, a lookup, a delete; the tree stays balanced.
+import std.map
+
+def fill : i64 -> map.Map i64 i64 ->{Diverge, Panic} map.Map i64 i64 =
+  \n m. if n < 1 then m else fill (n - 1) (map.insert compareInt ((n * 37) % 101) n m)
+
+def sumKeys : List (i64, i64) ->{Diverge, Panic} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(kv, rest) -> let (k, v) = kv in k + sumKeys (unbox rest) }
+
+main =
+  let m = fill 100 map.Tip in
+  printInt (map.size m); putc(10);
+  printInt (map.height m); putc(10);
+  printInt (case map.lookup compareInt 74 m of { None -> 0 - 1 | Some(v) -> v }); putc(10);
+  let d = map.delete compareInt 74 m in
+  printInt (map.size d); putc(10);
+  printInt (map.height d); putc(10);
+  sumKeys (map.toList d)

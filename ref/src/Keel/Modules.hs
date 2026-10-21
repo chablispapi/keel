@@ -1,5 +1,6 @@
 -- | Multi-file programs (M5). One file is one module; @import drivers.uart@ loads
--- @drivers/uart.kl@ relative to the entry file's directory.
+-- @drivers/uart.kl@ relative to the entry file's directory. @import std.map@ loads the
+-- standard library's @map.kl@, which ships with keelc (@ref/std/@).
 --
 -- Namespaces: a module sees its own declarations and the public declarations of the modules it
 -- imports, by plain name (@putc@) or qualified by the import (@uart.putc@, or @u.putc@ after
@@ -22,6 +23,7 @@ import Data.Set qualified as S
 import Keel.Parser (parseModule)
 import Keel.Prelude (declared, preludeDecls, withPrelude)
 import Keel.Syntax
+import Paths_keel_ref (getDataFileName)
 import System.Directory (doesFileExist)
 import System.FilePath (takeBaseName, takeDirectory, (<.>), (</>))
 
@@ -77,16 +79,22 @@ loadModulesWith readSource entry = do
                     ( \acc (imp, _, pos) -> case acc of
                         Left e -> pure (Left e)
                         Right (l, order) -> do
-                          r <- visit l (name : stack) imp (importPath root imp) (Just pos)
+                          path' <- importPath root imp
+                          r <- visit l (name : stack) imp path' (Just pos)
                           pure (fmap (\(l', o) -> (l', order ++ o)) r)
                     )
                     (Right (loaded0, []))
                     (modImports m)
                     >>= pure . fmap (\(l, order) -> (l, order ++ [name]))
 
--- | The file of an import: @drivers.uart@ is @ROOT/drivers/uart.kl@.
-importPath :: FilePath -> String -> FilePath
-importPath root imp = root </> map (\c -> if c == '.' then '/' else c) imp <.> "kl"
+-- | The file of an import: @drivers.uart@ is @ROOT/drivers/uart.kl@, and @std.map@ is the
+-- standard library's @map.kl@.
+importPath :: FilePath -> String -> IO FilePath
+importPath root imp = case imp of
+  's' : 't' : 'd' : '.' : m -> (</> file m) <$> getDataFileName "std"
+  _ -> pure (root </> file imp)
+  where
+    file m = map (\c -> if c == '.' then '/' else c) m <.> "kl"
 
 -- | Every module's public and private names, and the prelude's.
 data Scope = Scope {publics, privates :: M.Map String (S.Set String), preludeNames :: S.Set String}

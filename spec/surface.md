@@ -65,6 +65,7 @@ Arrows associate to the right. Effect variables start with `'`.
 | `cocase Ord { lt -> \p q. p < q }`, `e.lt` | codata value, observation |
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |
 | `read8(4)`, `out(x)`, `putc(c)` | performing an operation (`out` prints a number and a newline, `putc` one byte) |
+| `getc ()` | read one byte of input (effect `Input`): `0`–`255`, or `-1` at the end |
 | `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs |
 | `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
 | `"Hi!\n"` | a `List u8` of the string's UTF-8 bytes (Haskell-style escapes) |
@@ -143,12 +144,40 @@ Every program starts with the declarations in `ref/src/Keel/Prelude.hs`, written
 | `length`, `append`, `reverse` | list utilities |
 | `print`, `println` | print a `List u8` (`println` adds a newline) |
 | `printInt`, `printU64` | print a number in decimal, without a newline |
+| `readAll` | every byte of input, as a `List u8` (effect `Input`) |
+| `Ordering`, `compareInt` | `Less \| Equal \| Greater`, and comparing `i64`s |
 
 A program may declare any of these names itself. The prelude's version is then left out, along
 with every prelude definition that mentions a left-out or redeclared name. A program that defines
 its own `List`, or its own `putc` UART driver, gets none of the prelude's list or printing
 functions instead of ones silently built on its definitions. Unused prelude definitions cost
 nothing: the optimizer removes them.
+
+## The standard library
+
+Modules under `std` ship with keelc (`ref/std/`, installed with it) and are imported like any
+other: `import std.map`, then `map.insert`.
+
+| Module | What it has |
+|---|---|
+| `std.map` | `Map k v`: ordered maps (AVL trees). `Tip` is the empty map; `insert`, `lookup`, `member`, `delete` take a comparison (`compareInt`, `string.compare`); `size`, `height`, `toList` (in key order) |
+| `std.string` | for `List u8`: `compare`, `equal`, `fromInt`, `parseInt` (`Option i64`), `split`, `lines`, `join`, `isDigit`, `isSpace`, `isAlpha` |
+
+```
+import std.map
+import std.string
+
+def count : List (List u8) -> map.Map (List u8) i64 ->{Diverge, Panic} map.Map (List u8) i64 =
+  \ws m. case ws of
+    { Nil -> m
+    | Cons(w, rest) ->
+        let n = case map.lookup string.compare w m of { None -> 0 | Some(k) -> k } in
+        count (unbox rest) (map.insert string.compare w (n + 1) m) }
+```
+
+`examples/words.kl` counts the words on stdin this way. Keys and values are `Free`
+(copyable). Not yet: arrays with constant-time indexing (they need a new kind of heap block),
+reading files by name.
 
 ## Error messages
 
@@ -240,6 +269,10 @@ breakpoints work; lldb can't print Keel values yet (no variable locations or typ
 RISC-V target has no debug info yet.
 
 ## Hardware access
+
+**Input** has one operation, `getc : Unit => i64`: stdin on the Mac and in the evaluator
+(`keelc run` passes its stdin through); on RISC-V, the UART's receive register, with `-1` when no
+byte is waiting.
 
 **MMIO** is a built-in effect, like `IO`:
 

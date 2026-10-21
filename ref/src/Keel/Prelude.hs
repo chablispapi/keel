@@ -46,6 +46,17 @@ preludeSource =
     , "def printInt : i64 ->{IO, Diverge, Panic} Unit ="
     , "  \\n. if n < 0 then (putc(45); printU64 (((0 - (n + 1)) as u64) + 1))"
     , "      else printU64 (n as u64)"
+    , ""
+    , "-- Input: every byte up to the end of input."
+    , "def readOnto : List u8 ->{Input, Diverge} List u8 ="
+    , "  \\acc. let c = getc () in if c < 0 then reverse acc else readOnto (Cons(c as u8, box acc))"
+    , ""
+    , "def readAll : Unit ->{Input, Diverge} List u8 = \\u. readOnto Nil"
+    , ""
+    , "-- The result of a comparison (std.map takes a comparison function)."
+    , "data Ordering = Less | Equal | Greater"
+    , ""
+    , "def compareInt : i64 -> i64 -> Ordering = \\a b. if a < b then Less else if a == b then Equal else Greater"
     ]
 
 -- | Parse a single-file program and add the prelude.

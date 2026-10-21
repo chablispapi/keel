@@ -1,0 +1,94 @@
+-- Ordered maps: AVL trees, ordered by a comparison function passed to each operation
+-- (map.insert compareInt 3 "three" m). Lookups, inserts and deletes take O(log n) steps.
+--
+--   import std.map
+--   def names : map.Map i64 (List u8) = map.insert compareInt 1 "one" map.Tip
+--
+-- ponytail: keys and values are Free (copyable); a map of linear values needs a take/put API.
+
+-- Node(height, key, value, left, right)
+data Map k v = Tip | Node(i64, k, v, Box (Map k v), Box (Map k v))
+
+def height : forall (k : Free) (v : Free). Map k v -> i64 =
+  \m. case m of { Tip -> 0 | Node(h, k, v, l, r) -> h }
+
+def size : forall (k : Free) (v : Free). Map k v ->{Diverge} i64 =
+  \m. case m of { Tip -> 0 | Node(h, k, v, l, r) -> size (unbox l) +% size (unbox r) +% 1 }
+
+private def node : forall (k : Free) (v : Free). k -> v -> Map k v -> Map k v -> Map k v =
+  \k v l r.
+    let hl = height l in
+    let hr = height r in
+    Node((if hl < hr then hr else hl) +% 1, k, v, box l, box r)
+
+-- A node whose subtrees' heights differ by at most 2, rotated so they differ by at most 1.
+private def balance : forall (k : Free) (v : Free). k -> v -> Map k v -> Map k v -> Map k v =
+  \k v l r.
+    let hl = height l in
+    let hr = height r in
+    if hr +% 1 < hl then
+      case l of
+        { Tip -> node k v l r
+        | Node(h, lk, lv, ll, lr) ->
+            if height (unbox lr) < height (unbox ll) +% 1 then node lk lv (unbox ll) (node k v (unbox lr) r)
+            else case unbox lr of
+              { Tip -> node k v l r
+              | Node(h2, mk, mv, ml, mr) -> node mk mv (node lk lv (unbox ll) (unbox ml)) (node k v (unbox mr) r) } }
+    else if hl +% 1 < hr then
+      case r of
+        { Tip -> node k v l r
+        | Node(h, rk, rv, rl, rr) ->
+            if height (unbox rl) < height (unbox rr) +% 1 then node rk rv (node k v l (unbox rl)) (unbox rr)
+            else case unbox rl of
+              { Tip -> node k v l r
+              | Node(h2, mk, mv, ml, mr) -> node mk mv (node k v l (unbox ml)) (node rk rv (unbox mr) (unbox rr)) } }
+    else node k v l r
+
+-- Add a key, or replace its value.
+def insert : forall (k : Free) (v : Free) 'e. (k -> k ->{'e} Ordering) -> k -> v -> Map k v ->{'e, Diverge} Map k v =
+  \cmp key val m. case m of
+    { Tip -> Node(1, key, val, box Tip, box Tip)
+    | Node(h, k, v, l, r) -> case cmp key k of
+        { Less -> balance k v (insert cmp key val (unbox l)) (unbox r)
+        | Greater -> balance k v (unbox l) (insert cmp key val (unbox r))
+        | Equal -> Node(h, key, val, l, r) } }
+
+def lookup : forall (k : Free) (v : Free) 'e. (k -> k ->{'e} Ordering) -> k -> Map k v ->{'e, Diverge} Option v =
+  \cmp key m. case m of
+    { Tip -> None
+    | Node(h, k, v, l, r) -> case cmp key k of
+        { Less -> lookup cmp key (unbox l)
+        | Greater -> lookup cmp key (unbox r)
+        | Equal -> Some(v) } }
+
+def member : forall (k : Free) (v : Free) 'e. (k -> k ->{'e} Ordering) -> k -> Map k v ->{'e, Diverge} Bool =
+  \cmp key m. case lookup cmp key m of { None -> false | Some(v) -> true }
+
+-- The smallest key and its value, and the map without them.
+private def popMin : forall (k : Free) (v : Free). k -> v -> Map k v -> Map k v ->{Diverge} ((k, v), Map k v) =
+  \k v l r. case l of
+    { Tip -> ((k, v), r)
+    | Node(h, lk, lv, ll, lr) ->
+        let (kv, rest) = popMin lk lv (unbox ll) (unbox lr) in (kv, balance k v rest r) }
+
+-- Remove a key (the map is unchanged without it).
+def delete : forall (k : Free) (v : Free) 'e. (k -> k ->{'e} Ordering) -> k -> Map k v ->{'e, Diverge} Map k v =
+  \cmp key m. case m of
+    { Tip -> Tip
+    | Node(h, k, v, l, r) -> case cmp key k of
+        { Less -> balance k v (delete cmp key (unbox l)) (unbox r)
+        | Greater -> balance k v (unbox l) (delete cmp key (unbox r))
+        | Equal -> case unbox r of
+            { Tip -> unbox l
+            | Node(h2, rk, rv, rl, rr) ->
+                let (kv, rest) = popMin rk rv (unbox rl) (unbox rr) in
+                let (k2, v2) = kv in
+                balance k2 v2 (unbox l) rest } } }
+
+private def toListOnto : forall (k : Free) (v : Free). Map k v -> List (k, v) ->{Diverge} List (k, v) =
+  \m acc. case m of
+    { Tip -> acc
+    | Node(h, k, v, l, r) -> toListOnto (unbox l) (Cons((k, v), box (toListOnto (unbox r) acc))) }
+
+-- The entries in key order.
+def toList : forall (k : Free) (v : Free). Map k v ->{Diverge} List (k, v) = \m. toListOnto m Nil

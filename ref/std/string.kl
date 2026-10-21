@@ -1,0 +1,74 @@
+-- Strings are List u8 (UTF-8 bytes, as string literals are): comparing, converting to and
+-- from numbers, splitting, and classifying bytes.
+--
+--   import std.string
+--   map.insert string.compare "key" 1 m
+
+-- Byte order, which is code point order for UTF-8.
+def compare : List u8 -> List u8 ->{Diverge} Ordering =
+  \a b. case a of
+    { Nil -> case b of { Nil -> Equal | Cons(y, ys) -> Less }
+    | Cons(x, xs) -> case b of
+        { Nil -> Greater
+        | Cons(y, ys) -> if x < y then Less else if y < x then Greater else compare (unbox xs) (unbox ys) } }
+
+def equal : List u8 -> List u8 ->{Diverge} Bool =
+  \a b. case compare a b of { Equal -> true | Less -> false | Greater -> false }
+
+def isDigit : u8 -> Bool = \c. if c < 48 then false else c < 58
+
+def isSpace : u8 -> Bool = \c. if c == 32 then true else if c < 9 then false else c < 14
+
+def isAlpha : u8 -> Bool =
+  \c. if c < 65 then false else if c < 91 then true else if c == 95 then true else if c < 97 then false else c < 123
+
+-- Digits of n, most significant first, onto acc.
+private def digitsOnto : u64 -> List u8 ->{Diverge, Panic} List u8 =
+  \n acc. let d = Cons((n % 10 + 48) as u8, box acc) in if n < 10 then d else digitsOnto (n / 10) d
+
+-- Decimal; negative numbers go through -(n + 1), which can't overflow.
+def fromInt : i64 ->{Diverge, Panic} List u8 =
+  \n. if n < 0 then Cons(45, box (digitsOnto (((0 - (n + 1)) as u64) + 1) Nil))
+      else digitsOnto (n as u64) Nil
+
+private def digitsValue : i64 -> List u8 ->{Diverge, Panic} Option i64 =
+  \acc s. case s of
+    { Nil -> Some(acc)
+    | Cons(c, rest) -> if isDigit c then digitsValue (acc * 10 + (c as i64) - 48) (unbox rest) else None }
+
+-- A decimal number with an optional leading -, or None. Panics on overflow.
+-- ponytail: -9223372036854775808 overflows (it is parsed as -(9223372036854775808)).
+def parseInt : List u8 ->{Diverge, Panic} Option i64 =
+  \s. case s of
+    { Nil -> None
+    | Cons(c, rest) ->
+        if c == 45 then
+          (case unbox rest of
+            { Nil -> None
+            | Cons(d, more) -> case digitsValue 0 (Cons(d, more)) of { None -> None | Some(n) -> Some(0 - n) } })
+        else digitsValue 0 (Cons(c, rest)) }
+
+-- The pieces between separators: split 44 "a,,b" is ["a", "", "b"].
+def split : u8 -> List u8 ->{Diverge} List (List u8) =
+  \sep s. splitOnto sep s Nil
+
+private def splitOnto : u8 -> List u8 -> List u8 ->{Diverge} List (List u8) =
+  \sep s piece. case s of
+    { Nil -> Cons(reverse piece, box Nil)
+    | Cons(c, rest) ->
+        if c == sep then Cons(reverse piece, box (splitOnto sep (unbox rest) Nil))
+        else splitOnto sep (unbox rest) (Cons(c, box piece)) }
+
+-- Lines without their newlines; a final newline doesn't start an empty line.
+def lines : List u8 ->{Diverge} List (List u8) =
+  \s. case reverse s of
+    { Nil -> Nil
+    | Cons(c, rest) -> if c == 10 then split 10 (reverse (unbox rest)) else split 10 s }
+
+-- The pieces joined with a separator.
+def join : List u8 -> List (List u8) ->{Diverge} List u8 =
+  \sep parts. case parts of
+    { Nil -> Nil
+    | Cons(p, rest) -> case unbox rest of
+        { Nil -> p
+        | Cons(q, more) -> append p (append sep (join sep (Cons(q, more)))) } }

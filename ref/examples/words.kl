@@ -1,0 +1,22 @@
+-- Count the words on stdin with std.map and std.string: keelc run examples/words.kl < file
+
+import std.string
+import std.map
+
+def count : List (List u8) -> map.Map (List u8) i64 ->{Diverge, Panic} map.Map (List u8) i64 =
+  \ws m. case ws of
+    { Nil -> m
+    | Cons(w, rest) ->
+        let n = case map.lookup string.compare w m of { None -> 0 | Some(k) -> k } in
+        count (unbox rest) (map.insert string.compare w (n + 1) m) }
+
+def show : List (List u8, i64) ->{IO, Diverge, Panic} Unit =
+  \xs. case xs of
+    { Nil -> ()
+    | Cons(e, rest) -> let (w, n) = e in print w; putc(32); println (string.fromInt n); show (unbox rest) }
+
+main =
+  let ls = string.lines (readAll ()) in
+  show (map.toList (count (string.split 32 (string.join " " ls)) map.Tip));
+  println (string.fromInt (0 - 9223372036854775807 - 1));
+  case string.parseInt "-1234" of { None -> 0 | Some(n) -> n }

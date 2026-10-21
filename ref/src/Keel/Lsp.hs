@@ -245,11 +245,11 @@ definition overlay file line col = do
   case (self, wordAt src line col) of
     (Just m, Just (q, w))
       | (imp, _, _) : _ <- [i | i@(_, _, (_, l, _)) <- modImports m, l == line] -> do
-          let p = importPath root imp
+          p <- importPath root imp
           exists <- doesFileExist p
           pure (if exists || M.member p overlay then Just (p, 1, 1) else Nothing)
       | otherwise -> do
-          let imported = [importPath root imp | (imp, alias, _) <- modImports m, maybe True (== alias) q]
+          imported <- sequence [importPath root imp | (imp, alias, _) <- modImports m, maybe True (== alias) q]
           own <- if q == Nothing then pure (modSites m) else pure []
           others <- concat <$> mapM sitesIn imported
           pure (lookup w (own ++ others))

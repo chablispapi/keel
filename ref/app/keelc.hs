@@ -19,7 +19,7 @@ import Data.Char (isSpace)
 import Data.Map.Strict qualified as M
 import Keel.AArch64 (compileNativeWith)
 import Keel.Check (TypeError (..), checkProgram)
-import Keel.Eval (Outcome (..), evalProgram)
+import Keel.Eval (Outcome (..), evalProgramWith)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (serve)
 import Keel.Modules (loadModules)
@@ -31,7 +31,7 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileE
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath (dropExtension, takeDirectory, (<.>), (</>))
-import System.IO (hPutStr, hPutStrLn, stderr, stdin, stdout)
+import System.IO (hPutStr, hPutStrLn, hSetBinaryMode, stderr, stdin, stdout)
 import System.Process (readProcessWithExitCode)
 
 usage :: String
@@ -67,7 +67,12 @@ main = do
         "run" -> do
           (sources, core) <- load (jobEntry job)
           mono <- orDie (showErr sources (compile core))
-          let (outcome, output) = evalProgram mono
+          -- getc reads stdin's bytes, lazily: a program that reads nothing doesn't wait for input.
+          -- putc writes bytes.
+          hSetBinaryMode stdin True
+          hSetBinaryMode stdout True
+          input <- getContents
+          let (outcome, output) = evalProgramWith input mono
           putStr output
           case outcome of
             Done v -> putStrLn ("result: " ++ show v)

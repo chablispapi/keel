@@ -820,17 +820,20 @@ emitRuntime = do
   ins "ld ra, 24(sp)"
   ins "addi sp, sp, 32"
   ins "ret"
-  -- The machine: out (0) and putc (1) print; MMIO reads and writes device memory.
+  -- The machine: out (0) and putc (1) print, getc (2) reads the UART; MMIO reads and writes
+  -- device memory.
   line ".L_perform_machine:"
   ins "li t0, 1"
   ins "beq a0, t0, .L_putc_op"
   ins "li t0, 2"
-  ins "beq a0, t0, .L_read8"
+  ins "beq a0, t0, .L_getc_op"
   ins "li t0, 3"
-  ins "beq a0, t0, .L_read32"
+  ins "beq a0, t0, .L_read8"
   ins "li t0, 4"
-  ins "beq a0, t0, .L_write8"
+  ins "beq a0, t0, .L_read32"
   ins "li t0, 5"
+  ins "beq a0, t0, .L_write8"
+  ins "li t0, 6"
   ins "beq a0, t0, .L_write32"
   ins "bnez a0, .L_perform_unhandled"
   ins "mv a0, a1"
@@ -843,6 +846,17 @@ emitRuntime = do
   ins "mv a0, a1"
   ins "call _keel_putc"
   ins "li a0, 0"
+  ins "j .L_machine_ret"
+  -- ponytail: -1 when no byte is waiting (bit 0 of the line status register), not a blocking
+  -- read: QEMU's serial input has no end, so a blocking read would never see one. Block here if
+  -- a console needs it.
+  line ".L_getc_op:"
+  ins "li t0, 0x10000000"
+  ins "lbu t1, 5(t0)"
+  ins "andi t1, t1, 1"
+  ins "li a0, -1"
+  ins "beqz t1, .L_machine_ret"
+  ins "lbu a0, 0(t0)"
   ins "j .L_machine_ret"
   line ".L_read8:"
   ins "lbu a0, 0(a1)"

@@ -281,21 +281,23 @@ data Decl
 data Program = Program [Decl] Term
   deriving (Eq, Show)
 
--- | Built-in effect labels. @IO@ and @MMIO@ have the operations in 'builtinEffects';
--- @Panic@ and @Diverge@ have none and cannot be handled.
-ioE, mmioE, panicE, divergeE :: String
+-- | Built-in effect labels. @IO@ (output), @Input@ and @MMIO@ have the operations in
+-- 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
+ioE, inputE, mmioE, panicE, divergeE :: String
 ioE = "IO"
+inputE = "Input"
 mmioE = "MMIO"
 panicE = "Panic"
 divergeE = "Diverge"
 
 -- | Built-in effects and their operations, in operation-number order (the native runtime
 -- numbers operations this way, then user operations in declaration order). Unhandled, @out@
--- prints a number and a newline, @putc@ one byte, and the MMIO operations access device
--- memory (freestanding targets only).
+-- prints a number and a newline, @putc@ one byte, @getc@ reads one byte of input (-1 at its
+-- end), and the MMIO operations access device memory (freestanding targets only).
 builtinEffects :: [(String, [(String, Ty, Ty)])]
 builtinEffects =
   [ (ioE, [("out", TInt i64, TUnit), ("putc", TInt u8, TUnit)])
+  , (inputE, [("getc", TUnit, TInt i64)])
   , ( mmioE
     , [ ("read8", TInt u64, TInt u8)
       , ("read32", TInt u64, TInt u32)

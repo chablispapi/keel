@@ -20,7 +20,7 @@ import Data.List (isInfixOf, isPrefixOf, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative, compileNativeWith)
-import Keel.Eval (Outcome (..), evalProgram)
+import Keel.Eval (Outcome (..), evalProgram, evalProgramWith)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
@@ -203,7 +203,14 @@ exampleFiles =
   , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
   , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
   , ("test/modules/qual/main.kl", (Just "48", ""))
+  , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
+  , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
   ]
+
+-- | What an example reads on stdin (none for the rest). QEMU gives it none: there, and in the
+-- evaluator run it is compared with, getc returns -1 straight away.
+exampleInput :: String -> String
+exampleInput name = maybe "" id (lookup name [("examples/words.kl", "the cat\nthe dog\nsat on the cat\n")])
 
 -- | Multi-file programs the module loader must refuse, and part of the message.
 moduleErrors :: [(FilePath, String)]
@@ -262,7 +269,7 @@ loadExample (path, expected) = do
     Right core -> case compile core of
       Left e -> pure (["FAIL " ++ path ++ ": " ++ show e], [])
       Right mono -> do
-        let got = reduce (evalProgram mono)
+        let got = reduce (evalProgramWith (exampleInput path) mono)
             fails = ["FAIL " ++ path ++ ": evaluator gave " ++ show got ++ ", expected " ++ show expected | got /= expected]
         pure (fails, [(path, core)])
 
@@ -355,9 +362,9 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
       ExitFailure _ -> pure [failMsg ("cc failed:\n" ++ ccErr)]
       ExitSuccess -> do
         environment <- getEnvironment
-        (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) ""
+        (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) (exampleInput name)
         let native = parseRun code stdout
-            reference = reduce (evalProgram mono)
+            reference = reduce (evalProgramWith (exampleInput name) mono)
             stats = parseStats stderr
         pure $
           [failMsg ("native " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]

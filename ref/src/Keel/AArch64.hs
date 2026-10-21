@@ -989,6 +989,8 @@ emitRuntime = do
   line "L_perform_machine:"
   ins "cmp x0, #1" -- putc
   ins "b.eq L_perform_putc"
+  ins "cmp x0, #2" -- getc
+  ins "b.eq L_perform_getc"
   ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
   ins "sub sp, sp, #16"
   ins "str x1, [sp]" -- printf's variadic argument
@@ -1003,6 +1005,11 @@ emitRuntime = do
   ins "mov x0, x1"
   ins "bl _putchar"
   ins "mov x0, #0"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+  line "L_perform_getc:"
+  ins "bl _getchar" -- a byte, or EOF (-1)
+  ins "sxtw x0, w0"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 

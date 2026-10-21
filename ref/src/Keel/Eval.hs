@@ -1,11 +1,11 @@
 -- | Call-by-value, environment-based evaluator for Keel Core, stages 1–4
 -- (spec/core.md §1.4, §2.5, §3.4, §4.5). Types are erased: @f[τ̄]@ evaluates like @f@. Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
-module Keel.Eval (Value (..), Outcome (..), evalProgram) where
+module Keel.Eval (Value (..), Outcome (..), evalProgram, evalProgramWith) where
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
-import Control.Monad.Trans.State.Strict (State, modify, runState)
+import Control.Monad.Trans.State.Strict (State, get, modify, put, runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Map.Strict qualified as M
 import Keel.Syntax
@@ -52,20 +52,25 @@ data Outcome = Done Value | Panicked String
   deriving (Eq, Show)
 
 -- | Evaluation can panic and appends output text, in reversed chunks.
-type Run = ExceptT String (State [String])
+-- | The state: input not yet read (bytes as characters), and output written, newest first.
+type Run = ExceptT String (State (String, [String]))
 
 -- | A handler frame: operation ↦ (parameter, clause body), and the clause environment.
 data Handler = Handler (M.Map String (String, Term)) Env
 
--- | Run @main@; returns the outcome and the values written with the built-in @out@ operation.
+-- | Run @main@ with no input; returns the outcome and what it wrote with @out@ and @putc@.
 evalProgram :: Program -> (Outcome, String)
-evalProgram (Program decls main) = (either Panicked Done r, concat (reverse trace))
+evalProgram = evalProgramWith ""
+
+-- | Run @main@ with the bytes @getc@ reads (as characters).
+evalProgramWith :: String -> Program -> (Outcome, String)
+evalProgramWith input (Program decls main) = (either Panicked Done r, concat (reverse trace))
   where
-    (r, trace) = runState (runExceptT (eval [] globals main)) []
+    (r, (_, trace)) = runState (runExceptT (eval [] globals main)) (input, [])
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
     globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
-    pureValue m = case runState (runExceptT m) [] of
-      (Right v, []) -> v
+    pureValue m = case runState (runExceptT m) ("", []) of
+      (Right v, (_, [])) -> v
       _ -> stuck "effectful top-level definition"
 
 -- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
@@ -152,9 +157,17 @@ perform hs op v = case break handles hs of
 -- | Operations no handler caught are performed by the machine. The evaluator has no device
 -- memory, so an unhandled MMIO operation panics (handle MMIO with a mock to run drivers here).
 machine :: String -> Value -> Run Value
-machine "out" (VInt _ n) = lift (modify ((show n ++ "\n") :)) >> pure VUnit
-machine "putc" (VInt _ b) = lift (modify ([toEnum (fromInteger b)] :)) >> pure VUnit
+machine "out" (VInt _ n) = write (show n ++ "\n")
+machine "putc" (VInt _ b) = write [toEnum (fromInteger b)]
+machine "getc" _ = do
+  (input, out) <- lift get
+  case input of
+    c : rest -> lift (put (rest, out)) >> pure (VInt i64 (toInteger (fromEnum c)))
+    [] -> pure (VInt i64 (-1))
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
+
+write :: String -> Run Value
+write s = lift (modify (\(i, o) -> (i, s : o))) >> pure VUnit
 
 prim :: Prim -> Value -> Value -> Run Value
 prim op (VInt t a) (VInt _ b) = case op of
