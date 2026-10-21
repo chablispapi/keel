@@ -109,7 +109,7 @@ jumpIf cond operands target = do
       _ -> error ("jumpIf: " ++ c)
 
 emitProgram :: [Decl] -> Ty -> LProg -> Either String String
-emitProgram decls mainTy (LProg funs statics mainF) = case gsErr final of
+emitProgram decls mainTy (LProg funs statics mainF _) = case gsErr final of
   Just e -> Left e
   Nothing -> Right (unlines (reverse (gsLines final)))
   where

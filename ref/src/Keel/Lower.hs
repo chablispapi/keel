@@ -15,7 +15,7 @@ module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, 
 import Control.Applicative ((<|>))
 import Control.Monad (foldM, forM, forM_)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.State.Strict (State, StateT, evalState, get, modify, put, runStateT)
+import Control.Monad.Trans.State.Strict (State, StateT, evalState, get, gets, modify, put, runStateT)
 import Data.Bits (setBit)
 import Data.List (elemIndex, nub, sortOn)
 import Data.Map.Strict qualified as M
@@ -77,7 +77,10 @@ data Fun = Fun
 -- | Functions are numbered: top-level λ definitions keep their definition's index, lifted
 -- functions follow. Every top-level definition i also has a static block @_kc_i@, listed in
 -- @lStatics@ with the functions it points to. @main@ is a separate function.
-data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun}
+--
+-- @lLocs@ is the source position of each bound variable's computation, where the program
+-- still had one (only debug builds keep positions through optimization).
+data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos}
   deriving (Show)
 
 -- | What lowering needs to know about declarations.
@@ -101,7 +104,8 @@ isPtr t = case t of
   TBox a -> isPtr a
   _ -> False
 
-data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String}
+-- | lsPos is the innermost source position around the term being lowered.
+data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos}
 
 type M = StateT LS (Either String)
 
@@ -179,9 +183,9 @@ lower (Program userDecls main) = do
           m <- expr info M.empty main (pure . Ret)
           pure (statics, Fun "main" [] 1 [] [] False m)
       )
-      (LS 0 M.empty S.empty)
+      (LS 0 M.empty S.empty Nothing M.empty)
   let ptrs = lsPtrs s
-  pure (LProg (M.map (refcount ptrs) (lsFuns s)) statics (refcount ptrs mainF))
+  pure (LProg (M.map (refcount ptrs) (lsFuns s)) statics (refcount ptrs mainF) (lsLocs s))
   where
     isLam e = case e of
       Lam {} -> True
@@ -217,6 +221,11 @@ type Env = M.Map String (String, Ty)
 -- | CPS-style ANF conversion: @k@ receives an atom for the value of the term.
 expr :: Info -> Env -> Term -> (Atom -> M Expr) -> M Expr
 expr info env tm k = case tm of
+  -- The position holds while the term is lowered; the continuation gets the outer one back.
+  At p e -> do
+    outer <- gets lsPos
+    modify (\s -> s {lsPos = Just p})
+    expr info env e $ \v -> modify (\s -> s {lsPos = outer}) >> k v
   Var x
     | Just (x', _) <- M.lookup x env -> k (AVar x')
     | otherwise -> k (maybe (AVar x) (AGlobal . fst) (M.lookup x (iGlobals info)))
@@ -326,6 +335,7 @@ expr info env tm k = case tm of
 
     bindRhs rhs = do
       x <- newVar "t" ty
+      modify (\s -> s {lsLocs = maybe id (M.insert x) (lsPos s) (lsLocs s)})
       Bind x rhs <$> k (AVar x)
 
     con c = maybe (lift (Left ("unknown constructor " ++ c))) pure (M.lookup c (iCons info))
@@ -347,6 +357,7 @@ expr info env tm k = case tm of
 -- | The type of a well-typed term (effects omitted: lowering doesn't need them).
 typeOf :: Info -> Env -> Term -> Ty
 typeOf info env tm = case tm of
+  At _ e -> go e
   Var x -> fromMaybe TUnit ((snd <$> M.lookup x env) <|> (snd <$> M.lookup x (iGlobals info)))
   UnitLit -> TUnit
   BoolLit _ -> TBool

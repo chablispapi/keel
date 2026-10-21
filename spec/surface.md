@@ -8,10 +8,10 @@ Keel Core needs explicitly (`ref/src/Keel/Infer.hs`), then runs the core pipelin
 keelc new NAME                 create a project: NAME/keel.project, NAME/src/main.kl
 keelc check [FILE.kl]          type-check; print main's type and effects
 keelc run   [FILE.kl]          run with the reference evaluator
-keelc asm   [FILE.kl]          print the ARM64 assembly
-keelc build [FILE.kl] [-o OUT] [--target native|riscv64]
+keelc asm   [FILE.kl] [-g]     print the ARM64 assembly
+keelc build [FILE.kl] [-o OUT] [--target native|riscv64] [-g]
                                native executable (via the system cc), or a freestanding
-                               RISC-V image for QEMU's virt board
+                               RISC-V image for QEMU's virt board; -g adds debug info
 keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
 keelc lsp                      the language server, over stdin/stdout
 ```
@@ -204,6 +204,29 @@ ln -sfn "$PWD/queries" ~/.config/helix/runtime/queries/keel
 ```
 
 Not yet: types of local variables on hover, go-to-definition, completion.
+
+## Debugging
+
+`keelc build -g` adds DWARF debug info to a native build (`OUT.dSYM` next to the executable),
+so lldb can break on `.kl` lines, show the source, and name Keel functions in backtraces:
+
+```
+$ keelc build -g examples/fact.kl && lldb examples/fact
+(lldb) b fact.kl:4
+(lldb) run
+-> 4     \n. if n < 1 then 1 else n * fact (n - 1)
+                ^
+(lldb) bt
+  * frame #0: fact`fact at fact.kl:4:10
+    frame #1: fact`fact at fact.kl:4:32
+    frame #2: fact`main at fact.kl:9:12
+```
+
+The program is optimized as usual. Inlined code keeps its own lines, so a breakpoint on a
+small inlined function stops in its caller. A line with no code of its own left after
+inlining (`\n. helper n n`, once `helper` is inlined) takes no breakpoint. Stepping and
+breakpoints work; lldb can't print Keel values yet (no variable locations or types), and the
+RISC-V target has no debug info yet.
 
 ## Hardware access
 

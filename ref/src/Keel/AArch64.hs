@@ -10,29 +10,41 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate) where
+module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.List (nub, sortOn)
+import Data.List (elemIndex, nub, sortOn)
+import Data.ByteString qualified as B
 import Data.Map.Strict qualified as M
+import Data.Maybe (listToMaybe)
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Numeric (showOct)
 import Keel.Check (checkProgram)
 import Keel.Lower
-import Keel.Mono (compile)
+import Keel.Mono (compileWith)
 import Keel.Syntax
 
 -- | The whole pipeline: check, elaborate, monomorphize, lower, emit.
 compileNative :: Program -> Either String String
-compileNative p = do
-  (decls, t, lp) <- prepare p
+compileNative = compileNativeWith False
+
+-- | With @debug@, the assembly carries a line table (.file/.loc) for @cc -g@.
+compileNativeWith :: Bool -> Program -> Either String String
+compileNativeWith debug p = do
+  (decls, t, lp) <- prepareWith debug p
   pure (emitProgram decls t lp)
 
 -- | The target-independent part of every back end: the core pipeline and lowering. Returns
 -- the declarations (with built-ins), @main@'s type, and the lowered program.
 prepare :: Program -> Either String ([Decl], Ty, LProg)
-prepare p = do
-  mono <- either (Left . show) Right (compile p)
+prepare = prepareWith False
+
+prepareWith :: Bool -> Program -> Either String ([Decl], Ty, LProg)
+prepareWith debug p = do
+  mono <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram mono)
   lp <- lower mono
   let Program decls _ = mono
@@ -45,7 +57,9 @@ heapSize = 64 * 1024 * 1024
 maxSmall :: Int
 maxSmall = 64
 
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String}
+-- | gsLocs: the line-table row (file number, line, column) for variables bound by a
+-- positioned computation; empty unless the program kept positions (debug builds).
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int)}
 
 type G = State GS
 
@@ -81,13 +95,18 @@ printStr s = do
 
 -- | Emit a program whose @main@ has type @mainTy@.
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty))))
+emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows))))
   where
     printers = printerTypes decls mainTy
+    files = nub [f | (f, _, _) <- M.elems locs]
+    rows = M.map (\(f, l, c) -> (maybe 0 (+ 1) (elemIndex f files), l, c)) locs
     gen = do
       line "\t.section __TEXT,__text,regular,pure_instructions"
+      forM_ (zip [1 :: Int ..] files) $ \(n, f) -> ins (".file " ++ show n ++ " " ++ show f)
       forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
       emitFun "_kf_main" mainF
+      -- The runtime has no Keel source: line 0.
+      unless (null files) $ ins ".loc 1 0 0"
       emitEntry printers mainTy
       forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
       emitRuntime
@@ -107,6 +126,9 @@ emitProgram decls mainTy (LProg funs statics mainF) = unlines (reverse (gsLines 
       line "\t.section __TEXT,__cstring,cstring_literals"
       strs <- gets gsStrings
       forM_ (M.toList strs) $ \(s, l) -> line (l ++ ":\t.asciz " ++ show s)
+      case files of
+        f : _ -> debugInfo f ([("_kf_" ++ show i, funName fn) | (i, fn) <- M.toList funs] ++ [("_kf_main", "main")])
+        [] -> pure ()
 
 -- Functions -------------------------------------------------------------------------------
 
@@ -138,6 +160,12 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
       slots = Slots locs saved
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t// " ++ name)
+  line ("L" ++ lbl ++ "_begin:")
+  -- The prologue belongs to the function's first line, so a breakpoint on it stops there.
+  rows <- gets gsLocs
+  case [r | v <- bound body, Just r <- [M.lookup v rows]] of
+    r : _ -> lineRow r
+    [] -> unless (M.null rows) $ ins ".loc 1 0 0"
   ins "stp x29, x30, [sp, #-16]!"
   ins "mov x29, sp"
   when (frame > 0) $ subSp frame
@@ -150,6 +178,7 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "bl _keel_drop"
   expr slots Nothing body
+  line ("L" ++ lbl ++ "_end:")
 
 subSp :: Int -> G ()
 subSp n
@@ -237,6 +266,68 @@ movImm r n =
     chunks = [(u `shiftR` (16 * k)) .&. 0xffff | k <- [0 .. 3]]
     shift k = if k == 0 then "" else ", lsl #" ++ show (16 * k)
 
+-- | DWARF for debug builds: a compile unit pointing at the line table the assembler builds
+-- from the .loc directives, and a subprogram per Keel function, so lldb can break on .kl
+-- lines and name functions in backtraces. Paths are absolute (keelc makes them so).
+--
+-- ponytail: lines and function names only; no variable locations or types, so lldb can't
+-- print Keel values yet.
+debugInfo :: FilePath -> [(String, String)] -> G ()
+debugInfo file fns = do
+  line "\t.section __DWARF,__debug_abbrev,regular,debug"
+  mapM_ (ins . (".byte " ++) . show)
+    ( [1, 0x11, 1, 0x03, 0x08, 0x13, 0x05, 0x10, 0x17, 0x1b, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0] -- compile unit
+        ++ [2, 0x2e, 0, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0] -- subprogram
+        ++ [0 :: Int]
+    )
+  line "\t.section __DWARF,__debug_info,regular,debug"
+  line "Ldebug_info:"
+  diff "Ldebug_info_end" "Ldebug_info_start"
+  line "Ldebug_info_start:"
+  ins ".short 4"
+  ins ".long 0"
+  ins ".byte 8"
+  ins ".byte 1"
+  cstring file
+  -- No DWARF language for Keel; lldb ignores subprograms in assembler units, so say C.
+  ins ".short 0x0c"
+  diff "Lline_table_start" "Lsection_line"
+  cstring "/"
+  -- The functions are emitted in this order, main last.
+  let first = maybe "_kf_main" fst (listToMaybe fns)
+  ins (".quad L" ++ first ++ "_begin")
+  diff "L_kf_main_end" ("L" ++ first ++ "_begin")
+  forM_ fns $ \(lbl, name) -> do
+    ins ".byte 2"
+    cstring name
+    ins (".quad L" ++ lbl ++ "_begin")
+    diff ("L" ++ lbl ++ "_end") ("L" ++ lbl ++ "_begin")
+  ins ".byte 0"
+  line "Ldebug_info_end:"
+  line "\t.section __DWARF,__debug_line,regular,debug"
+  line "Lsection_line:"
+  line "Lline_table_start:"
+  where
+    -- A 4-byte difference of local labels, through a .set symbol so the assembler computes it:
+    -- written directly, it becomes a relocation pair, which debug sections can't have.
+    diff a b = do
+      n <- newLabel
+      line (n ++ "_set = " ++ a ++ "-" ++ b)
+      ins (".long " ++ n ++ "_set")
+    -- UTF-8, with octal escapes outside printable ASCII (names like λx).
+    cstring s = ins (".asciz \"" ++ concatMap esc (B.unpack (TE.encodeUtf8 (T.pack s))) ++ "\"")
+    esc b
+      | b >= 32 && b < 127 && b /= 34 && b /= 92 = [toEnum (fromIntegral b)]
+      | otherwise = '\\' : pad (showOct b "")
+    pad o = replicate (3 - length o) '0' ++ o
+
+-- | A line-table row for the code computing @x@, if it has a position.
+loc :: String -> G ()
+loc x = gets (M.lookup x . gsLocs) >>= mapM_ lineRow
+
+lineRow :: (Int, Int, Int) -> G ()
+lineRow (f, l, c) = ins (".loc " ++ show f ++ " " ++ show l ++ " " ++ show c)
+
 -- | Increment the reference count of a variable's block (inline; uses x16, x17). Immortal
 -- blocks (bit 31) are skipped; a count of zero means a freed block, which is a bug.
 dup :: Slots -> String -> G ()
@@ -258,8 +349,9 @@ expr slots join e = case e of
     case join of
       Nothing -> leave slots >> ins "ret"
       Just (v, lbl) -> store slots "x0" v >> ins ("b " ++ lbl)
-  Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> tc
+  Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> loc x >> tc
   Bind x rhs rest -> do
+    loc x
     rhsCode slots rhs
     store slots "x0" x
     expr slots join rest

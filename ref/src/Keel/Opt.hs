@@ -14,7 +14,7 @@
 --
 -- Inlined code is renamed apart, since the core forbids shadowing. The result is checked
 -- again by the core checker ("Keel.Mono".compile).
-module Keel.Opt (optimize) where
+module Keel.Opt (optimize, optimizeWith) where
 
 import Control.Monad (forM)
 import Control.Monad.Trans.State.Strict (State, evalState, get, gets, modify, put, runState)
@@ -26,13 +26,42 @@ import Keel.Check (recursiveGroups, typeOfClosed)
 import Keel.Syntax
 
 optimize :: Program -> Program
-optimize = removeDead . simplify . specialize . liftClosed . stripPositions
+optimize = optimizeWith False
+
+-- | With @debug@, positions stay on computations (calls, arithmetic, case, …) for the line
+-- table (@keelc build -g@); otherwise they are stripped.
+optimizeWith :: Bool -> Program -> Program
+optimizeWith debug = removeDead . simplify . specialize . liftClosed . positions
+  where
+    positions = if debug then thinPositions else stripPositions
 
 stripPositions :: Program -> Program
 stripPositions (Program decls main) = Program [strip d | d <- decls] (stripAt main)
   where
     strip (Def f t e) = Def f t (stripAt e)
     strip d = d
+
+-- | Keep positions only on computations. The rewrites below match λs, lets, variables and
+-- cocases directly under applications and projections, so those must not sit under a position.
+thinPositions :: Program -> Program
+thinPositions (Program decls main) = Program [thinDecl d | d <- decls] (thin main)
+  where
+    thinDecl (Def f t e) = Def f t (thin e)
+    thinDecl d = d
+    thin tm = case tm of
+      At p e -> let e' = thin e in if computation e' then At p e' else e'
+      _ -> descend thin tm
+    computation e = case e of
+      App {} -> True
+      Prim {} -> True
+      Perform {} -> True
+      Case {} -> True
+      If {} -> True
+      Proj {} -> True
+      Handle {} -> True
+      Convert {} -> True
+      Con _ _ (_ : _) -> True
+      _ -> False
 
 -- Lifting closed λ arguments ------------------------------------------------------------------
 
@@ -281,7 +310,10 @@ rename = go M.empty
           k x' (M.insert x x' env)
 
 size :: Term -> Int
-size = length . universe
+size tm = length [() | t <- universe tm, not (isAt t)]
+  where
+    isAt At {} = True
+    isAt _ = False
 
 -- Dead definitions -----------------------------------------------------------------------------
 

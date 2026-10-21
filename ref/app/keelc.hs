@@ -3,10 +3,10 @@
 -- > keelc new NAME                 create a project: NAME/keel.project, NAME/src/main.kl
 -- > keelc check [FILE.kl]          type-check, print main's type and effects
 -- > keelc run   [FILE.kl]          run with the reference evaluator
--- > keelc asm   [FILE.kl]          print the ARM64 assembly
--- > keelc build [FILE.kl] [-o OUT] [--target native|riscv64]
+-- > keelc asm   [FILE.kl] [-g]     print the ARM64 assembly
+-- > keelc build [FILE.kl] [-o OUT] [--target native|riscv64] [-g]
 -- >                                compile (native: via the system cc; riscv64: a freestanding
--- >                                image for QEMU's virt board)
+-- >                                image for QEMU's virt board); -g adds debug info (native)
 -- > keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
 -- > keelc lsp                      the language server, over stdin/stdout ("Keel.Lsp")
 --
@@ -17,7 +17,7 @@ module Main (main) where
 
 import Data.Char (isSpace)
 import Data.Map.Strict qualified as M
-import Keel.AArch64 (compileNative)
+import Keel.AArch64 (compileNativeWith)
 import Keel.Check (TypeError (..), checkProgram)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
@@ -27,7 +27,7 @@ import Keel.Mono (compile)
 import Keel.RiscV (compileRiscV)
 import Keel.Syntax (Program, prettyEff, prettyTy)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath (dropExtension, takeDirectory, (<.>), (</>))
@@ -39,7 +39,7 @@ usage =
   unlines
     [ "usage: keelc new NAME"
     , "       keelc (check | run | asm | qemu) [FILE.kl]"
-    , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64]"
+    , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64] [-g]"
     , "       keelc lsp"
     , "Without FILE.kl, keelc uses keel.project in the current directory."
     ]
@@ -47,8 +47,8 @@ usage =
 data Target = Native | RiscV64
   deriving (Eq)
 
--- | What to build: the entry file, the target, and the output path.
-data Job = Job {jobEntry :: FilePath, jobTarget :: Target, jobOut :: FilePath}
+-- | What to build: the entry file, the target, the output path, and whether to add debug info.
+data Job = Job {jobEntry :: FilePath, jobTarget :: Target, jobOut :: FilePath, jobDebug :: Bool}
 
 main :: IO ()
 main = do
@@ -74,14 +74,14 @@ main = do
             Panicked msg -> hPutStrLn stderr ("panic: " ++ msg) >> exitWith (ExitFailure 101)
         "asm" -> do
           (_, core) <- load (jobEntry job)
-          putStr =<< orDie (compileNative core)
+          putStr =<< orDie (compileNativeWith (jobDebug job) core)
         "qemu" -> do
           (tools, elf) <- buildRv (jobEntry job) (jobOut job)
           (code, out) <- runQemu tools elf
           putStr out
           exitWith code
         _ -> case jobTarget job of
-          Native -> build (jobEntry job) (jobOut job)
+          Native -> build job
           RiscV64 -> () <$ buildRv (jobEntry job) (jobOut job)
     _ -> die usage
 
@@ -89,9 +89,9 @@ main = do
 -- project in the current directory provides the defaults.
 jobFor :: [String] -> IO Job
 jobFor args = do
-  let (file, out, target) = parseArgs args (Nothing, Nothing, Nothing)
+  let (file, out, target) = parseArgs (filter (/= "-g") args) (Nothing, Nothing, Nothing)
   base <- case file of
-    Just f -> pure (Job f Native (dropExtension f))
+    Just f -> pure (Job f Native (dropExtension f) ("-g" `elem` args))
     Nothing -> do
       hasProject <- doesFileExist "keel.project"
       if not hasProject
@@ -100,7 +100,7 @@ jobFor args = do
           m <- readManifest "keel.project"
           let name = M.findWithDefault "main" "name" m
               target' = if M.lookup "target" m == Just "riscv64" then RiscV64 else Native
-          pure (Job (M.findWithDefault "src/main.kl" "main" m) target' ("build" </> name))
+          pure (Job (M.findWithDefault "src/main.kl" "main" m) target' ("build" </> name) ("-g" `elem` args))
   t <- case target of
     Nothing -> pure (jobTarget base)
     Just "native" -> pure Native
@@ -152,13 +152,18 @@ load f = do
   _ <- orDie (showErr sources (compile core))
   pure (sources, core)
 
-build :: FilePath -> FilePath -> IO ()
-build f out = do
-  (_, core) <- load f
-  asm <- orDie (compileNative core)
+-- | With -g, cc turns the line table into DWARF and runs dsymutil (OUT.dSYM), so lldb can
+-- break on and step through .kl lines.
+build :: Job -> IO ()
+build job = do
+  let out = jobOut job
+  -- Debug info names files by absolute path, so lldb finds them from anywhere.
+  entry <- if jobDebug job then makeAbsolute (jobEntry job) else pure (jobEntry job)
+  (_, core) <- load entry
+  asm <- orDie (compileNativeWith (jobDebug job) core)
   let s = out <.> "s"
   writeFile s asm
-  (code, _, err) <- readProcessWithExitCode "cc" ["-o", out, s] ""
+  (code, _, err) <- readProcessWithExitCode "cc" (["-g" | jobDebug job] ++ ["-o", out, s]) ""
   case code of
     ExitSuccess -> putStrLn ("built " ++ out)
     ExitFailure _ -> hPutStr stderr err >> die "cc failed"

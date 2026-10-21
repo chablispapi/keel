@@ -19,7 +19,7 @@ import Control.Monad (forM, unless)
 import Data.List (isInfixOf, isPrefixOf, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.AArch64 (compileNative)
+import Keel.AArch64 (compileNative, compileNativeWith)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), Json (..), diagnose, hover, parseJson, renderJson)
@@ -268,15 +268,18 @@ main = do
   loaded <- mapM loadExample exampleFiles
   modErrs <- (++) <$> (concat <$> mapM checkModuleError moduleErrors) <*> lspChecks
   let programs = cases ++ specCases ++ concatMap snd loaded
-  failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir))
+  failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir False))
+  -- The examples have source positions: build them again with debug info.
+  let debugPrograms = concatMap snd loaded
+  debugFailures <- concat <$> forM (zip [0 :: Int ..] debugPrograms) (uncurry (runCase dir True))
   let refused =
         [ "FAIL " ++ name ++ ": expected 'not supported yet', got " ++ either id (const "assembly") r
         | (name, p) <- unsupportedCases
         , let r = compileNative p
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
-      allFailures = failures ++ refused
-      total = length programs + length unsupportedCases + length exampleFiles + length moduleErrors + 1
+      allFailures = failures ++ debugFailures ++ refused
+      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + 1
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-
@@ -329,15 +332,20 @@ firmware tools dir = do
           (code, uart) <- runQemu tools elf
           pure ["FAIL [riscv] " ++ path ++ ": got " ++ show (code, uart) | code /= ExitSuccess || not ("Hi!\nresult: ()\n" `isPrefixOf` uart)]
 
-runCase :: FilePath -> Int -> (String, Program) -> IO [String]
-runCase dir i (name, prog) = case (compile prog, compileNative prog) of
+-- | Build and run a program natively, and compare with the evaluator. With @debug@, it is built
+-- as keelc build -g does: positions kept through optimization and a line table, which must
+-- change nothing but the debug info.
+runCase :: FilePath -> Bool -> Int -> (String, Program) -> IO [String]
+runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug prog) of
   (Left e, _) -> pure [failMsg ("does not type-check: " ++ show e)]
   (_, Left e) -> pure [failMsg e]
+  (_, Right asm) | debug, not (".loc " `isInfixOf` asm) -> pure [failMsg "no line table"]
   (Right mono, Right asm) -> do
-    let src = dir </> ("case" ++ show i ++ ".s")
-        exe = dir </> ("case" ++ show i)
+    let base = (if debug then "dcase" else "case") ++ show i
+        src = dir </> (base ++ ".s")
+        exe = dir </> base
     writeFile src asm
-    (ccCode, _, ccErr) <- readProcessWithExitCode "cc" ["-o", exe, src] ""
+    (ccCode, _, ccErr) <- readProcessWithExitCode "cc" (["-g" | debug] ++ ["-o", exe, src]) ""
     case ccCode of
       ExitFailure _ -> pure [failMsg ("cc failed:\n" ++ ccErr)]
       ExitSuccess -> do
@@ -354,7 +362,7 @@ runCase dir i (name, prog) = case (compile prog, compileNative prog) of
                , maybe True (\s -> inplace s < 990000 || allocs s > 5000) stats
                ]
   where
-    failMsg msg = "FAIL " ++ name ++ ": " ++ msg
+    failMsg msg = "FAIL " ++ name ++ (if debug then " (-g)" else "") ++ ": " ++ msg
 
 data Stats = Stats {allocs, recycled, inplace, freed, live :: Integer}
   deriving (Show)

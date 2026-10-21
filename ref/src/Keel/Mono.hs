@@ -3,7 +3,7 @@
 --
 -- The output has no ∀, no type application, and no type variables outside data and codata
 -- declarations, which stay as layout templates instantiated at closed types.
-module Keel.Mono (monomorphize, isClosed, compile) where
+module Keel.Mono (monomorphize, isClosed, compile, compileWith) where
 
 import Control.Monad (forM_, unless)
 import Data.List (intercalate)
@@ -11,20 +11,24 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.Check (ErrKind (..), TypeError (..), checkProgram, recursiveGroups)
 import Keel.Elab (checkRefs, elaborate)
-import Keel.Opt (optimize)
+import Keel.Opt (optimizeWith)
 import Keel.Syntax
 
 -- | The whole pipeline: place rules, elaboration, type checking, monomorphization,
 -- optimization, and a final check of the result.
 compile :: Program -> Either TypeError Program
-compile p = do
+compile = compileWith False
+
+-- | With @debug@, positions survive optimization (for the line table).
+compileWith :: Bool -> Program -> Either TypeError Program
+compileWith debug p = do
   checkRefs p
   let core = elaborate p
   _ <- checkProgram core
   mono <- monomorphize core
   _ <- checkProgram mono
   -- Optimize (spec/perf.md) and check again: an optimizer bug shows up as a type error.
-  let opt = optimize mono
+  let opt = optimizeWith debug mono
   _ <- checkProgram opt
   pure opt
 
