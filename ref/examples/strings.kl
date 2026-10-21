@@ -1,0 +1,8 @@
+-- The prelude and string literals: "text" is a List u8 of UTF-8 bytes.
+
+main =
+  println "Hello from Keel!";
+  printInt (-9223372036854775808); putc(10);
+  println (reverse "!olleh");
+  println (append "length of abc: " "");
+  length "abc"

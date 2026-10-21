@@ -8,7 +8,7 @@
 -- > def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
 -- >   \f xs. case xs of { Nil -> Nil | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
 -- > main = ...
-module Keel.Parser (parseProgram) where
+module Keel.Parser (parseProgram, parseLibrary) where
 
 import Data.Char (isUpper)
 import Data.Functor (($>))
@@ -20,6 +20,10 @@ import Text.Parsec.Token qualified as Tok
 
 parseProgram :: FilePath -> String -> Either String Program
 parseProgram path src = either (Left . show) Right (parse (whiteSpace *> program <* eof) path src)
+
+-- | Declarations without a @main@ (the prelude).
+parseLibrary :: FilePath -> String -> Either String [Decl]
+parseLibrary path src = either (Left . show) Right (parse (whiteSpace *> many decl <* eof) path src)
 
 -- Lexer -------------------------------------------------------------------------------------
 
@@ -329,9 +333,24 @@ postfix = do
         Con c [] as -> Con c ts as
         _ -> t
 
+-- | @"text"@: a @List u8@ of the string's UTF-8 bytes (Haskell-style escapes).
+stringLit :: Parser Term
+stringLit = do
+  s <- Tok.stringLiteral lexer
+  pure (foldr (\b rest -> Con "Cons" [] [IntLit u8 b, Box rest]) (Con "Nil" [] []) (concatMap utf8 s))
+  where
+    utf8 c
+      | n < 0x80 = [n]
+      | n < 0x800 = [0xC0 + n `div` 64, 0x80 + n `mod` 64]
+      | n < 0x10000 = [0xE0 + n `div` 4096, 0x80 + (n `div` 64) `mod` 64, 0x80 + n `mod` 64]
+      | otherwise = [0xF0 + n `div` 262144, 0x80 + (n `div` 4096) `mod` 64, 0x80 + (n `div` 64) `mod` 64, 0x80 + n `mod` 64]
+      where
+        n = toInteger (fromEnum c)
+
 atom :: Parser Term
 atom =
-  number
+  stringLit
+    <|> number
     <|> (reserved "true" $> BoolLit True)
     <|> (reserved "false" $> BoolLit False)
     <|> try (parens (pure ()) $> UnitLit)

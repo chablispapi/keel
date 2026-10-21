@@ -14,7 +14,7 @@ import Keel.Check (TypeError (..), checkProgram)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
 import Keel.Mono (compile)
-import Keel.Parser (parseProgram)
+import Keel.Prelude (loadProgram)
 import Keel.RiscV (compileRiscV)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import Keel.Syntax (Program, prettyEff, prettyTy)
@@ -67,7 +67,7 @@ main = do
 load :: FilePath -> IO (String, Program)
 load f = do
   src <- readFile f
-  surface <- orDie (parseProgram f src)
+  surface <- orDie (loadProgram f src)
   core <- orDie (showErr f src (inferProgram surface))
   -- Report core errors (linearity, effects, references) with positions too.
   _ <- orDie (showErr f src (compile core))

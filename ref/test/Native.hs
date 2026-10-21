@@ -21,7 +21,7 @@ import Data.Set qualified as S
 import Keel.AArch64 (compileNative)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
-import Keel.Parser (parseProgram)
+import Keel.Prelude (loadProgram)
 import Keel.RiscV (compileRiscV)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
@@ -198,6 +198,7 @@ exampleFiles =
   , ("examples/overflow.kl", (Nothing, "1\n2\n"))
   , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", ""))
   , ("examples/reuse.kl", (Just "1500500", ""))
+  , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
   ]
 
 -- | Parse and infer an example; check the evaluator against the expected output, and return
@@ -205,7 +206,7 @@ exampleFiles =
 loadExample :: (FilePath, Run) -> IO ([String], [(String, Program)])
 loadExample (path, expected) = do
   src <- readFile path
-  case parseProgram path src >>= either (Left . show) Right . inferProgram of
+  case loadProgram path src >>= either (Left . show) Right . inferProgram of
     Left e -> pure (["FAIL " ++ path ++ ": " ++ e], [])
     Right core -> case compile core of
       Left e -> pure (["FAIL " ++ path ++ ": " ++ show e], [])
@@ -272,7 +273,7 @@ firmware :: RiscVTools -> FilePath -> IO [String]
 firmware tools dir = do
   let path = "examples/firmware/hello.kl"
   src <- readFile path
-  case parseProgram path src >>= either (Left . show) Right . inferProgram >>= compileRiscV of
+  case loadProgram path src >>= either (Left . show) Right . inferProgram >>= compileRiscV of
     Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
     Right asm ->
       buildRiscV tools (dir </> "firmware") asm >>= \case
