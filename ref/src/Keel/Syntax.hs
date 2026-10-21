@@ -72,6 +72,31 @@ data BitOp = And | Or | Xor | Shl | Shr
 data Prim = Arith Overflow ArithOp | Bits BitOp | Eq | Lt
   deriving (Eq, Show)
 
+-- | Operations on the built-in @Array a@ (M5): a growable array of one-word elements, updated
+-- in place when the array is not shared and copied when it is (spec/memory.md).
+data ArrayOp = AEmpty | ANew | ALength | AGet | ASet | APush | APop
+  deriving (Eq, Show)
+
+-- | The names array operations are written with, applied to all their arguments
+-- (@arrayGet xs 3@, or just @arrayEmpty@); "std.array" wraps them as ordinary functions.
+arrayOps :: [(String, ArrayOp)]
+arrayOps = [("arrayEmpty", AEmpty), ("arrayNew", ANew), ("arrayLength", ALength), ("arrayGet", AGet), ("arraySet", ASet), ("arrayPush", APush), ("arrayPop", APop)]
+
+-- | An array operation's argument types, result type and effects, for element type @a@
+-- (which must be Free: the elements are copied in and out).
+arrayOpType :: ArrayOp -> Ty -> ([Ty], Ty, Eff)
+arrayOpType op a = case op of
+  AEmpty -> ([], arr, S.empty)
+  ANew -> ([TInt i64, a], arr, panic)
+  ALength -> ([arr], TInt i64, S.empty)
+  AGet -> ([arr, TInt i64], a, panic)
+  ASet -> ([arr, TInt i64, a], arr, panic)
+  APush -> ([arr, a], arr, S.empty)
+  APop -> ([arr], arr, panic)
+  where
+    arr = TData "Array" [a]
+    panic = S.singleton panicE
+
 data Term
   = Var String
   | UnitLit
@@ -80,6 +105,7 @@ data Term
   | Convert IntTy Term        -- ^ e as ι: wrapping conversion between integer types
   | BoolLit Bool
   | Prim Prim Term Term
+  | ArrayPrim ArrayOp Ty [Term] -- ^ an array operation at an element type, applied to all its arguments
   | If Term Term Term
   | Lam String Ty Term   -- ^ λ(x:τ). e
   | LLam String Ty Term  -- ^ λ°(x:τ). e
@@ -123,6 +149,7 @@ stripAt tm = descend stripAt tm
 children :: Term -> [Term]
 children tm = case tm of
   Prim _ a b -> [a, b]
+  ArrayPrim _ _ as -> as
   If c a b -> [c, a, b]
   Lam _ _ b -> [b]
   LLam _ _ b -> [b]
@@ -149,6 +176,7 @@ children tm = case tm of
 descend :: (Term -> Term) -> Term -> Term
 descend f tm = case tm of
   Prim op a b -> Prim op (f a) (f b)
+  ArrayPrim op t as -> ArrayPrim op t (map f as)
   If c a b -> If (f c) (f a) (f b)
   Lam x t b -> Lam x t (f b)
   LLam x t b -> LLam x t (f b)
@@ -175,6 +203,7 @@ descend f tm = case tm of
 descendM :: (Monad m) => (Term -> m Term) -> Term -> m Term
 descendM f tm = case tm of
   Prim op a b -> Prim op <$> f a <*> f b
+  ArrayPrim op t as -> ArrayPrim op t <$> mapM f as
   If c a b -> If <$> f c <*> f a <*> f b
   Lam x t b -> Lam x t <$> f b
   LLam x t b -> LLam x t <$> f b
@@ -234,6 +263,7 @@ substTerm tv ev = go
       Lam x t b -> Lam x (st t) b
       LLam x t b -> LLam x (st t) b
       Con c ts as -> Con c (map st ts) as
+      ArrayPrim op t as -> ArrayPrim op (st t) as
       TyApp f ts es -> TyApp f (map st ts) (map (substEff ev) es)
       Cocase d ts bs -> Cocase d (map st ts) bs
       _ -> tm
@@ -310,3 +340,8 @@ builtinEffects =
 -- | Built-in data: @data Option a = None | Some(a)@, the result of @+?@.
 optionDecl :: Decl
 optionDecl = Data False "Option" ["a"] [("None", []), ("Some", [TVar "a"])]
+
+-- | Built-in data: @Array a@, with no constructors (see 'ArrayOp'). Declared so kinds work as
+-- for any data type: an array is linear if its elements are.
+arrayDecl :: Decl
+arrayDecl = Data False "Array" ["a"] []

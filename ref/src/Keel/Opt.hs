@@ -7,7 +7,8 @@
 --    copy. Closed λ arguments (@map (\x. x + 1) xs@) are first lifted to top-level definitions,
 --    so they specialize too, and the inliner then removes the call through the closure.
 -- 2. __Inlining.__ @c.o@ on a known cocase becomes the branch; calls to small non-recursive
---    definitions are replaced by their bodies.
+--    definitions are replaced by their bodies, and constant definitions (@def none = None@,
+--    @array.empty@) by their values, so no top-level value outlives optimization.
 -- 3. __β-reduction.__ @(λx. b) a@ becomes @let x = a in b@, and a @let@ in function position
 --    floats out; both keep call-by-value evaluation order.
 -- 4. __Dead definitions__ (not reachable from @main@) are removed.
@@ -55,6 +56,7 @@ thinPositions (Program decls main) = Program [thinDecl d | d <- decls] (thin mai
       App {} -> True
       Prim {} -> True
       Perform {} -> True
+      ArrayPrim {} -> True
       Case {} -> True
       If {} -> True
       Proj {} -> True
@@ -231,6 +233,14 @@ simplify (Program decls main) = evalState go (0 :: Int)
     isLam Lam {} = True
     isLam LLam {} = True
     isLam _ = False
+    constants = M.fromList [(f, e') | (f, e) <- M.toList defs, let e' = stripAt e, constant e']
+    constant e = case e of
+      UnitLit -> True
+      BoolLit _ -> True
+      IntLit _ _ -> True
+      Con _ _ [] -> True
+      ArrayPrim AEmpty _ [] -> True
+      _ -> False
 
     go = do
       decls' <- forM decls $ \d -> case d of
@@ -250,6 +260,7 @@ simplify (Program decls main) = evalState go (0 :: Int)
       case tm' of
         -- c.o on a known cocase: the branch (renamed apart)
         Proj (Var g) o | Just bs <- M.lookup g consts, Just b <- lookup o bs -> rename b
+        Var g | Just e <- M.lookup g constants -> pure e
         -- calls to small definitions
         App (Var f) a | Just e <- M.lookup f inlinable -> do
           e' <- rename e

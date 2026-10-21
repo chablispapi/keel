@@ -179,7 +179,7 @@ reachable refs f0 = go S.empty (next f0)
 
 buildSig :: [Decl] -> TC Sig
 buildSig userDecls = do
-  let decls = optionDecl : userDecls
+  let decls = optionDecl : arrayDecl : userDecls
       datas = [(d, (lin, ps, cs)) | Data lin d ps cs <- decls]
       codatas = [(d, (ps, os)) | Codata d ps os <- decls]
       cons = [(c, (fs, d)) | (d, (_, _, cs)) <- datas, (c, fs) <- cs]
@@ -351,6 +351,14 @@ infer s rec ctx tm = case tm of
           Arith _ _ -> (ta, S.empty)
           Bits _ -> (ta, S.empty)
     pure (t, S.unions [ea, eb, extra], u)
+  ArrayPrim op a args -> do
+    wfTy s a
+    when (kindOf s a == Lin) $ err KindMismatch ("array elements must be Free, got linear " ++ prettyTy a)
+    let (tys, r, eff) = arrayOpType op a
+    when (length tys /= length args) $ err Mismatch "array operation: wrong number of arguments"
+    rs <- mapM (uncurry expect) (zip tys args)
+    u <- foldM join2 S.empty (map snd rs)
+    pure (r, S.unions (eff : map fst rs), u)
   Convert to e -> do
     (te, ee, ue) <- infer s rec ctx e
     case te of

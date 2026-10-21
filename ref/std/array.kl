@@ -1,0 +1,45 @@
+-- Arrays: growable, with constant-time indexing. Array a is built in; these are its operations
+-- as ordinary functions (the built-in names arrayGet, arraySet, … must be applied to all their
+-- arguments).
+--
+--   import std.array
+--   def squares : Array i64 = array.push (array.push array.empty 0) 1
+--
+-- An update to an array nothing else references happens in place; otherwise the array is
+-- copied first, so arrays are values like everything else. push doubles a full array's
+-- capacity, so n pushes take O(n) time. Elements are Free (copyable).
+
+def empty : forall (a : Free). Array a = arrayEmpty
+
+-- n copies of x.
+def make : forall (a : Free). i64 -> a ->{Panic} Array a = \n x. arrayNew n x
+
+def length : forall (a : Free). Array a -> i64 = \xs. arrayLength xs
+
+-- Element i, panicking unless 0 ≤ i < length.
+def get : forall (a : Free). Array a -> i64 ->{Panic} a = \xs i. arrayGet xs i
+
+def set : forall (a : Free). Array a -> i64 -> a ->{Panic} Array a = \xs i x. arraySet xs i x
+
+-- Add an element at the end.
+def push : forall (a : Free). Array a -> a -> Array a = \xs x. arrayPush xs x
+
+-- Remove the last element, panicking on an empty array.
+def pop : forall (a : Free). Array a ->{Panic} Array a = \xs. arrayPop xs
+
+private def pushAll : forall (a : Free). Array a -> List a ->{Diverge} Array a =
+  \xs l. case l of { Nil -> xs | Cons(x, rest) -> pushAll (arrayPush xs x) (unbox rest) }
+
+def fromList : forall (a : Free). List a ->{Diverge} Array a = \l. pushAll arrayEmpty l
+
+private def toListFrom : forall (a : Free). i64 -> Array a -> List a ->{Diverge, Panic} List a =
+  \i xs acc. if i < 1 then acc else toListFrom (i - 1) xs (Cons(arrayGet xs (i - 1), box acc))
+
+def toList : forall (a : Free). Array a ->{Diverge, Panic} List a = \xs. toListFrom (arrayLength xs) xs Nil
+
+private def foldFrom : forall (a : Free) (b : Free) 'e. (b -> a ->{'e} b) -> b -> i64 -> Array a ->{'e, Diverge, Panic} b =
+  \f acc i xs. if i < arrayLength xs then foldFrom f (f acc (arrayGet xs i)) (i + 1) xs else acc
+
+-- f (… (f (f acc x₀) x₁) …) xₙ₋₁
+def foldl : forall (a : Free) (b : Free) 'e. (b -> a ->{'e} b) -> b -> Array a ->{'e, Diverge, Panic} b =
+  \f acc xs. foldFrom f acc 0 xs

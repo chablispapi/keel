@@ -204,6 +204,7 @@ exampleFiles =
   , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
   , ("test/modules/qual/main.kl", (Just "48", ""))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
+  , ("test/std/array.kl", (Just "(Cons(Cons(110, box Cons(105, box Cons(108, box Nil))), box Cons(Cons(111, box Cons(110, box Cons(101, box Nil))), box Nil)), 100000)", "4999950000\n9592\nzero\nnil\n"))
   , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
   ]
 
@@ -373,6 +374,8 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
                | name == "examples/reuse.kl"
                , maybe True (\s -> inplace s < 990000 || allocs s > 5000) stats
                ]
+            -- 200,000 pushes and 100,000 updates: arrays not shared are updated in place.
+            ++ [failMsg ("expected arrays to be updated in place: " ++ show stats) | name == "test/std/array.kl", maybe True ((> 100) . allocs) stats]
   where
     failMsg msg = "FAIL " ++ name ++ (if debug then " (-g)" else "") ++ ": " ++ msg
 

@@ -46,6 +46,7 @@ data Rhs
   | RPopHandler Atom                    -- ^ pop (and drop) the frame
   | RPerform Int Atom                   -- ^ perform operation n: innermost handler, else the machine
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
+  | RArray ArrayOp Bool [Atom]          -- ^ an array operation; whether the elements are pointers
   deriving (Show)
 
 data Expr
@@ -143,7 +144,7 @@ bitmap offset ptrs = do
 -- | Lower a monomorphic core program (the output of "Keel.Mono".compile).
 lower :: Program -> Either String LProg
 lower (Program userDecls main) = do
-  let decls = optionDecl : userDecls
+  let decls = optionDecl : arrayDecl : userDecls
       defs = [(f, t, e) | Def f t e <- decls]
       info =
         Info
@@ -236,6 +237,7 @@ expr info env tm k = case tm of
     TInt it -> sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
   Convert to e -> sub e $ \v -> bindRhs (RConv to v)
+  ArrayPrim op t args -> subs args $ \vs -> bindRhs (RArray op (isPtr t) vs)
   Let x e b -> sub e $ \v -> do
     let t = typeOf info env e
     x' <- newVar x t
@@ -366,6 +368,7 @@ typeOf info env tm = case tm of
   Prim Lt _ _ -> TBool
   Prim (Arith Optional _) a _ -> TData "Option" [go a]
   Prim _ a _ -> go a
+  ArrayPrim op t _ -> let (_, r, _) = arrayOpType op t in r
   Convert to _ -> TInt to
   If _ a _ -> go a
   Lam x t b -> TFun t S.empty (typeOf info (M.insert x (x, t) env) b)
@@ -449,6 +452,7 @@ refcount ptrs f = f {funBody = evalState (go owned0 S.empty M.empty (funBody f))
         afterDrops <- foldM (flip (dropOrReuse reuse)) rest' (reverse dyingBorrowed)
         let after = case rhs of
               RField _ _ | isP x -> Dup x afterDrops -- a field read is borrowed: own it
+              RArray AGet _ _ | isP x -> Dup x afterDrops
               _ -> afterDrops
         stmt <- foldM (flip (dropOrReuse reuse)) (Bind x rhs after) (reverse dyingUnused)
         pure (foldr Dup stmt dups)
@@ -511,11 +515,13 @@ consumed rhs = case rhs of
   RPushHandler cs _ -> concatMap (atomVars . snd) cs
   RPopHandler a -> atomVars a
   RPerform _ a -> atomVars a
+  RArray op _ as -> concatMap atomVars (if op `elem` [ALength, AGet] then drop 1 as else as)
   _ -> []
 
 -- | Variables a right-hand side only reads.
 borrowed :: Rhs -> [String]
 borrowed (RField a _) = atomVars a
+borrowed (RArray op _ (a : _)) | op `elem` [ALength, AGet] = atomVars a
 borrowed _ = []
 
 -- | Variables used anywhere in an expression (names are unique, so no shadowing to track).

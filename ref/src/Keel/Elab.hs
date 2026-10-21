@@ -202,6 +202,7 @@ expr ps tm k
         [va, vb] -> k ps1 (Prim op va vb)
         _ -> error "unreachable"
       Con c tys as -> exprs ps as $ \ps1 vs -> k ps1 (Con c (map elabTy tys) vs)
+      ArrayPrim op t as -> exprs ps as $ \ps1 vs -> k ps1 (ArrayPrim op (elabTy t) vs)
       -- Like closures: branches see no outer places.
       Cocase d tys bs -> do
         bs' <- mapM (\(o, b) -> (o,) <$> expr M.empty b (\_ v -> pure v)) bs

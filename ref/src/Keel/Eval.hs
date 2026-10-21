@@ -7,7 +7,9 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Control.Monad.Trans.State.Strict (State, get, modify, put, runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
+import Data.Foldable (toList)
 import Data.Map.Strict qualified as M
+import Data.Sequence qualified as Seq
 import Keel.Syntax
 
 data Value
@@ -19,6 +21,7 @@ data Value
   | VBox Value
   | VPair Value Value
   | VCodata Env (M.Map String Term) -- ^ a cocase: each observation runs its branch in the env
+  | VArray (Seq.Seq Value)
 
 type Env = M.Map String Value
 
@@ -33,6 +36,7 @@ instance Show Value where
     VBox a -> "box " ++ show a
     VPair a b -> "(" ++ show a ++ ", " ++ show b ++ ")"
     VCodata {} -> "<codata>"
+    VArray xs -> "[" ++ (if null xs then "" else commas (map show (toList xs))) ++ "]"
     where
       commas = foldr1 (\a b -> a ++ ", " ++ b)
 
@@ -44,6 +48,7 @@ instance Eq Value where
   VCon c vs == VCon d ws = c == d && vs == ws
   VBox a == VBox b = a == b
   VPair a b == VPair c d = a == c && b == d
+  VArray xs == VArray ys = xs == ys
   _ == _ = False
 
 -- | How a program ended. A panic stops the whole program (the reset handler of notes.md §16
@@ -92,6 +97,7 @@ eval hs env tm = case tm of
     va <- eval hs env a
     vb <- eval hs env b
     prim op va vb
+  ArrayPrim op _ args -> mapM (eval hs env) args >>= array op
   If c a b -> do
     vc <- eval hs env c
     case vc of
@@ -165,6 +171,26 @@ machine "getc" _ = do
     c : rest -> lift (put (rest, out)) >> pure (VInt i64 (toInteger (fromEnum c)))
     [] -> pure (VInt i64 (-1))
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
+
+-- | Arrays are values: an update returns a new sequence (the native code updates in place
+-- when it can, which no program can observe).
+array :: ArrayOp -> [Value] -> Run Value
+array op args = case (op, args) of
+  (AEmpty, []) -> pure (VArray Seq.empty)
+  (ANew, [VInt _ n, x]) | n >= 0 -> pure (VArray (Seq.replicate (fromInteger n) x))
+  (ANew, _) -> outOfBounds
+  (ALength, [VArray xs]) -> pure (VInt i64 (toInteger (Seq.length xs)))
+  (AGet, [VArray xs, VInt _ i]) -> maybe outOfBounds pure (Seq.lookup (fromInteger i) xs)
+  (ASet, [VArray xs, VInt _ i, x])
+    | i >= 0 && i < toInteger (Seq.length xs) -> pure (VArray (Seq.update (fromInteger i) x xs))
+    | otherwise -> outOfBounds
+  (APush, [VArray xs, x]) -> pure (VArray (xs Seq.|> x))
+  (APop, [VArray xs]) -> case Seq.viewr xs of
+    rest Seq.:> _ -> pure (VArray rest)
+    Seq.EmptyR -> outOfBounds
+  _ -> stuck "array operation on a non-array"
+  where
+    outOfBounds = throwE "array index out of bounds"
 
 write :: String -> Run Value
 write s = lift (modify (\(i, o) -> (i, s : o))) >> pure VUnit

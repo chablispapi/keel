@@ -222,6 +222,7 @@ uses e = case e of
       RPopHandler a -> av a
       RPerform _ a -> av a
       RConv _ a -> av a
+      RArray _ _ as -> concatMap av as
 
 -- | Variables bound in a body.
 bound :: Expr -> [String]
@@ -524,6 +525,26 @@ rhsCode slots rhs = case rhs of
     atom slots "x1" a
     movImm "x0" (toInteger n)
     ins "bl _keel_perform"
+  -- Arrays (spec/memory.md): length and get read the block; the rest are runtime routines.
+  RArray ALength _ [a] -> atom slots "x9" a >> ins "ldr x0, [x9]"
+  RArray AGet _ [a, i] -> do
+    atom slots "x9" a
+    atom slots "x10" i
+    ins "ldr x11, [x9]"
+    ins "cmp x10, x11"
+    ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
+    ins "add x9, x9, x10, lsl #3"
+    ins "ldr x0, [x9, #16]"
+  RArray op ptr as -> do
+    forM_ (zip [0 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
+    case op of
+      AEmpty -> ins "mov x0, #0" >> ins ("mov x1, #" ++ flag) >> ins "bl _keel_array_alloc"
+      ANew -> ins ("mov x2, #" ++ flag) >> ins "bl _keel_array_new"
+      ASet -> ins "bl _keel_array_set"
+      APush -> ins "bl _keel_array_push"
+      _ -> ins "bl _keel_array_pop"
+    where
+      flag = if ptr then "1" else "0"
   where
     storeAll :: Int -> [String] -> G ()
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
@@ -689,6 +710,7 @@ printerTypes decls t0 = go M.empty [t0]
       | M.member (prettyTy t) acc || M.size acc >= 500 = go acc ts
       | otherwise = go (M.insert (prettyTy t) (t, "_kp_" ++ show (M.size acc)) acc) (deps t ++ ts)
     deps t = case t of
+      TData "Array" [a] -> [a]
       TBox a -> [a]
       TPair a b -> [a, b]
       TData d tys | Just (ps, cs) <- dataOf decls d -> concatMap (map (substTy (M.fromList (zip ps tys)) M.empty) . snd) cs
@@ -751,6 +773,30 @@ emitPrinter decls printers lbl t = do
           printStr ")"
         ins ("b " ++ lDone)
       line (lDone ++ ":")
+    TData "Array" [a] -> do
+      lLoop <- newLabel
+      lFirst <- newLabel
+      lDone <- newLabel
+      printStr "["
+      ins "str xzr, [sp, #24]" -- the index
+      line (lLoop ++ ":")
+      ins "ldp x9, x11, [sp, #16]"
+      ins "ldr x10, [x9]"
+      ins "cmp x11, x10"
+      ins ("b.hs " ++ lDone)
+      ins ("cbz x11, " ++ lFirst)
+      printStr ", "
+      line (lFirst ++ ":")
+      ins "ldp x9, x11, [sp, #16]"
+      ins "add x9, x9, x11, lsl #3"
+      ins "ldr x0, [x9, #16]"
+      maybe (printStr "...") (\(_, l) -> ins ("bl " ++ l)) (M.lookup (prettyTy a) printers)
+      ins "ldr x11, [sp, #24]"
+      ins "add x11, x11, #1"
+      ins "str x11, [sp, #24]"
+      ins ("b " ++ lLoop)
+      line (lDone ++ ":")
+      printStr "]"
     TData _ _ -> printStr "<codata>"
     _ -> printStr "<closure>"
   epilogue
@@ -860,6 +906,7 @@ emitRuntime = do
   ins "str x0, [sp, #16]"
   ins "ldr x11, [x0, #-8]"
   ins "lsr x11, x11, #48"
+  ins "tbnz x11, #0, L_drop_array"
   line "L_drop_loop:"
   ins "cbz x11, L_drop_free"
   ins "sub x13, x11, #1"
@@ -891,6 +938,20 @@ emitRuntime = do
   line "L_drop_ret:"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
+  -- An array: drop its elements if they are pointers (bit 1), last first, then free it.
+  line "L_drop_array:"
+  ins "tbz x11, #1, L_drop_free"
+  ins "ldr x12, [x0]"
+  line "L_drop_elems:"
+  ins "cbz x12, L_drop_free"
+  ins "sub x12, x12, #1"
+  ins "str x12, [sp, #24]"
+  ins "ldr x9, [sp, #16]"
+  ins "add x9, x9, x12, lsl #3"
+  ins "ldr x0, [x9, #16]"
+  ins "bl _keel_drop"
+  ins "ldr x12, [sp, #24]"
+  ins "b L_drop_elems"
 
   -- _keel_free_block: x0 = block with count 0 → push it on its size's free list.
   fn "_keel_free_block"
@@ -942,6 +1003,215 @@ emitRuntime = do
   line "L_reuse_none:"
   ins "mov x0, #0"
   line "L_reuse_ret:"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
+  -- Arrays: payload [length, capacity, elements…]. The header's pointer map has bit 0 set (an
+  -- array: word 0 of other blocks is never a pointer) and bit 1 if the elements are pointers;
+  -- its size field is capacity + 2, at most 0xFFFF (larger blocks are never recycled anyway).
+  -- An update to an array nothing else references happens in place; otherwise the array is
+  -- copied first.
+
+  -- _keel_array_alloc: x0 = capacity, x1 = 1 if the elements are pointers → x0 = an empty array.
+  fn "_keel_array_alloc"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  ins "stp x0, x1, [sp, #16]"
+  ins "add x0, x0, #2"
+  ins "mov x1, #0"
+  ins "bl _keel_alloc"
+  ins "ldp x9, x10, [sp, #16]"
+  ins "add x11, x9, #2"
+  ins "mov x12, #0xFFFF"
+  ins "cmp x11, x12"
+  ins "csel x11, x11, x12, lo"
+  ins "lsl x11, x11, #32"
+  ins "orr x11, x11, #1" -- count 1
+  ins "orr x11, x11, #0x1000000000000" -- pointer map bit 0: an array
+  ins "orr x11, x11, x10, lsl #49"
+  ins "str x11, [x0, #-8]"
+  ins "stp xzr, x9, [x0]"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
+  -- _keel_array_new: x0 = length, x1 = the element (owned), x2 = pointer flag → x0.
+  fn "_keel_array_new"
+  ins "stp x29, x30, [sp, #-48]!"
+  ins "mov x29, sp"
+  ins "tbnz x0, #63, _keel_panic_bounds"
+  ins "stp x1, x2, [sp, #16]"
+  ins "str x0, [sp, #32]"
+  ins "mov x1, x2"
+  ins "bl _keel_array_alloc"
+  ins "ldr x9, [sp, #32]"
+  ins "ldp x10, x11, [sp, #16]"
+  ins "str x9, [x0]"
+  ins "mov x12, #0"
+  line "L_anew_fill:"
+  ins "cmp x12, x9"
+  ins "b.hs L_anew_filled"
+  ins "add x13, x0, x12, lsl #3"
+  ins "str x10, [x13, #16]"
+  ins "add x12, x12, #1"
+  ins "b L_anew_fill"
+  line "L_anew_filled:"
+  ins "cbz x11, L_anew_ret"
+  -- The element now has n references in the array; the caller gave one.
+  ins "cbz x9, L_anew_drop"
+  ins "ldr w13, [x10, #-8]"
+  ins "tbnz w13, #31, L_anew_ret"
+  ins "add w13, w13, w9"
+  ins "sub w13, w13, #1"
+  ins "str w13, [x10, #-8]"
+  ins "b L_anew_ret"
+  line "L_anew_drop:"
+  ins "str x0, [sp, #32]"
+  ins "mov x0, x10"
+  ins "bl _keel_drop"
+  ins "ldr x0, [sp, #32]"
+  line "L_anew_ret:"
+  ins "ldp x29, x30, [sp], #48"
+  ins "ret"
+
+  -- _keel_array_clone: x0 = array (owned), x1 = capacity ≥ its length → x0 = a fresh array with
+  -- the same elements. A unique array's elements move and its block is freed; a shared one's
+  -- are duplicated and its count decremented.
+  fn "_keel_array_clone"
+  ins "stp x29, x30, [sp, #-48]!"
+  ins "mov x29, sp"
+  ins "str x0, [sp, #16]"
+  ins "ldr x9, [x0, #-8]"
+  ins "mov x0, x1"
+  ins "ubfx x1, x9, #49, #1"
+  ins "bl _keel_array_alloc"
+  ins "ldr x9, [sp, #16]"
+  ins "ldr x10, [x9]"
+  ins "str x10, [x0]"
+  ins "mov x11, #0"
+  line "L_aclone_copy:"
+  ins "cmp x11, x10"
+  ins "b.hs L_aclone_copied"
+  ins "add x12, x9, x11, lsl #3"
+  ins "ldr x13, [x12, #16]"
+  ins "add x12, x0, x11, lsl #3"
+  ins "str x13, [x12, #16]"
+  ins "add x11, x11, #1"
+  ins "b L_aclone_copy"
+  line "L_aclone_copied:"
+  ins "ldr w12, [x9, #-8]"
+  ins "cmp w12, #1"
+  ins "b.ne L_aclone_shared"
+  ins "str wzr, [x9, #-8]"
+  stat 24 "x12" "x13"
+  ins "str x0, [sp, #32]"
+  ins "mov x0, x9"
+  ins "bl _keel_free_block"
+  ins "ldr x0, [sp, #32]"
+  ins "b L_aclone_ret"
+  line "L_aclone_shared:"
+  ins "ldr x13, [x9, #-8]"
+  ins "tbz x13, #49, L_aclone_dec"
+  ins "mov x11, #0"
+  line "L_aclone_dup:"
+  ins "cmp x11, x10"
+  ins "b.hs L_aclone_dec"
+  ins "add x14, x9, x11, lsl #3"
+  ins "ldr x14, [x14, #16]"
+  ins "ldr w15, [x14, #-8]"
+  ins "tbnz w15, #31, L_aclone_next"
+  ins "add w15, w15, #1"
+  ins "str w15, [x14, #-8]"
+  line "L_aclone_next:"
+  ins "add x11, x11, #1"
+  ins "b L_aclone_dup"
+  line "L_aclone_dec:"
+  ins "sub w12, w12, #1"
+  ins "str w12, [x9, #-8]"
+  line "L_aclone_ret:"
+  ins "ldp x29, x30, [sp], #48"
+  ins "ret"
+
+  -- _keel_array_set: x0 = array (owned), x1 = index, x2 = element (owned) → x0.
+  fn "_keel_array_set"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  ins "ldr x9, [x0]"
+  ins "cmp x1, x9"
+  ins "b.hs _keel_panic_bounds"
+  ins "ldr w10, [x0, #-8]"
+  ins "cmp w10, #1"
+  ins "b.eq L_aset_store"
+  ins "stp x1, x2, [sp, #16]"
+  ins "ldr x1, [x0, #8]"
+  ins "bl _keel_array_clone"
+  ins "ldp x1, x2, [sp, #16]"
+  line "L_aset_store:"
+  ins "add x9, x0, x1, lsl #3"
+  ins "ldr x10, [x9, #16]"
+  ins "str x2, [x9, #16]"
+  ins "ldr x11, [x0, #-8]"
+  ins "tbz x11, #49, L_aset_ret"
+  ins "str x0, [sp, #16]"
+  ins "mov x0, x10"
+  ins "bl _keel_drop" -- the element it replaced
+  ins "ldr x0, [sp, #16]"
+  line "L_aset_ret:"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
+  -- _keel_array_push: x0 = array (owned), x1 = element (owned) → x0. A full array doubles.
+  fn "_keel_array_push"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  ins "str x1, [sp, #16]"
+  ins "ldp x9, x10, [x0]"
+  ins "cmp x9, x10"
+  ins "b.hs L_apush_grow"
+  ins "ldr w11, [x0, #-8]"
+  ins "cmp w11, #1"
+  ins "b.eq L_apush_store"
+  ins "mov x1, x10"
+  ins "bl _keel_array_clone"
+  ins "b L_apush_store"
+  line "L_apush_grow:"
+  ins "lsl x1, x10, #1"
+  ins "mov x12, #4"
+  ins "cmp x1, x12"
+  ins "csel x1, x1, x12, hs"
+  ins "bl _keel_array_clone"
+  line "L_apush_store:"
+  ins "ldr x9, [x0]"
+  ins "add x10, x0, x9, lsl #3"
+  ins "ldr x1, [sp, #16]"
+  ins "str x1, [x10, #16]"
+  ins "add x9, x9, #1"
+  ins "str x9, [x0]"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
+  -- _keel_array_pop: x0 = array (owned) → x0 without its last element.
+  fn "_keel_array_pop"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  ins "ldr x9, [x0]"
+  ins "cbz x9, _keel_panic_bounds"
+  ins "ldr w11, [x0, #-8]"
+  ins "cmp w11, #1"
+  ins "b.eq L_apop_take"
+  ins "ldr x1, [x0, #8]"
+  ins "bl _keel_array_clone"
+  line "L_apop_take:"
+  ins "ldr x9, [x0]"
+  ins "sub x9, x9, #1"
+  ins "str x9, [x0]"
+  ins "ldr x11, [x0, #-8]"
+  ins "tbz x11, #49, L_apop_ret"
+  ins "add x10, x0, x9, lsl #3"
+  ins "str x0, [sp, #16]"
+  ins "ldr x0, [x10, #16]"
+  ins "bl _keel_drop"
+  ins "ldr x0, [sp, #16]"
+  line "L_apop_ret:"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 
@@ -1015,6 +1285,7 @@ emitRuntime = do
 
   panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO needs a freestanding target)\n"
   panic "_keel_panic_div" "panic: division by zero\n"
+  panic "_keel_panic_bounds" "panic: array index out of bounds\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"

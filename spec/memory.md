@@ -36,6 +36,11 @@ pairs, closures and codata values are pointers to heap blocks. `Box` is the iden
 | data value, pair | `[tag, field₁, …, fieldₙ]` |
 | closure | `[code, captured₁, …]` |
 | codata value | `[code₁, …, codeₙ, captured₁, …]` (one function per observation) |
+| array | `[length, capacity, element₀, …]` |
+
+An **array**'s pointer map is not a map: bit 0 marks the block as an array (word 0 of any other
+block is a tag or a code pointer, never a counted pointer, so the bit is free) and bit 1 says
+whether the elements are pointers. Its size field is capacity + 2, capped at `0xFFFF`.
 
 Top-level definitions are static blocks in the data section with an immortal header: counting
 skips them.
@@ -88,12 +93,20 @@ list 1,000 times with about 1,000 fresh allocations and 1,001,000 in-place updat
 list the same code allocates, so the shared copy is never changed. This is how pure code gets
 mutation's performance without any `&mut`.
 
+**Arrays** work the same way, without a token: `arraySet`, `arrayPush` and `arrayPop` take the
+array owned and update it in place when its count is 1; otherwise they copy it first (duplicating
+the elements) and decrement the original. `arrayGet` and `arrayLength` borrow the array, like a
+field read, so `let x = arrayGet xs i in arraySet xs i (x + 1)` leaves `xs` unique and updates in
+place. A full array doubles its capacity on push; when it was unique, the elements move to the
+new block and the old one is freed without touching them. `test/std/array.kl` does 200,000 pushes
+and 100,000 updates with 36 allocations.
+
 ## Runtime
 
 - **Allocation:** blocks up to 64 payload words come from **size-segregated free lists**, then
   from a bump region (64 MB). Running out is a panic.
-- **Drop:** decrements the count; at zero it drops the children named by the pointer map and
-  frees the block. The last pointer child is handled by looping instead of recursing, so freeing
+- **Drop:** decrements the count; at zero it drops the children named by the pointer map (an
+  array's elements, if they are pointers) and frees the block. The last pointer child is handled by looping instead of recursing, so freeing
   a long list uses constant stack.
 - **Checks:** duplicating or dropping a freed block (count 0) is a panic ("reference count
   error"), so a double free cannot go unnoticed.
@@ -117,7 +130,10 @@ call); known-arity calls (M4) remove them.
   the parent is unique, reuse across branches, and specialized drop functions. All of these are
   standard Perceus refinements that remove counting work; none changes the model.
 - A block may have at most 16 payload words before its last pointer (the pointer map is
-  16 bits); larger blocks are rejected at compile time. Blocks over 64 words are not recycled.
+  16 bits); larger blocks are rejected at compile time. Arrays have no such limit.
+- Blocks over 64 words, so arrays of more than 62 elements, are not recycled: a growing array
+  leaves its smaller copies behind in the bump region. A free list for large blocks (first fit,
+  or size classes by powers of two) is the fix when a program runs out of heap.
 - Counts are not atomic: fine for single-core code; multicore sharing needs atomic counts or
   ownership transfer (`notes.md` §16, concurrency).
 - **Real-time code** (`notes.md` §13): a drop can free a whole structure, which takes time

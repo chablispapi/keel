@@ -69,7 +69,7 @@ located p m = StateT $ \s -> atPos p (runStateT m s)
 inferProgram :: Program -> Either TypeError Program
 inferProgram (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty M.empty [] bitsInfo)
   where
-    decls = optionDecl : userDecls
+    decls = optionDecl : arrayDecl : userDecls
     bitsInfo = M.fromList [(b, (it, fs)) | Bitdata b it fs <- userDecls]
     sig =
       Sig
@@ -365,6 +365,10 @@ infer env tm = case tm of
           pure (TyApp x tys (map S.singleton effs), ty, diverge x)
         _ -> pure (Var x, t, diverge x)
     | M.member x (sOps sig) -> failWith Mismatch ("operation " ++ x ++ " must be applied: " ++ x ++ "(…)")
+    | Just AEmpty <- lookup x arrayOps -> do
+        elemTy <- freshTy
+        pure (ArrayPrim AEmpty elemTy [], TData "Array" [elemTy], S.empty)
+    | Just op <- lookup x arrayOps -> arrayArity op >>= \n -> failWith Mismatch (x ++ " must be applied to its " ++ show n ++ " arguments (std.array has it as a function)")
     | otherwise -> failWith Unbound x
   TyApp f tys effs -> case M.lookup f (sDefs sig) of
     Just (TForall vs es body) | length tys == length vs -> do
@@ -416,6 +420,18 @@ infer env tm = case tm of
         (a', ea) <- check env a ta
         pure (Perform op a', tr, S.insert l ea)
   Perform op a -> infer env (App (Var op) a)
+  ArrayPrim op _ args -> infer env (foldl App (Var (concat [n | (n, o) <- arrayOps, o == op])) args)
+  App _ _
+    | (Var x, args) <- appSpine tm
+    , Nothing <- M.lookup x (eLocals env)
+    , not (M.member x (sDefs sig))
+    , Just op <- lookup x arrayOps -> do
+        elemTy <- freshTy
+        let (tys, r, eff) = arrayOpType op elemTy
+        when (length args /= length tys) $
+          failWith Mismatch (x ++ " takes " ++ show (length tys) ++ " arguments, given " ++ show (length args))
+        rs <- zipWithM (check env) args tys
+        pure (ArrayPrim op elemTy (map fst rs), r, S.unions (eff : map snd rs))
   App f a -> do
     (f', tf, ef) <- infer env f
     tf' <- shallow tf
@@ -591,6 +607,7 @@ zonkTerm tm = do
     Lam x t b -> (\t' -> Lam x t' b) <$> finalTy t
     LLam x t b -> (\t' -> LLam x t' b) <$> finalTy t
     Con c tys as -> (\tys' -> Con c tys' as) <$> mapM finalTy tys
+    ArrayPrim op t as -> (\t' -> ArrayPrim op t' as) <$> finalTy t
     TyApp f tys effs -> TyApp f <$> mapM finalTy tys <*> mapM finalEff effs
     Cocase d tys bs -> (\tys' -> Cocase d tys' bs) <$> mapM finalTy tys
     NumLit (Just t) n -> do
@@ -640,6 +657,14 @@ linearize env bs = go
       TData d as
         | Just (lin, _, _) <- M.lookup d (sData (eSig env)), lin || any ((== Lin) . kindOf) as -> Lin
       _ -> Free
+
+-- | The head of an application and its arguments in order.
+appSpine :: Term -> (Term, [Term])
+appSpine (App f a) = let (h, as) = appSpine f in (h, as ++ [a])
+appSpine t = (t, [])
+
+arrayArity :: ArrayOp -> I Int
+arrayArity op = (\(ts, _, _) -> length ts) . arrayOpType op <$> freshTy
 
 freeVars :: Term -> S.Set String
 freeVars tm = case tm of

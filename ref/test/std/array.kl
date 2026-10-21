@@ -1,0 +1,28 @@
+-- std.array: pushes, in-place updates of an unshared array, copies of a shared one, pointer
+-- elements, and conversions.
+import std.array
+
+def range : i64 -> Array i64 ->{Diverge, Panic} Array i64 =
+  \n xs. if n < 1 then xs else range (n - 1) (array.push xs (100000 - n))
+
+-- Sieve of Eratosthenes: crossing out updates the array in place.
+def cross : i64 -> i64 -> Array Bool ->{Diverge, Panic} Array Bool =
+  \i step xs. if i < array.length xs then cross (i + step) step (array.set xs i false) else xs
+
+def sieve : i64 -> Array Bool ->{Diverge, Panic} Array Bool =
+  \p xs. if p * p < array.length xs then
+           sieve (p + 1) (if array.get xs p then cross (p * p) p xs else xs)
+         else xs
+
+def primes : Array Bool ->{Diverge, Panic} i64 =
+  \xs. array.foldl (\n b. if b then n + 1 else n) 0 xs - 2
+
+main =
+  let xs = range 100000 array.empty in
+  printInt (array.foldl (\a b. a + b) 0 xs); putc(10);
+  printInt (primes (sieve 2 (array.make 100000 true))); putc(10);
+  let words = array.fromList (Cons("zero", box Cons("one", box Cons("two", box Nil)))) in
+  let shared = array.set words 0 "nil" in
+  println (array.get words 0);
+  println (array.get shared 0);
+  (array.toList (array.pop shared), array.length xs)

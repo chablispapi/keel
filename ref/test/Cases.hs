@@ -523,4 +523,19 @@ cases =
     , Rejects InfiniteSize
     )
   , ("unbound effect variable", Program [Def "g" (fnE ["'q"] tI tI) (Lam "n" tI (Var "n"))] (int 0), Rejects Unbound)
+  -- Arrays (M5) -----------------------------------------------------------------------------
+  , ( "array: set copies a shared array"
+    , Program [] (Let "a" (arr ANew [int 3, int 7]) (Let "b" (arr ASet [Var "a", int 0, int 1]) (add (arr AGet [Var "a", int 0]) (arr AGet [Var "b", int 0]))))
+    , ok (VInt i64 8)
+    )
+  , ( "array: push, pop, length"
+    , Program [] (Let "a" (arr APush [arr APush [arr APush [ArrayPrim AEmpty tI [], int 1], int 2], int 3]) (add (arr ALength [arr APop [Var "a"]]) (arr AGet [Var "a", int 2])))
+    , ok (VInt i64 5)
+    )
+  , ("array: index out of bounds", Program [] (arr AGet [arr ANew [int 2, int 0], int 2]), Panics [])
+  , ("array: negative index", Program [] (arr AGet [arr ANew [int 2, int 0], int (-1)]), Panics [])
+  , ("array: pop of an empty array", Program [] (arr ALength [arr APop [ArrayPrim AEmpty tI []]]), Panics [])
+  , ("array of a linear type", Program [token] (Let "a" (ArrayPrim AEmpty tTok []) (int 0)), Rejects KindMismatch)
   ]
+  where
+    arr op = ArrayPrim op tI

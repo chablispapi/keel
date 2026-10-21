@@ -48,6 +48,7 @@ type variables, operations and observations.
 | `a -o b`, `a -o{IO} b` | linear (one-shot) function |
 | `&a -> b`, `&mut a -> b` | reference parameters (only as a parameter) |
 | `List a`, `Box a`, `(a, b)` | data / codata types, boxes, pairs |
+| `Array a` | built-in growable array of `Free` elements (see the standard library) |
 | `forall a (b : Free) 'e. type` | polymorphic definition type; kind defaults to `Lin` |
 
 Arrows associate to the right. Effect variables start with `'`.
@@ -161,6 +162,7 @@ other: `import std.map`, then `map.insert`.
 | Module | What it has |
 |---|---|
 | `std.map` | `Map k v`: ordered maps (AVL trees). `Tip` is the empty map; `insert`, `lookup`, `member`, `delete` take a comparison (`compareInt`, `string.compare`); `size`, `height`, `toList` (in key order) |
+| `std.array` | `Array a`: growable arrays with constant-time indexing. `empty`, `make n x`, `length`, `get`, `set`, `push`, `pop`, `fromList`, `toList`, `foldl` |
 | `std.string` | for `List u8`: `compare`, `equal`, `fromInt`, `parseInt` (`Option i64`), `split`, `lines`, `join`, `isDigit`, `isSpace`, `isAlpha` |
 
 ```
@@ -176,8 +178,16 @@ def count : List (List u8) -> map.Map (List u8) i64 ->{Diverge, Panic} map.Map (
 ```
 
 `examples/words.kl` counts the words on stdin this way. Keys and values are `Free`
-(copyable). Not yet: arrays with constant-time indexing (they need a new kind of heap block),
-reading files by name.
+(copyable).
+
+**Arrays** are values: `array.set xs 0 x` returns an array and leaves `xs` as it was. Under the
+hood an array nothing else references is updated in place, so a loop that threads one array
+through `set` and `push` runs as fast as mutation (spec/memory.md). The built-in operations are
+`arrayEmpty`, `arrayNew`, `arrayLength`, `arrayGet`, `arraySet`, `arrayPush` and `arrayPop`,
+always applied to all their arguments; `std.array` has them as functions. An index out of range
+panics.
+
+Not yet: reading files by name.
 
 ## Error messages
 
