@@ -181,6 +181,16 @@ roots = ["keel.project"]
 language-servers = ["keel"]
 ```
 
+Syntax highlighting is a tree-sitter grammar in `editors/tree-sitter-keel/` (`grammar.js`,
+`queries/highlights.scm`). For Helix, build it into the runtime directory and link the queries:
+
+```
+cd editors/tree-sitter-keel
+tree-sitter generate              # after editing grammar.js
+tree-sitter build -o ~/.config/helix/runtime/grammars/keel.so .
+ln -sfn "$PWD/queries" ~/.config/helix/runtime/queries/keel
+```
+
 Not yet: types of local variables on hover, go-to-definition, completion.
 
 ## Hardware access
