@@ -1,0 +1,38 @@
+-- Every construct of the grammar, for comparing selfhost/parser.kl with keelc's parser. It
+-- only has to parse.
+import drivers.uart
+import a.b.c as q
+
+{- nested {- comments -} -}
+private linear data Handle = Handle(i64)
+data Tree a = Leaf | Node(Box (Tree a), a, Box (Tree a))
+codata Ord a { lt : a -> a -> Bool; eq : a -> a -> Bool }
+codata Empty { }
+effect Port { get : Unit => u8 ; put : u8 => Unit }
+bitdata Status : u8 { ready @ 0 ; mode @ 2..4 }
+
+def poly : forall a (b : Free) (c : Lin) 'e. (a ->{'e, Panic, IO} b) -o{IO} &mut c -> &uart.Status -> (a, b) = x
+def refs : &mut i64 -> &(List i64) -> Unit = \&mut n &xs (&mut m : i64) (&k : i64) (z : u8) w. n := n + 1; f(&mut n) &xs
+def lits : i64 = 0x1F_FF + 1_000 - -5 + 250u8 + -3i8 + 'a' + '\n' + '\x41' + '\65' + f -1 + (-1)
+def strs : List u8 = "a\"b\\c\n\t\r"
+def arith : i64 = a +% b -| c *? d / e % f land g lor h lxor i lsl j lsr k +| l -? m *% n
+def cmps : Bool = a == b && c != d || e < f && g > h || i <= j && k >= l && f x > g y && f x <= 3 && not (a < b)
+def conv : u8 = (x as u16) as u8
+def ctl : i64 =
+  let (a, b) = (1, 2) in
+  var c = 3 in
+  c := c + a;
+  if a < b then c else if b < a then 0 else c
+def cases : i64 =
+  case t of { Leaf -> 0 | Node(l, x, r) -> x } +
+  case t of { q.Leaf -> 0 | other -> 1 } +
+  case c of { 'a' -> 1 | 42 -> 2 | -1 -> 3 | 0x10 -> 4 | _ -> 5 } +
+  case n of { 1 -> 2 | m -> m } +
+  case t of { Node(l, x, r) -> x | _ -> 0 }
+def codes : Ord i64 = cocase Ord[i64] { lt -> \a b. a < b | eq -> \a b. a == b }
+def handlers : i64 = handle run () with uart.Port { get u -> 1 | put b -> () }
+def misc : i64 =
+  box (unbox x) ; unbox y.field ; f[i64, List a] x ; uart.init[u8] ; Nil[i64] ; Cons[i64](1, box Nil) ;
+  Status { ready = 1, mode = 2 } ; uart.Status { ready = 0 } ; s.ready.raw ; () ; (a, (b, c)) ; q.Ready ; f (&x) (&mut y)
+
+main = poly 1

@@ -1,0 +1,622 @@
+-- Keel's parser, in Keel: tokens to the syntax tree keelc's parser builds
+-- (ref/src/Keel/Parser.hs), with the same desugarings (strings to lists, && || != > <= >= to
+-- if and <, literal cases to if chains). Source positions are not kept yet.
+--
+-- A parse error is sticky: it replaces the rest of the token list with one Error token, which
+-- nothing consumes, so every parser just returns its result (a placeholder after an error)
+-- and the tokens left, and the first error comes out at the end.
+
+import std.string
+import lexer
+
+data Ty =
+    TUnit | TBool | TInt(List u8) | TVar(List u8) | THole
+  | TFun(Box Ty, List (List u8), Box Ty) | TLFun(Box Ty, List (List u8), Box Ty)
+  | TData(List u8, Box (List Ty)) | TBox(Box Ty) | TPair(Box Ty, Box Ty)
+  | TForall(List (List u8, List u8), List (List u8), Box Ty) | TRef(Box Ty) | TMut(Box Ty)
+
+-- Names are byte strings. A number is its sign, magnitude and width suffix ("" when the
+-- width is inferred); characters are u8 numbers.
+data Term =
+    EVar(List u8) | EUnit | EBool(Bool) | ENum(Bool, u64, List u8)
+  | EConvert(List u8, Box Term) | EPrim(List u8, Box Term, Box Term)
+  | EIf(Box Term, Box Term, Box Term) | ELam(List u8, Ty, Box Term) | EApp(Box Term, Box Term)
+  | ELet(List u8, Box Term, Box Term) | ELetPair(List u8, List u8, Box Term, Box Term)
+  | EVarIn(List u8, Box Term, Box Term) | EAssign(List u8, Box Term) | ESeq(Box Term, Box Term)
+  | ECon(List u8, Box (List Ty), Box (List Term)) | ECase(Box Term, Box (List Alt))
+  | EBox(Box Term) | EUnbox(Box Term) | EPair(Box Term, Box Term)
+  | EHandle(List u8, Box Term, Box (List Alt)) | ECocase(List u8, Box (List Ty), Box (List Alt))
+  | ETyApp(List u8, Box (List Ty)) | EProj(Box Term, List u8)
+  | EBorrow(List u8) | EBorrowMut(List u8) | EBits(List u8, Box (List Alt))
+
+-- A case alternative (constructor, variables, body). Handler clauses (operation, [x], body),
+-- cocase branches (observation, [], body) and bitdata fields (field, [], value) reuse it.
+data Alt = Alt(List u8, List (List u8), Term)
+
+-- Constructors (name, field types); codata observations and effect operations reuse it as
+-- (name, [type]) and (name, [argument, result]).
+data Ctor = Ctor(List u8, List Ty)
+
+data Field = Field(List u8, u64, u64)
+
+data Decl =
+    DData(Bool, List u8, List (List u8), List Ctor) | DCodata(List u8, List (List u8), List Ctor)
+  | DEffect(List u8, List Ctor) | DDef(List u8, Ty, Term) | DBitdata(List u8, List u8, List Field)
+
+-- Imports (module, qualifier), declarations (private?, declaration), main.
+data Module = Module(List (List u8, List u8), List (Bool, Decl), Option Term)
+
+def parse : List Token ->{Diverge, Panic} (Module, List Token) =
+  \ts.
+    let (imps, ts) = manyOf (kwIs "import") importP ts in
+    let (ds, ts) = manyOf startsDecl declP ts in
+    let (m, ts) = if kwIs "main" ts then (let (e, ts) = expr (expect "=" (next ts)) in (Some(e), ts)) else (None, ts) in
+    (Module(imps, ds, m), case tok ts of { End -> ts | _ -> fail "expected a declaration" ts })
+
+-- Tokens -----------------------------------------------------------------------------------
+
+def tok : List Token -> Tok = \ts. case ts of { Nil -> End | Cons(t, rest) -> case t of { At(l, c, k) -> k } }
+
+-- The tokens after the first; an error or the end stays.
+private def next : List Token -> List Token =
+  \ts. case ts of
+    { Nil -> Nil
+    | Cons(t, rest) -> case t of { At(l, c, k) -> case k of { Error(m) -> ts | End -> ts | _ -> unbox rest } } }
+
+private def fail : List u8 -> List Token -> List Token =
+  \msg ts. case ts of
+    { Nil -> Nil
+    | Cons(t, rest) -> case t of { At(l, c, k) -> case k of { Error(m) -> ts | _ -> Cons(At(l, c, Error(msg)), box Nil) } } }
+
+private def symIs : List u8 -> List Token ->{Diverge} Bool =
+  \s ts. case tok ts of { Sym(w) -> string.equal s w | _ -> false }
+
+private def kwIs : List u8 -> List Token ->{Diverge} Bool =
+  \s ts. case tok ts of { Keyword(w) -> string.equal s w | _ -> false }
+
+private def isIdent : List Token -> Bool = \ts. case tok ts of { Ident(x) -> true | _ -> false }
+
+private def isUpperTok : List Token -> Bool = \ts. case tok ts of { Upper(x) -> true | _ -> false }
+
+private def expect : List u8 -> List Token ->{Diverge} List Token =
+  \s ts. if symIs s ts then next ts else fail (append "expected " s) ts
+
+private def expectKw : List u8 -> List Token ->{Diverge} List Token =
+  \s ts. if kwIs s ts then next ts else fail (append "expected " s) ts
+
+private def lower : List Token -> (List u8, List Token) =
+  \ts. case tok ts of { Ident(x) -> (x, next ts) | _ -> (Nil, fail "expected a name" ts) }
+
+private def upper : List Token -> (List u8, List Token) =
+  \ts. case tok ts of { Upper(x) -> (x, next ts) | _ -> (Nil, fail "expected a capitalized name" ts) }
+
+-- Status, or uart.Status.
+private def startsQualUpper : List Token ->{Diverge} Bool =
+  \ts. case tok ts of { Upper(x) -> true | Ident(q) -> symIs "." (next ts) && isUpperTok (next (next ts)) | _ -> false }
+
+private def qualUpper : List Token ->{Diverge} (List u8, List Token) =
+  \ts. case tok ts of
+    { Ident(q) ->
+        if startsQualUpper ts then (let (n, ts) = upper (next (next ts)) in (append q (Cons('.', box n)), ts))
+        else (Nil, fail "expected a capitalized name" ts)
+    | _ -> upper ts }
+
+-- Lists of things --------------------------------------------------------------------------
+
+private def manyOf : forall a 'e. (List Token ->{Diverge} Bool) -> (List Token ->{'e} (a, List Token)) -> List Token ->{'e, Diverge} (List a, List Token) =
+  \starts p ts.
+    if starts ts then (let (x, ts) = p ts in let (xs, ts) = manyOf starts p ts in (Cons(x, box xs), ts))
+    else (Nil, ts)
+
+private def sepBy1 : forall a 'e. (List Token ->{'e} (a, List Token)) -> List u8 -> List Token ->{'e, Diverge} (List a, List Token) =
+  \p sep ts.
+    let (x, ts) = p ts in
+    if symIs sep ts then (let (xs, ts) = sepBy1 p sep (next ts) in (Cons(x, box xs), ts)) else (Cons(x, box Nil), ts)
+
+-- Between brackets: none, or p's separated by sep; then the closing bracket.
+private def inside : forall a 'e. (List Token ->{'e} (a, List Token)) -> List u8 -> List u8 -> List Token ->{'e, Diverge} (List a, List Token) =
+  \p sep close ts.
+    if symIs close ts then (Nil, next ts)
+    else (let (xs, ts) = sepBy1 p sep ts in (xs, expect close ts))
+
+-- In braces: p's each ended by ;, the last ; optional; then the closing brace.
+private def endBy : forall a 'e. (List Token ->{'e} (a, List Token)) -> List Token ->{'e, Diverge} (List a, List Token) =
+  \p ts.
+    if symIs "}" ts then (Nil, next ts)
+    else (let (x, ts) = p ts in
+          if symIs ";" ts then (let (xs, ts) = endBy p (next ts) in (Cons(x, box xs), ts))
+          else (Cons(x, box Nil), expect "}" ts))
+
+-- Declarations ---------------------------------------------------------------------------
+
+-- import a.b [as q]; without as, the module is known by its last segment.
+private def importP : List Token ->{Diverge, Panic} ((List u8, List u8), List Token) =
+  \ts.
+    let (path, ts) = sepBy1 lower "." (next ts) in
+    let (q, ts) = if kwIs "as" ts then lower (next ts) else (lastName path, ts) in
+    ((string.join "." path, q), ts)
+
+private def lastName : List (List u8) ->{Diverge} List u8 =
+  \ns. case ns of { Nil -> Nil | Cons(n, rest) -> case unbox rest of { Nil -> n | more -> lastName more } }
+
+private def startsDecl : List Token ->{Diverge} Bool =
+  \ts. case tok ts of
+    { Keyword(w) -> member w (string.split ' ' "private linear data codata effect bitdata def")
+    | _ -> false }
+
+private def declP : List Token ->{Diverge, Panic} ((Bool, Decl), List Token) =
+  \ts.
+    let priv = kwIs "private" ts in
+    let ts = if priv then next ts else ts in
+    let (d, ts) =
+      if kwIs "linear" ts then dataP true (expectKw "data" (next ts))
+      else if kwIs "data" ts then dataP false (next ts)
+      else if kwIs "codata" ts then codataP (next ts)
+      else if kwIs "effect" ts then effectP (next ts)
+      else if kwIs "bitdata" ts then bitdataP (next ts)
+      else defP (expectKw "def" ts) in
+    ((priv, d), ts)
+
+private def dataP : Bool -> List Token ->{Diverge, Panic} (Decl, List Token) =
+  \lin ts.
+    let (n, ts) = upper ts in
+    let (ps, ts) = manyOf isIdent lower ts in
+    let (cs, ts) = sepBy1 ctorP "|" (expect "=" ts) in
+    (DData(lin, n, ps, cs), ts)
+
+private def ctorP : List Token ->{Diverge, Panic} (Ctor, List Token) =
+  \ts.
+    let (c, ts) = upper ts in
+    let (fs, ts) = if symIs "(" ts then inside ty "," ")" (next ts) else (Nil, ts) in
+    (Ctor(c, fs), ts)
+
+private def codataP : List Token ->{Diverge, Panic} (Decl, List Token) =
+  \ts.
+    let (n, ts) = upper ts in
+    let (ps, ts) = manyOf isIdent lower ts in
+    let (os, ts) = endBy (\ts. let (o, ts) = lower ts in let (t, ts) = ty (expect ":" ts) in (Ctor(o, Cons(t, box Nil)), ts)) (expect "{" ts) in
+    (DCodata(n, ps, os), ts)
+
+private def effectP : List Token ->{Diverge, Panic} (Decl, List Token) =
+  \ts.
+    let (n, ts) = upper ts in
+    let (ops, ts) = endBy opP (expect "{" ts) in
+    (DEffect(n, ops), ts)
+
+private def opP : List Token ->{Diverge, Panic} (Ctor, List Token) =
+  \ts.
+    let (o, ts) = lower ts in
+    let (a, ts) = ty (expect ":" ts) in
+    let (b, ts) = ty (expect "=>" ts) in
+    (Ctor(o, Cons(a, box Cons(b, box Nil))), ts)
+
+-- bitdata Name : u8 { field @ bit ; field @ lo..hi }
+private def bitdataP : List Token ->{Diverge, Panic} (Decl, List Token) =
+  \ts.
+    let (n, ts) = upper ts in
+    let (it, ts) = lower (expect ":" ts) in
+    let (fs, ts) = endBy fieldP (expect "{" ts) in
+    (DBitdata(n, it, fs), ts)
+
+private def fieldP : List Token ->{Diverge, Panic} (Field, List Token) =
+  \ts.
+    let (f, ts) = lower ts in
+    let (lo, ts) = natural (expect "@" ts) in
+    let (hi, ts) = if symIs ".." ts then natural (next ts) else (lo, ts) in
+    (Field(f, lo, hi - lo + 1), ts)
+
+private def natural : List Token -> (u64, List Token) =
+  \ts. case tok ts of { Num(v, w) -> (v, next ts) | _ -> (0, fail "expected a number" ts) }
+
+private def defP : List Token ->{Diverge, Panic} (Decl, List Token) =
+  \ts.
+    let (f, ts) = lower ts in
+    let (t, ts) = ty (expect ":" ts) in
+    let (e, ts) = expr (expect "=" ts) in
+    (DDef(f, t, e), ts)
+
+-- Types ------------------------------------------------------------------------------------
+
+def ty : List Token ->{Diverge, Panic} (Ty, List Token) =
+  \ts.
+    if kwIs "forall" ts then
+      (let (bs, ts) = binders (next ts) in
+       let (vs, es) = bs in
+       let (t, ts) = ty (expect "." ts) in
+       (TForall(vs, es, box t), ts))
+    else arrowTy ts
+
+-- a, (b : Free), 'e: type variables (with kinds) and effect variables.
+private def binders : List Token ->{Diverge, Panic} ((List (List u8, List u8), List (List u8)), List Token) =
+  \ts. case tok ts of
+    { EffVar(e) -> let (bs, ts) = binders (next ts) in let (vs, es) = bs in ((vs, Cons(Cons('\'', box e), box es)), ts)
+    | Ident(v) -> let (bs, ts) = binders (next ts) in let (vs, es) = bs in ((Cons((v, "Lin"), box vs), es), ts)
+    | _ ->
+        if symIs "(" ts then
+          (let (v, ts) = lower (next ts) in
+           let ts = expect ":" ts in
+           let k = case tok ts of { Keyword(w) -> w | _ -> Nil } in
+           let ts = if string.equal k "Free" || string.equal k "Lin" then next ts else fail "expected Free or Lin" ts in
+           let (bs, ts) = binders (expect ")" ts) in
+           let (vs, es) = bs in
+           ((Cons((v, k), box vs), es), ts))
+        else ((Nil, Nil), ts) }
+
+private def arrowTy : List Token ->{Diverge, Panic} (Ty, List Token) =
+  \ts.
+    let (p, ts) = paramTy ts in
+    if symIs "->" ts then arrowRest false p (next ts)
+    else if symIs "-" ts && (case tok (next ts) of { Ident(o) -> string.equal o "o" | _ -> false }) then arrowRest true p (next (next ts))
+    else (p, ts)
+
+private def arrowRest : Bool -> Ty -> List Token ->{Diverge, Panic} (Ty, List Token) =
+  \lin p ts.
+    let (e, ts) = if symIs "{" ts then inside effName "," "}" (next ts) else (Nil, ts) in
+    let effs = foldl (\s n. insertName n s) Nil e in
+    let (r, ts) = arrowTy ts in
+    (if lin then TLFun(box p, effs, box r) else TFun(box p, effs, box r), ts)
+
+private def effName : List Token ->{Diverge} (List u8, List Token) =
+  \ts. case tok ts of { EffVar(e) -> (Cons('\'', box e), next ts) | _ -> qualUpper ts }
+
+-- Into a sorted list without duplicates (keelc keeps effects in a set).
+private def insertName : List u8 -> List (List u8) ->{Diverge} List (List u8) =
+  \n ns. case ns of
+    { Nil -> Cons(n, box Nil)
+    | Cons(m, rest) -> case string.compare n m of
+        { Less -> Cons(n, box ns) | Equal -> ns | Greater -> Cons(m, box (insertName n (unbox rest))) } }
+
+private def paramTy : List Token ->{Diverge, Panic} (Ty, List Token) =
+  \ts.
+    if symIs "&" ts then
+      (if kwIs "mut" (next ts) then (let (t, ts) = appTy (next (next ts)) in (TMut(box t), ts))
+       else (let (t, ts) = appTy (next ts) in (TRef(box t), ts)))
+    else appTy ts
+
+private def appTy : List Token ->{Diverge, Panic} (Ty, List Token) =
+  \ts.
+    if kwIs "Box" ts then (let (t, ts) = atomTy (next ts) in (TBox(box t), ts))
+    else if startsQualUpper ts then
+      (let (n, ts) = qualUpper ts in let (xs, ts) = manyOf startsAtomTy atomTy ts in (TData(n, box xs), ts))
+    else atomTy ts
+
+private def startsAtomTy : List Token ->{Diverge} Bool =
+  \ts. kwIs "Bool" ts || kwIs "Unit" ts || isIdent ts || isUpperTok ts || symIs "(" ts
+
+private def atomTy : List Token ->{Diverge, Panic} (Ty, List Token) =
+  \ts.
+    if kwIs "Bool" ts then (TBool, next ts)
+    else if kwIs "Unit" ts then (TUnit, next ts)
+    else if startsQualUpper ts then (let (n, ts) = qualUpper ts in (TData(n, box Nil), ts))
+    else if symIs "(" ts then
+      (let (a, ts) = ty (next ts) in
+       if symIs "," ts then (let (b, ts) = ty (next ts) in (TPair(box a, box b), expect ")" ts))
+       else (a, expect ")" ts))
+    else case tok ts of
+      { Ident(n) -> (if isIntTy n then TInt(n) else TVar(n), next ts)
+      | _ -> (TUnit, fail "expected a type" ts) }
+
+private def isIntTy : List u8 ->{Diverge} Bool =
+  \n. member n (string.split ' ' "i8 i16 i32 i64 u8 u16 u32 u64")
+
+-- Expressions ------------------------------------------------------------------------------
+
+-- a; b; c binds loosest.
+def expr : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (a, ts) = opExpr ts in
+    if symIs ";" ts then (let (b, ts) = expr (next ts) in (ESeq(box a, box b), ts)) else (a, ts)
+
+private def opExpr : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    if symIs "\\" ts then
+      (let (ps, ts) = manyOf startsParam param (next ts) in
+       let (b, ts) = expr (expect "." ts) in
+       (foldr (\p body. let (x, t) = p in ELam(x, t, box body)) b ps, ts))
+    else if kwIs "let" ts then
+      (if symIs "(" (next ts) then
+         (let (x, ts) = lower (next (next ts)) in
+          let (y, ts) = lower (expect "," ts) in
+          let (e, ts) = expr (expect "=" (expect ")" ts)) in
+          let (b, ts) = expr (expectKw "in" ts) in
+          (ELetPair(x, y, box e, box b), ts))
+       else
+         (let (x, ts) = lower (next ts) in
+          let (e, ts) = expr (expect "=" ts) in
+          let (b, ts) = expr (expectKw "in" ts) in
+          (ELet(x, box e, box b), ts)))
+    else if kwIs "var" ts then
+      (let (x, ts) = lower (next ts) in
+       let (e, ts) = expr (expect "=" ts) in
+       let (b, ts) = expr (expectKw "in" ts) in
+       (EVarIn(x, box e, box b), ts))
+    else if kwIs "if" ts then
+      (let (c, ts) = expr (next ts) in
+       let (a, ts) = expr (expectKw "then" ts) in
+       let (b, ts) = opExpr (expectKw "else" ts) in
+       (EIf(box c, box a, box b), ts))
+    else if kwIs "handle" ts then
+      (let (e, ts) = expr (next ts) in
+       let (l, ts) = qualUpper (expectKw "with" ts) in
+       let (cs, ts) = sepBy1 clause "|" (expect "{" ts) in
+       (EHandle(l, box e, box cs), expect "}" ts))
+    else if isIdent ts && symIs ":=" (next ts) then
+      (let (x, ts) = lower ts in let (e, ts) = opExpr (next ts) in (EAssign(x, box e), ts))
+    else orE ts
+
+private def foldr : forall a (b : Free). (a -> b ->{Diverge} b) -> b -> List a ->{Diverge} b =
+  \f z xs. case xs of { Nil -> z | Cons(x, rest) -> f x (foldr f z (unbox rest)) }
+
+-- read a -> e
+private def clause : List Token ->{Diverge, Panic} (Alt, List Token) =
+  \ts.
+    let (o, ts) = lower ts in
+    let (x, ts) = lower ts in
+    let (b, ts) = expr (expect "->" ts) in
+    (Alt(o, Cons(x, box Nil), b), ts)
+
+private def startsParam : List Token ->{Diverge} Bool = \ts. isIdent ts || symIs "&" ts || symIs "(" ts
+
+-- x, &x, &mut x, (x : t), (&x : t), (&mut x : t).
+private def param : List Token ->{Diverge, Panic} ((List u8, Ty), List Token) =
+  \ts.
+    if symIs "&" ts then (let (xm, ts) = refName (next ts) in let (x, m) = xm in ((x, withMode m THole), ts))
+    else if symIs "(" ts then
+      (let (xm, ts) = if symIs "&" (next ts) then refName (next (next ts)) else (let (x, ts) = lower (next ts) in ((x, 0), ts)) in
+       let (x, m) = xm in
+       let (t, ts) = ty (expect ":" ts) in
+       ((x, withMode m t), expect ")" ts))
+    else (let (x, ts) = lower ts in ((x, THole), ts))
+
+-- After &: mut x (mode 2) or x (mode 1).
+private def refName : List Token ->{Diverge} ((List u8, i64), List Token) =
+  \ts.
+    if kwIs "mut" ts then (let (x, ts) = lower (next ts) in ((x, 2), ts))
+    else (let (x, ts) = lower ts in ((x, 1), ts))
+
+private def withMode : i64 -> Ty -> Ty = \m t. case m of { 1 -> TRef(box t) | 2 -> TMut(box t) | _ -> t }
+
+private def orE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (a, ts) = andE ts in
+    if symIs "||" ts then (let (b, ts) = orE (next ts) in (EIf(box a, box EBool(true), box b), ts)) else (a, ts)
+
+private def andE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (a, ts) = cmpE ts in
+    if symIs "&&" ts then (let (b, ts) = andE (next ts) in (EIf(box a, box b, box EBool(false)), ts)) else (a, ts)
+
+private def cmpE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (a, ts) = addE ts in
+    let o = case tok ts of { Sym(s) -> if member s (string.split ' ' "== != <= >= < >") then s else Nil | _ -> Nil } in
+    case o of
+      { Nil -> (a, ts)
+      | Cons(c, rest) -> let (b, ts) = addE (next ts) in (comparison o a b, ts) }
+
+-- == and < are primitives; the others are written with them, as keelc does. > and <= swap
+-- their operands, binding them first unless they are variables or numbers.
+private def comparison : List u8 -> Term -> Term ->{Diverge} Term =
+  \o a b.
+    if string.equal o "==" then EPrim("==", box a, box b)
+    else if string.equal o "!=" then notE (EPrim("==", box a, box b))
+    else if string.equal o "<=" then notE (swapped a b)
+    else if string.equal o ">=" then notE (EPrim("<", box a, box b))
+    else if string.equal o "<" then EPrim("<", box a, box b)
+    else swapped a b
+
+private def notE : Term -> Term = \c. EIf(box c, box EBool(false), box EBool(true))
+
+private def swapped : Term -> Term -> Term =
+  \a b.
+    if plain a && plain b then EPrim("<", box b, box a)
+    else ELet("l%", box a, box ELet("r%", box b, box EPrim("<", box EVar("r%"), box EVar("l%"))))
+
+private def plain : Term -> Bool = \e. case e of { EVar(x) -> true | ENum(n, v, w) -> true | _ -> false }
+
+private def addE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts. let (a, ts) = mulE ts in addRest a ts
+
+private def addRest : Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \a ts.
+    let o = case tok ts of { Sym(s) -> if member s (string.split ' ' "+ +% +| +? - -% -| -?") then s else Nil | _ -> Nil } in
+    case o of
+      { Nil -> (a, ts)
+      | Cons(c, rest) -> let (b, ts) = mulE (next ts) in addRest (EPrim(o, box a, box b)) ts }
+
+private def mulE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts. let (a, ts) = convE ts in mulRest a ts
+
+private def mulRest : Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \a ts.
+    let o = case tok ts of
+      { Sym(s) -> if member s (string.split ' ' "* *% *| *? / %") then s else Nil
+      | Keyword(w) -> if member w (string.split ' ' "land lor lxor lsl lsr") then w else Nil
+      | _ -> Nil } in
+    case o of
+      { Nil -> (a, ts)
+      | Cons(c, rest) -> let (b, ts) = convE (next ts) in mulRest (EPrim(o, box a, box b)) ts }
+
+-- e as u8
+private def convE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts. let (e, ts) = appE ts in convRest e ts
+
+private def convRest : Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \e ts.
+    if kwIs "as" ts then
+      (case tok (next ts) of
+        { Ident(t) -> if isIntTy t then convRest (EConvert(t, box e)) (next (next ts)) else (e, fail "expected an integer type" (next ts))
+        | _ -> (e, fail "expected an integer type" (next ts)) })
+    else (e, ts)
+
+private def appE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (h, ts) =
+      if kwIs "box" ts then (let (e, ts) = postfix (next ts) in (EBox(box e), ts))
+      else if kwIs "unbox" ts then (let (e, ts) = postfix (next ts) in (EUnbox(box e), ts))
+      else if symIs "-" ts then
+        (case tok (next ts) of { Num(v, w) -> (ENum(true, v, w), next (next ts)) | _ -> postfix ts })
+      else postfix ts in
+    args h ts
+
+-- f x &y (&mut z)
+private def args : Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \h ts.
+    if symIs "&" ts then (let (b, ts) = borrow (next ts) in args (EApp(box h, box b)) ts)
+    else if symIs "(" ts && symIs "&" (next ts) then
+      (let (b, ts) = borrow (next (next ts)) in args (EApp(box h, box b)) (expect ")" ts))
+    else if startsAtom ts then (let (a, ts) = postfix ts in args (EApp(box h, box a)) ts)
+    else (h, ts)
+
+private def borrow : List Token ->{Diverge} (Term, List Token) =
+  \ts.
+    if kwIs "mut" ts then (let (x, ts) = lower (next ts) in (EBorrowMut(x), ts))
+    else (let (x, ts) = lower ts in (EBorrow(x), ts))
+
+private def startsAtom : List Token ->{Diverge} Bool =
+  \ts. case tok ts of
+    { Str(s) -> true | Char(c) -> true | Num(v, w) -> true | Ident(x) -> true | Upper(x) -> true
+    | Keyword(w) -> member w (string.split ' ' "true false case cocase")
+    | Sym(s) -> string.equal s "("
+    | _ -> false }
+
+-- An atom with projections (e.obs) and type arguments (f[i64]).
+private def postfix : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts. let (a, ts) = atom ts in postfixRest a ts
+
+private def postfixRest : Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \t ts.
+    if symIs "." ts && isIdent (next ts) then (let (o, ts) = lower (next ts) in postfixRest (EProj(box t, o)) ts)
+    else if symIs "[" ts then (let (tys, ts) = inside ty "," "]" (next ts) in postfixRest (typeArgs t tys) ts)
+    else (t, ts)
+
+private def typeArgs : Term -> List Ty ->{Diverge} Term =
+  \t tys. case t of
+    { EVar(f) -> ETyApp(f, box tys)
+    | EProj(e, f) -> (case unbox e of { EVar(q) -> ETyApp(append q (Cons('.', box f)), box tys) | _ -> t })
+    | ECon(c, ts, xs) -> (case unbox ts of { Nil -> ECon(c, box tys, xs) | _ -> t })
+    | _ -> t }
+
+private def atom : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts. case tok ts of
+    { Str(s) -> (strTerm s, next ts)
+    | Char(c) -> (ENum(false, c as u64, "u8"), next ts)
+    | Num(v, w) -> (ENum(false, v, w), next ts)
+    | Keyword(w) ->
+        if string.equal w "true" then (EBool(true), next ts)
+        else if string.equal w "false" then (EBool(false), next ts)
+        else if string.equal w "case" then caseE (next ts)
+        else if string.equal w "cocase" then cocaseE (next ts)
+        else (EUnit, fail "expected an expression" ts)
+    | Upper(c) -> constructor ts
+    | Ident(x) -> if startsQualUpper ts then constructor ts else (EVar(x), next ts)
+    | _ ->
+        if symIs "(" ts then
+          (if symIs ")" (next ts) then (EUnit, next (next ts))
+           else (let (e, ts) = expr (next ts) in
+                 if symIs "," ts then (let (b, ts) = expr (next ts) in (EPair(box e, box b), expect ")" ts))
+                 else (e, expect ")" ts)))
+        else (EUnit, fail "expected an expression" ts) }
+
+-- "text" is a list of its bytes.
+private def strTerm : List u8 ->{Diverge} Term =
+  \s. case s of
+    { Nil -> ECon("Nil", box Nil, box Nil)
+    | Cons(c, rest) ->
+        ECon("Cons", box Nil, box Cons(ENum(false, c as u64, "u8"), box Cons(EBox(box (strTerm (unbox rest))), box Nil))) }
+
+-- C, C(e, …), C[t](e, …), or a bitdata value Status { field = e, … }.
+private def constructor : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (c, ts) = qualUpper ts in
+    if symIs "{" ts then
+      (let (fs, ts) = inside (\ts. let (f, ts) = lower ts in let (e, ts) = expr (expect "=" ts) in (Alt(f, Nil, e), ts)) "," "}" (next ts) in
+       (EBits(c, box fs), ts))
+    else
+      (let (tys, ts) = if symIs "[" ts then inside ty "," "]" (next ts) else (Nil, ts) in
+       let (xs, ts) = if symIs "(" ts then inside expr "," ")" (next ts) else (Nil, ts) in
+       (ECon(c, box tys, box xs), ts))
+
+-- Alternatives as written: constructor patterns, literals, and variables (or _).
+private data Pattern = PCon(List u8, List (List u8)) | PLit(Term) | PVar(List u8)
+
+private def caseE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (e, ts) = expr ts in
+    let (alts, ts) = sepBy1 altP "|" (expect "{" (expectKw "of" ts)) in
+    let (c, ts) = caseOf e alts ts in
+    (c, expect "}" ts)
+
+private def altP : List Token ->{Diverge, Panic} ((Pattern, Term), List Token) =
+  \ts.
+    let (p, ts) =
+      if startsQualUpper ts then
+        (let (c, ts) = qualUpper ts in
+         let (xs, ts) = if symIs "(" ts then inside lower "," ")" (next ts) else (Nil, ts) in
+         (PCon(c, xs), ts))
+      else case tok ts of
+        { Char(c) -> (PLit(ENum(false, c as u64, "u8")), next ts)
+        | Num(v, w) -> (PLit(ENum(false, v, w)), next ts)
+        | Ident(x) -> (PVar(x), next ts)
+        | _ -> case tok (next ts) of
+            { Num(v, w) -> if symIs "-" ts then (PLit(ENum(true, v, w)), next (next ts)) else (PVar(Nil), fail "expected a pattern" ts)
+            | _ -> (PVar(Nil), fail "expected a pattern" ts) } } in
+    let (b, ts) = expr (expect "->" ts) in
+    ((p, b), ts)
+
+-- As keelc does: constructor alternatives make a case, maybe ending in a default (x -> e,
+-- x being the scrutinee); literal alternatives make an if chain ending in one.
+private def caseOf : Term -> List (Pattern, Term) -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \e alts ts.
+    let rev = reverse alts in
+    let cons = conAlts alts in
+    let n = length alts in
+    if length cons == n then (ECase(box e, box cons), ts)
+    else case rev of
+      { Nil -> (e, ts)
+      | Cons(last, rest) ->
+          let (p, d) = last in
+          case p of
+            { PVar(x) ->
+                let before = reverse (unbox rest) in
+                if length cons == n - 1 then (defaultCase e cons x d, ts)
+                else if literals before then (ELet("case%", box e, box (ifChain before (bindTo x d))), ts)
+                else (e, fail "a case on literals has literal alternatives ('a' -> e, 42 -> e), then one last alternative x -> e or _ -> e" ts)
+            | _ -> (e, fail "a case on literals has literal alternatives ('a' -> e, 42 -> e), then one last alternative x -> e or _ -> e" ts) } }
+
+private def conAlts : List (Pattern, Term) ->{Diverge} List Alt =
+  \alts. case alts of
+    { Nil -> Nil
+    | Cons(a, rest) -> let (p, b) = a in
+        case p of { PCon(c, xs) -> Cons(Alt(c, xs, b), box (conAlts (unbox rest))) | _ -> conAlts (unbox rest) } }
+
+private def literals : List (Pattern, Term) ->{Diverge} Bool =
+  \alts. case alts of
+    { Nil -> true
+    | Cons(a, rest) -> let (p, b) = a in case p of { PLit(l) -> literals (unbox rest) | _ -> false } }
+
+private def ifChain : List (Pattern, Term) -> Term ->{Diverge} Term =
+  \alts d. case alts of
+    { Nil -> d
+    | Cons(a, rest) -> let (p, b) = a in
+        case p of
+          { PLit(l) -> EIf(box EPrim("==", box EVar("case%"), box l), box b, box (ifChain (unbox rest) d))
+          | _ -> ifChain (unbox rest) d } }
+
+private def bindTo : List u8 -> Term ->{Diverge} Term =
+  \x d. if string.equal x "_" then d else ELet(x, box EVar("case%"), box d)
+
+private def defaultCase : Term -> List Alt -> List u8 -> Term ->{Diverge} Term =
+  \e alts x d.
+    if string.equal x "_" then ECase(box e, box (append alts (Cons(Alt("_", Nil, d), box Nil))))
+    else ELet("case%", box e, box ECase(box EVar("case%"), box (append alts (Cons(Alt("_", Nil, ELet(x, box EVar("case%"), box d)), box Nil)))))
+
+private def cocaseE : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts.
+    let (d, ts) = qualUpper ts in
+    let (tys, ts) = if symIs "[" ts then inside ty "," "]" (next ts) else (Nil, ts) in
+    let (bs, ts) = sepBy1 (\ts. let (o, ts) = lower ts in let (b, ts) = expr (expect "->" ts) in (Alt(o, Nil, b), ts)) "|" (expect "{" ts) in
+    (ECocase(d, box tys, box bs), expect "}" ts)
+
+private def member : List u8 -> List (List u8) ->{Diverge} Bool =
+  \w ws. case ws of { Nil -> false | Cons(k, rest) -> string.equal w k || member w (unbox rest) }

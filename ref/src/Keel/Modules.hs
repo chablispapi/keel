@@ -186,7 +186,7 @@ resolveModule scope self path (Module imports decls main _) = do
       Let x e b -> Let x <$> go bound e <*> go (S.insert x bound) b
       LetVar x e b -> LetVar x <$> go bound e <*> go (S.insert x bound) b
       LetPair x y e b -> LetPair x y <$> go bound e <*> go (S.insert x (S.insert y bound)) b
-      Case e alts -> Case <$> go bound e <*> mapM (\(c, xs, b) -> (,xs,) <$> name pos c <*> go (bound <> S.fromList xs) b) alts
+      Case e alts -> Case <$> go bound e <*> mapM (\(c, xs, b) -> (,xs,) <$> (if c == "_" then pure c else name pos c) <*> go (bound <> S.fromList xs) b) alts
       Handle l e cs -> Handle <$> name pos l <*> go bound e <*> mapM (\(op, x, b) -> (,x,) <$> plain pos op <*> go (S.insert x bound) b) cs
       Con c ts as -> Con <$> name pos c <*> mapM (ty pos) ts <*> mapM (go bound) as
       TyApp f ts es -> TyApp <$> name pos f <*> mapM (ty pos) ts <*> mapM (effs pos) es

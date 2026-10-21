@@ -61,7 +61,7 @@ module.exports = grammar({
     constructor: _ => /[A-Z][A-Za-z0-9_]*/,
     identifier: _ => /[a-z_][A-Za-z0-9_]*/,
     effect_variable: _ => /'[A-Za-z0-9_]+/,
-    operator: _ => choice('-o', /[-+*=<>&|:%?.\/\\@]+/),
+    operator: _ => choice('-o', /[-+*=<>&|:%?!.\/\\@]+/),
     punctuation: _ => choice('(', ')', '{', '}', '[', ']', ',', ';'),
   },
 });

@@ -1,0 +1,37 @@
+-- Print the tokens of a Keel source file, one per line with line and column:
+--
+--   keelc run selfhost/lex.kl < examples/fact.kl
+--
+-- The result is the number of tokens, End included.
+
+import lexer
+
+def showTok : Tok ->{IO, Diverge, Panic} Unit =
+  \t. case t of
+    { Ident(w) -> print "ident "; print w
+    | Upper(w) -> print "upper "; print w
+    | Keyword(w) -> print "keyword "; print w
+    | EffVar(w) -> print "effvar "; print w
+    | Num(v, w) -> print "num "; printU64 v; print w
+    | Char(c) -> print "char "; printU64 (c as u64)
+    | Str(s) -> print "str \""; quoted s; putc('"')
+    | Sym(w) -> print "sym "; print w
+    | Error(msg) -> print "error "; print msg
+    | End -> print "end" }
+
+def quoted : List u8 ->{IO, Diverge} Unit =
+  \s. case s of
+    { Nil -> ()
+    | Cons(c, rest) ->
+        (case c of { '\n' -> print "\\n" | '"' -> print "\\\"" | '\\' -> print "\\\\" | _ -> putc(c) });
+        quoted (unbox rest) }
+
+def showAll : List Token -> i64 ->{IO, Diverge, Panic} i64 =
+  \ts n. case ts of
+    { Nil -> n
+    | Cons(t, rest) -> case t of
+        { At(line, col, k) ->
+            printInt line; putc(':'); printInt col; putc(' '); showTok k; putc('\n');
+            showAll (unbox rest) (n + 1) } }
+
+main = showAll (lex (readAll ()) 1 1) 0

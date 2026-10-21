@@ -335,7 +335,13 @@ caseOf env e alts mex = do
   (d, _, tys) <- conInfo env c0 []
   rel False te (TData d tys)
   resTy <- maybe freshTy pure mex
-  rs <- forM alts $ \(c, xs, b) -> do
+  -- A last alternative _ -> e stands for every constructor not listed before it.
+  -- ponytail: e is copied into each; bind it to a function first if that gets big.
+  let cons = maybe [] (\(_, _, cs) -> cs) (M.lookup d (sData (eSig env)))
+      unlisted (c, xs, b)
+        | c == "_" = [(c', map (const "_") fs, b) | (c', fs) <- cons, c' `notElem` [k | (k, _, _) <- alts]]
+        | otherwise = [(c, xs, b)]
+  rs <- forM (concatMap unlisted alts) $ \(c, xs, b) -> do
     (_, fields, _) <- conInfo env c []
     when (length xs /= length fields) $ failWith Mismatch (c ++ ": wrong number of pattern variables")
     (xs', env') <- binders env (zip xs (map (inst env c tys) fields))

@@ -16,7 +16,7 @@ module Main (main) where
 import Cases (Expect (..))
 import Cases qualified
 import Control.Monad (forM, unless)
-import Data.List (isInfixOf, isPrefixOf, stripPrefix)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative, compileNativeWith)
@@ -24,15 +24,17 @@ import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
+import Keel.Parser (parseModule)
 import Keel.RiscV (compileRiscV)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
 import Keel.Syntax
-import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
+import Sexp (sexpModule)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, listDirectory)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
-import System.Process (env, proc, readCreateProcessWithExitCode, readProcessWithExitCode)
+import System.Process (env, proc, readCreateProcessWithExitCode, readProcessWithExitCode, shell)
 
 tI :: Ty
 tI = TInt i64
@@ -206,7 +208,10 @@ exampleFiles =
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/std/array.kl", (Just "(Cons(Cons(110, box Cons(105, box Cons(108, box Nil))), box Cons(Cons(111, box Cons(110, box Cons(101, box Nil))), box Nil)), 100000)", "4999950000\n9592\nzero\nnil\n"))
-  , ("examples/lexer.kl", (Just "27", "1:1 keyword def\n1:5 ident f\n1:7 sym :\n1:9 ident i64\n1:13 sym ->\n1:15 sym {\n1:16 effvar e\n1:18 sym }\n1:20 ident i64\n1:24 sym =\n1:26 sym \\\n1:27 ident x\n1:28 sym .\n1:30 ident x\n1:32 sym +?\n1:35 num 7936\n1:42 sym ;\n2:1 str \"a\\\"bA\\n\"\n2:14 char 97\n2:18 char 10\n2:23 char 65\n2:47 num 250u8\n2:53 sym ..\n2:56 ident q\n2:57 sym .\n2:58 upper Name\n3:3 error unexpected letter after a number\n"))
+  , ("selfhost/lex.kl", (Just "27", "1:1 keyword def\n1:5 ident f\n1:7 sym :\n1:9 ident i64\n1:13 sym ->\n1:15 sym {\n1:16 effvar e\n1:18 sym }\n1:20 ident i64\n1:24 sym =\n1:26 sym \\\n1:27 ident x\n1:28 sym .\n1:30 ident x\n1:32 sym +?\n1:35 num 7936\n1:42 sym ;\n2:1 str \"a\\\"bA\\n\"\n2:14 char 97\n2:18 char 10\n2:23 char 65\n2:47 num 250u8\n2:53 sym ..\n2:56 ident q\n2:57 sym .\n2:58 upper Name\n3:3 error unexpected letter after a number\n"))
+  , ("selfhost/parse.kl", (Just "4", "(import a.b q)\n(data T (a) (A) (B a (Box (T a))))\n(def f (-> i64 (Panic) i64) (\\ x _ (let case% x (if (== case% 0) 1 (let n case% (* n 2))))))\n(main (if (let l% (app f 2) (let r% 3 (< r% l%))) (if (== (con Cons () (int u8 104) (box (con Cons () (int u8 105) (box (con Nil ()))))) (con Nil ())) false true) false))\n"))
+  , ("test/syntax/ops.kl", (Just "72", "1\n0\n1\n2\n8\n3\n4\n9\n321\n"))
+  , ("test/syntax/wildcard.kl", (Just "2405", ""))
   , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
   ]
 
@@ -218,7 +223,8 @@ exampleInput name =
     lookup
       name
       [ ("examples/words.kl", "the cat\nthe dog\nsat on the cat\n")
-      , ("examples/lexer.kl", "def f : i64 ->{'e} i64 = \\x. x +? 0x1F_00;\n\"a\\\"b\\x41\\n\" 'a' '\\n' '\\65' {- a {- b -} c -} 250u8 .. q.Name -- done\n12ab\n")
+      , ("selfhost/parse.kl", "import a.b as q\ndata T a = A | B(a, Box (T a))\ndef f : i64 ->{Panic} i64 = \\x. case x of { 0 -> 1 | n -> n * 2 }\nmain = f 2 > 3 && \"hi\" != Nil\n")
+      , ("selfhost/lex.kl", "def f : i64 ->{'e} i64 = \\x. x +? 0x1F_00;\n\"a\\\"b\\x41\\n\" 'a' '\\n' '\\65' {- a {- b -} c -} 250u8 .. q.Name -- done\n12ab\n")
       ]
 
 -- | The evaluator's view of the world for a program: its stdin, and the files on disk that the
@@ -237,6 +243,7 @@ moduleErrors =
   , ("test/modules/scope/private.kl", "private.kl:3:8: secret is private to module a")
   , ("test/modules/qual/ambiguous.kl", "ambiguous.kl:3:8: Ready is ambiguous: it is declared in x and y; write x.Ready or y.Ready")
   , ("test/modules/missing/main.kl", "test/modules/missing/main.kl:1:1: module nowhere not found")
+  , ("test/syntax/nodefault.kl", "nodefault.kl:1:36: parse error")
   ]
 
 -- | The language server's checks on the example project, with an unsaved edit to util.kl.
@@ -268,6 +275,33 @@ lspChecks = do
     , not ok
     ]
 
+-- | The self-hosted parser (selfhost/parse.kl), built natively, must print the same syntax
+-- tree as keelc's parser for every .kl file in the repo, and stop at the same place on an error.
+selfhostChecks :: FilePath -> IO [String]
+selfhostChecks dir = do
+  loaded <- loadModules "selfhost/parse.kl"
+  case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileNative of
+    Left e -> pure ["FAIL selfhost/parse.kl: " ++ e]
+    Right asm -> do
+      let exe = dir </> "selfhost-parse"
+      writeFile (exe ++ ".s") asm
+      _ <- readProcessWithExitCode "cc" ["-o", exe, exe ++ ".s"] ""
+      files <- concat <$> mapM klFiles ["examples", "std", "test", "selfhost"]
+      fmap concat $ forM files $ \f -> do
+        text <- readFile f
+        (_, printed, _) <- readCreateProcessWithExitCode (shell (exe ++ " < " ++ f)) ""
+        let got = unlines (init (lines printed)) -- without the "result:" line
+            same = case parseModule f text of
+              Right m -> got == sexpModule m
+              Left e -> fmap (takeWhile (/= ' ')) (stripPrefix (f ++ ":") e) == Just (takeWhile (/= ' ') printed)
+        pure ["FAIL selfhost/parse.kl disagrees with keelc on " ++ f ++ ":\n" ++ printed | not same]
+  where
+    klFiles d = do
+      entries <- map (d </>) <$> listDirectory d
+      fmap concat $ forM entries $ \e -> do
+        isDir <- doesDirectoryExist e
+        if isDir then klFiles e else pure [e | ".kl" `isSuffixOf` e]
+
 checkModuleError :: (FilePath, String) -> IO [String]
 checkModuleError (path, expected) =
   loadModules path >>= \case
@@ -295,7 +329,7 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
-  modErrs <- (++) <$> (concat <$> mapM checkModuleError moduleErrors) <*> lspChecks
+  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, lspChecks, selfhostChecks dir]
   let programs = cases ++ specCases ++ concatMap snd loaded
   failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir False))
   -- The examples have source positions: build them again with debug info.
@@ -308,7 +342,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ debugFailures ++ refused
-      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + 1
+      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + 2
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-

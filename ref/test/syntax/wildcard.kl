@@ -1,0 +1,6 @@
+data T = A | B(i64) | C(i64, i64) | D
+
+def f : T ->{Panic} i64 = \t. case t of { B(n) -> n | _ -> 0 }
+def g : T ->{Panic} i64 = \t. case t of { C(a, b) -> a + b | other -> case other of { A -> 1 | _ -> 2 } }
+
+main = f (B(5)) + f A + g (C(10, 20)) * 10 + g A * 100 + g D * 1000

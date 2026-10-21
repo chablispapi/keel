@@ -1,0 +1,114 @@
+-- Parse a Keel source file and print its syntax tree as S-expressions, one top-level item
+-- per line, in the format keelc's test suite prints its own parse in (ref/test/Sexp.hs):
+--
+--   keelc run selfhost/parse.kl < examples/fact.kl
+--
+-- The result is the number of top-level items, or -1 after an error.
+
+import lexer
+import parser
+
+def showModule : Module ->{IO, Diverge, Panic} i64 =
+  \m. case m of
+    { Module(imps, ds, entry) ->
+        each (\i. let (path, q) = i in print "(import "; print path; putc(' '); print q; println ")") imps;
+        each (\d. let (priv, decl) = d in
+                  (if priv then print "(private " else ()); pDecl decl; (if priv then putc(')') else ()); putc('\n')) ds;
+        (case entry of { None -> () | Some(e) -> print "(main "; pTerm e; println ")" });
+        length imps + length ds + (case entry of { None -> 0 | Some(e) -> 1 }) }
+
+def each : forall a 'e. (a ->{'e} Unit) -> List a ->{'e, Diverge} Unit =
+  \f xs. case xs of { Nil -> () | Cons(x, rest) -> f x; each f (unbox rest) }
+
+-- " x" for each x, then ")".
+def items : forall a 'e. (a ->{'e} Unit) -> List a ->{'e, IO, Diverge} Unit =
+  \f xs. each (\x. putc(' '); f x) xs; putc(')')
+
+-- (x y z)
+def plist : forall a 'e. (a ->{'e} Unit) -> List a ->{'e, IO, Diverge} Unit =
+  \f xs. putc('('); (case xs of { Nil -> () | Cons(x, rest) -> f x; each (\y. putc(' '); f y) (unbox rest) }); putc(')')
+
+def names : List (List u8) ->{IO, Diverge} Unit = \ns. plist (\n. print n) ns
+
+def pDecl : Decl ->{IO, Diverge, Panic} Unit =
+  \d. case d of
+    { DData(lin, n, ps, cs) ->
+        print (if lin then "(linear-data " else "(data "); print n; putc(' '); names ps;
+        items (\c. case c of { Ctor(k, ts) -> putc('('); print k; items pTy ts }) cs
+    | DCodata(n, ps, os) ->
+        print "(codata "; print n; putc(' '); names ps;
+        items (\o. case o of { Ctor(k, ts) -> putc('('); print k; items pTy ts }) os
+    | DEffect(n, ops) ->
+        print "(effect "; print n;
+        items (\o. case o of { Ctor(k, ts) -> putc('('); print k; items pTy ts }) ops
+    | DDef(f, t, e) -> print "(def "; print f; putc(' '); pTy t; putc(' '); pTerm e; putc(')')
+    | DBitdata(n, it, fs) ->
+        print "(bitdata "; print n; putc(' '); print it;
+        items (\f. case f of { Field(k, lo, w) -> putc('('); print k; putc(' '); printU64 lo; putc(' '); printU64 w; putc(')') }) fs }
+
+def pTy : Ty ->{IO, Diverge, Panic} Unit =
+  \t. case t of
+    { TUnit -> print "Unit"
+    | TBool -> print "Bool"
+    | TInt(n) -> print n
+    | TVar(v) -> print v
+    | THole -> print "_"
+    | TFun(a, e, b) -> print "(-> "; pTy (unbox a); putc(' '); names e; putc(' '); pTy (unbox b); putc(')')
+    | TLFun(a, e, b) -> print "(-o "; pTy (unbox a); putc(' '); names e; putc(' '); pTy (unbox b); putc(')')
+    | TData(n, ts) -> (case unbox ts of { Nil -> print n | more -> putc('('); print n; items pTy more })
+    | TBox(a) -> print "(Box "; pTy (unbox a); putc(')')
+    | TPair(a, b) -> print "(, "; pTy (unbox a); putc(' '); pTy (unbox b); putc(')')
+    | TForall(vs, es, a) ->
+        print "(forall "; plist (\v. let (n, k) = v in putc('('); print n; putc(' '); print k; putc(')')) vs;
+        putc(' '); names es; putc(' '); pTy (unbox a); putc(')')
+    | TRef(a) -> print "(& "; pTy (unbox a); putc(')')
+    | TMut(a) -> print "(&mut "; pTy (unbox a); putc(')') }
+
+def pNum : Bool -> u64 ->{IO, Diverge, Panic} Unit =
+  \neg v. (if neg && v != 0 then putc('-') else ()); printU64 v
+
+def pTerm : Term ->{IO, Diverge, Panic} Unit =
+  \e. case e of
+    { EVar(x) -> print x
+    | EUnit -> print "()"
+    | EBool(b) -> print (if b then "true" else "false")
+    | ENum(neg, v, w) -> (case w of { Nil -> pNum neg v | _ -> print "(int "; print w; putc(' '); pNum neg v; putc(')') })
+    | EConvert(t, a) -> print "(as "; print t; putc(' '); pTerm (unbox a); putc(')')
+    | EPrim(o, a, b) -> putc('('); print o; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | EIf(c, a, b) -> print "(if"; terms (Cons(unbox c, box Cons(unbox a, box Cons(unbox b, box Nil))))
+    | ELam(x, t, b) -> print "(\\ "; print x; putc(' '); pTy t; terms (Cons(unbox b, box Nil))
+    | EApp(f, a) -> print "(app"; terms (Cons(unbox f, box Cons(unbox a, box Nil)))
+    | ELet(x, a, b) -> print "(let "; print x; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | ELetPair(x, y, a, b) -> print "(letpair "; print x; putc(' '); print y; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | EVarIn(x, a, b) -> print "(var "; print x; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | EAssign(x, a) -> print "(:= "; print x; terms (Cons(unbox a, box Nil))
+    | ESeq(a, b) -> print "(seq"; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | ECon(c, ts, xs) -> print "(con "; print c; putc(' '); plist pTy (unbox ts); terms (unbox xs)
+    | ECase(a, alts) ->
+        print "(case "; pTerm (unbox a);
+        items (\alt. case alt of { Alt(c, xs, b) -> putc('('); print c; putc(' '); names xs; terms (Cons(b, box Nil)) }) (unbox alts)
+    | EBox(a) -> print "(box"; terms (Cons(unbox a, box Nil))
+    | EUnbox(a) -> print "(unbox"; terms (Cons(unbox a, box Nil))
+    | EPair(a, b) -> print "(pair"; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | EHandle(l, a, cs) ->
+        print "(handle "; print l; putc(' '); pTerm (unbox a);
+        items (\cl. case cl of { Alt(o, xs, b) -> putc('('); print o; each (\x. putc(' '); print x) xs; terms (Cons(b, box Nil)) }) (unbox cs)
+    | ECocase(d, ts, bs) ->
+        print "(cocase "; print d; putc(' '); plist pTy (unbox ts);
+        items (\br. case br of { Alt(o, xs, b) -> putc('('); print o; terms (Cons(b, box Nil)) }) (unbox bs)
+    | ETyApp(f, ts) -> print "(tyapp "; print f; putc(' '); plist pTy (unbox ts); putc(')')
+    | EProj(a, o) -> print "(proj "; pTerm (unbox a); putc(' '); print o; putc(')')
+    | EBorrow(x) -> print "(& "; print x; putc(')')
+    | EBorrowMut(x) -> print "(&mut "; print x; putc(')')
+    | EBits(c, fs) ->
+        print "(bits "; print c;
+        items (\f. case f of { Alt(k, xs, b) -> putc('('); print k; terms (Cons(b, box Nil)) }) (unbox fs) }
+
+-- " t" for each term, then ")".
+def terms : List Term ->{IO, Diverge, Panic} Unit = \ts. items pTerm ts
+
+main =
+  let (m, ts) = parser.parse (lexer.lex (readAll ()) 1 1) in
+  case tok ts of
+    { Error(msg) -> (case ts of { Nil -> () | Cons(t, rest) -> case t of { At(l, c, k) -> printInt l; putc(':'); printInt c; print ": "; println msg } }); -1
+    | _ -> showModule m }

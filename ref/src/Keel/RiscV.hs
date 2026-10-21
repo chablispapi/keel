@@ -8,7 +8,8 @@
 -- 'linkerScript') and run with @qemu-system-riscv64 -machine virt -bios none -kernel prog.elf@.
 --
 -- Registers: a0 = block / result, a1 = argument; t0–t3 operands and temporaries (the allocator
--- leaves them alone); a6/a7 for inline reference counting; s0 frame pointer.
+-- leaves them alone; t3 also addresses stack slots beyond 2 KB); a6/a7 for inline reference
+-- counting; s0 frame pointer.
 module Keel.RiscV (compileRiscV, linkerScript) where
 
 import Control.Monad (forM_, unless, when)
@@ -41,7 +42,7 @@ linkerScript =
     , "}"
     ]
 
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsErr :: Maybe String}
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String}
 
 type G = State GS
 
@@ -57,8 +58,6 @@ newLabel = do
   modify (\s -> s {gsLabel = n + 1})
   pure (".Lk" ++ show n)
 
-failG :: String -> G ()
-failG msg = modify (\s -> s {gsErr = Just (maybe msg id (gsErr s))})
 
 str :: String -> G String
 str s = do
@@ -109,11 +108,9 @@ jumpIf cond operands target = do
       _ -> error ("jumpIf: " ++ c)
 
 emitProgram :: [Decl] -> Ty -> LProg -> Either String String
-emitProgram decls mainTy (LProg funs statics mainF _) = case gsErr final of
-  Just e -> Left e
-  Nothing -> Right (unlines (reverse (gsLines final)))
+emitProgram decls mainTy (LProg funs statics mainF _) = Right (unlines (reverse (gsLines final)))
   where
-    final = execState gen (GS 0 [] M.empty Nothing)
+    final = execState gen (GS 0 [] M.empty)
     printers = printerTypes decls mainTy
     gen = do
       line "\t.section .text.start, \"ax\""
@@ -160,15 +157,14 @@ emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   let (locs, saved, frame) = allocate ["s" ++ show r | r <- [1 .. 11 :: Int]] f (params ++ env ++ bound body)
       slots = Slots locs saved
-  when (frame > 2032) $ failG ("function " ++ name ++ " has too many variables for the RISC-V back end")
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t# " ++ name)
   ins "addi sp, sp, -16"
   ins "sd ra, 8(sp)"
   ins "sd s0, 0(sp)"
   ins "mv s0, sp"
-  when (frame > 0) $ ins ("addi sp, sp, -" ++ show frame)
-  forM_ saved $ \(r, off) -> ins ("sd " ++ r ++ ", " ++ show off ++ "(sp)")
+  when (frame > 0) $ if frame <= 2048 then ins ("addi sp, sp, -" ++ show frame) else li "t3" (toInteger frame) >> ins "sub sp, sp, t3"
+  forM_ saved $ \(r, off) -> slot off >>= \s -> ins ("sd " ++ r ++ ", " ++ s)
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ld t0, " ++ show (8 * j) ++ "(a0)")
     store slots "t0" v
@@ -180,8 +176,14 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
 -- | Leave a Keel function: restore its callee-saved registers, then the frame.
 leave :: Slots -> G ()
 leave slots = do
-  forM_ (fSaved slots) $ \(r, off) -> ins ("ld " ++ r ++ ", " ++ show off ++ "(sp)")
+  forM_ (fSaved slots) $ \(r, off) -> slot off >>= \s -> ins ("ld " ++ r ++ ", " ++ s)
   epilogue
+
+-- | A frame offset as an address: off(sp), or through t3 past the 12-bit offset range.
+slot :: Int -> G String
+slot off
+  | off < 2048 = pure (show off ++ "(sp)")
+  | otherwise = li "t3" (toInteger off) >> ins "add t3, t3, sp" >> pure "0(t3)"
 
 epilogue :: G ()
 epilogue = do
@@ -193,10 +195,10 @@ epilogue = do
 store, load' :: Slots -> String -> String -> G ()
 store slots r v = case fLocs slots M.! v of
   InReg x -> unless (x == r) $ ins ("mv " ++ x ++ ", " ++ r)
-  InSlot i -> ins ("sd " ++ r ++ ", " ++ show (8 * i) ++ "(sp)")
+  InSlot i -> slot (8 * i) >>= \s -> ins ("sd " ++ r ++ ", " ++ s)
 load' slots r v = case fLocs slots M.! v of
   InReg x -> unless (x == r) $ ins ("mv " ++ r ++ ", " ++ x)
-  InSlot i -> ins ("ld " ++ r ++ ", " ++ show (8 * i) ++ "(sp)")
+  InSlot i -> slot (8 * i) >>= \s -> ins ("ld " ++ r ++ ", " ++ s)
 
 atom :: Slots -> String -> Atom -> G ()
 atom slots r a = case a of
@@ -371,6 +373,7 @@ rhsCode slots rhs = case rhs of
       ins ("sd t2, " ++ show (8 * (2 + 2 * i)) ++ "(a0)")
       atom slots "t2" a
       ins ("sd t2, " ++ show (8 * (3 + 2 * i)) ++ "(a0)")
+    ins "la t3, _keel_handlers" -- again: loading a variable may have used t3
     ins "sd a0, 0(t3)"
   RPopHandler a -> do
     atom slots "a0" a

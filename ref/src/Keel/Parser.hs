@@ -267,7 +267,7 @@ located p = do
   At (sourceName pos, sourceLine pos, sourceColumn pos) <$> p
 
 opExpr :: Parser Term
-opExpr = located (lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> cmpE)
+opExpr = located (lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> orE)
   where
     lambda = do
       _ <- Tok.symbol lexer "\\"
@@ -315,12 +315,34 @@ opExpr = located (lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> cm
       Handle l e <$> braces (sepBy1 ((,,) <$> lower <*> lower <* op "->" <*> expr) (op "|"))
     assign = try (do x <- lower; op ":="; Assign x <$> opExpr)
 
+-- | @a || b@ and @a && b@, which only evaluate @b@ when they need it: sugar for @if@.
+orE, andE :: Parser Term
+orE = chainr1 andE (op "||" $> \a b -> If a (BoolLit True) b)
+andE = chainr1 cmpE (op "&&" $> \a b -> If a b (BoolLit False))
+
+-- | @==@ and @<@ are primitives; @!=@ @>@ @<=@ @>=@ are written with them. @>@ and @<=@ swap
+-- their operands, so an operand that might do something is bound first, keeping evaluation
+-- left to right.
 cmpE :: Parser Term
 cmpE = do
   a <- addE
   option a $ do
-    p <- (op "==" $> Eq) <|> (op "<" $> Lt)
-    Prim p a <$> addE
+    f <-
+      choice
+        [ op "==" $> Prim Eq
+        , op "!=" $> \x y -> notE (Prim Eq x y)
+        , op "<=" $> \x y -> notE (swapped x y)
+        , op ">=" $> \x y -> notE (Prim Lt x y)
+        , op "<" $> Prim Lt
+        , op ">" $> swapped
+        ]
+    f a <$> addE
+  where
+    notE c = If c (BoolLit False) (BoolLit True)
+    swapped x y
+      | plain x && plain y = Prim Lt y x
+      | otherwise = Let "l%" x (Let "r%" y (Prim Lt (Var "r%") (Var "l%")))
+    plain e = case stripAt e of Var _ -> True; IntLit _ _ -> True; NumLit _ _ -> True; _ -> False
 
 addE, mulE :: Parser Term
 addE = chainl1 mulE (arithOp [("+", Add), ("-", Sub)])
@@ -425,13 +447,37 @@ atom =
       reserved "case"
       e <- expr
       reserved "of"
-      Case e <$> braces (sepBy1 alt (op "|"))
-    alt = do
+      -- (checked before the closing brace, so an error points there)
+      braces (sepBy1 alt (op "|") >>= \alts -> case (reverse alts, [() | Right _ <- alts]) of
+        (_, []) -> pure (Case e [a | Left a <- alts])
+        (Right (Left (x, d)) : rest@(Left _ : _), [_]) -> pure (defaultCase e [a | Left a <- reverse rest] x d)
+        _ -> literalCase e alts)
+    alt = (Left <$> ctorAlt) <|> (Right <$> litAlt)
+    ctorAlt = do
       c <- qualUpper
       xs <- option [] (parens (sepBy lower comma))
       op "->"
       b <- expr
       pure (c, xs, b)
+    -- 'a' -> e, 42 -> e, -1 -> e; then x -> e (or _ -> e) for everything else.
+    litAlt = do
+      pat <- (Right <$> (charLit <|> number <|> try (op "-" >> negative <$> number))) <|> (Left <$> lower)
+      op "->"
+      b <- expr
+      pure (either (Left . (,b)) (Right . (,b)) pat)
+    -- An if chain on the scrutinee, bound once.
+    -- Constructors, then _ -> d (or x -> d, x being the scrutinee): "Keel.Infer" fills in
+    -- the constructors not listed.
+    defaultCase e alts "_" d = Case e (alts ++ [("_", [], d)])
+    defaultCase e alts x d = Let "case%" e (Case (Var "case%") (alts ++ [("_", [], Let x (Var "case%") d)]))
+    literalCase e alts = case reverse alts of
+      Right (Left (x, d)) : rest | Just lits <- mapM literal rest ->
+        pure (Let "case%" e (foldr (\(l, b) r -> If (Prim Eq (Var "case%") l) b r) (bind x d) (reverse lits)))
+      _ -> fail "a case on literals has literal alternatives ('a' -> e, 42 -> e), then one last alternative x -> e or _ -> e"
+    literal (Right (Right a)) = Just a
+    literal _ = Nothing
+    bind "_" d = d
+    bind x d = Let x (Var "case%") d
     cocaseE = do
       reserved "cocase"
       d <- qualUpper

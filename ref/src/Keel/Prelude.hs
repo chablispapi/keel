@@ -56,6 +56,8 @@ preludeSource =
     , "-- The result of a comparison (std.map takes a comparison function)."
     , "data Ordering = Less | Equal | Greater"
     , ""
+    , "def not : Bool -> Bool = \\b. if b then false else true"
+    , ""
     , "def compareInt : i64 -> i64 -> Ordering = \\a b. if a < b then Less else if a == b then Equal else Greater"
     ]
 

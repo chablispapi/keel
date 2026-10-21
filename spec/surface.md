@@ -63,6 +63,8 @@ Arrows associate to the right. Effect variables start with `'`.
 | `var x = e in e`, `x := e`, `e; e` | mutable local, assignment, sequencing |
 | `if c then a else b` | conditional |
 | `case e of { Nil -> a \| Cons(x, rest) -> b }` | pattern matching |
+| `case t of { Node(l, x, r) -> x \| _ -> 0 }` | a last `_ -> e` (or `y -> e`, `y` being the scrutinee) covers the constructors not listed; its body is copied into each |
+| `case c of { '(' -> 1 \| 42 -> 2 \| -1 -> 3 \| _ -> 0 }` | literal patterns: an `if` chain on `==`, which needs a last `_ -> e` or `y -> e` |
 | `cocase Ord { lt -> \p q. p < q }`, `e.lt` | codata value, observation |
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |
 | `read8(4)`, `out(x)`, `putc(c)` | performing an operation (`out` prints a number and a newline, `putc` one byte) |
@@ -76,11 +78,13 @@ Arrows associate to the right. Effect variables start with `'`.
 | `e as u8` | wrapping conversion between integer types |
 | `s.thr_empty`, `s.raw`, `LineStatus(x)`, `LineStatus { thr_empty = 1 }` | bitdata field, raw value, from raw, from fields |
 | `+ - *`, `+% -% *%`, `+\| -\| *\|`, `+? -? *?` | checked, wrapping, saturating, Option arithmetic |
-| `==`, `<` | comparisons |
+| `==`, `<`, `!=`, `>`, `<=`, `>=` | comparisons (the last four are written with `==`, `<` and `if`; operands still evaluate left to right) |
+| `a && b`, `a \|\| b`, `not a` | `if a then b else false`, `if a then true else b`, and a prelude function |
 | `f[i64]`, `Nil[i64]` | explicit type arguments (usually inferred) |
 
 Precedence, loosest first: `;`, then `λ` / `let` / `var` / `if` / `handle` / `:=` (their bodies
-extend as far as possible), then `==` `<`, then `+ -` (all variants), then `*` and the bitwise
+extend as far as possible), then `||`, then `&&` (both associate to the right), then the
+comparisons, then `+ -` (all variants), then `*` and the bitwise
 operators, then `as`, then application, then `.obs` and `[types]`. A `-` directly before a number at the start of an
 operand is a negative literal; `n -1` still means `n - 1`.
 
@@ -148,6 +152,7 @@ Every program starts with the declarations in `ref/src/Keel/Prelude.hs`, written
 | `printInt`, `printU64` | print a number in decimal, without a newline |
 | `readAll` | every byte of input, as a `List u8` (effect `Input`) |
 | `Ordering`, `compareInt` | `Less \| Equal \| Greater`, and comparing `i64`s |
+| `not` | Boolean negation |
 
 A program may declare any of these names itself. The prelude's version is then left out, along
 with every prelude definition that mentions a left-out or redeclared name. A program that defines

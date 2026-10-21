@@ -40,5 +40,5 @@ test-suite native
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        Native.hs
-  other-modules:  Cases
+  other-modules:  Cases, Sexp
   build-depends:  keel-ref, directory, filepath, process

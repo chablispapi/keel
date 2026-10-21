@@ -667,7 +667,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       if (('\t' <= lookahead && lookahead <= '\r') ||
           lookahead == ' ') SKIP(0);
       if (('1' <= lookahead && lookahead <= '9')) ADVANCE(27);
-      if (('%' <= lookahead && lookahead <= '@') ||
+      if (lookahead == '!' ||
+          ('%' <= lookahead && lookahead <= '@') ||
           lookahead == '\\' ||
           lookahead == '|') ADVANCE(51);
       if (('A' <= lookahead && lookahead <= 'Z')) ADVANCE(45);
@@ -772,7 +773,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       if (('\t' <= lookahead && lookahead <= '\r') ||
           lookahead == ' ') SKIP(17);
       if (('1' <= lookahead && lookahead <= '9')) ADVANCE(27);
-      if (('%' <= lookahead && lookahead <= '@') ||
+      if (lookahead == '!' ||
+          ('%' <= lookahead && lookahead <= '@') ||
           lookahead == '\\' ||
           lookahead == '|') ADVANCE(51);
       if (('A' <= lookahead && lookahead <= 'Z')) ADVANCE(45);
@@ -784,7 +786,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       END_STATE();
     case 19:
       ACCEPT_TOKEN(anon_sym_DOT);
-      if (lookahead == '%' ||
+      if (lookahead == '!' ||
+          lookahead == '%' ||
           lookahead == '&' ||
           lookahead == '*' ||
           lookahead == '+' ||
@@ -867,7 +870,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       END_STATE();
     case 32:
       ACCEPT_TOKEN(sym_comment);
-      if (lookahead == '%' ||
+      if (lookahead == '!' ||
+          lookahead == '%' ||
           lookahead == '&' ||
           lookahead == '*' ||
           lookahead == '+' ||
@@ -1009,7 +1013,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       ACCEPT_TOKEN(aux_sym_operator_token1);
       if (lookahead == '-') ADVANCE(32);
       if (lookahead == 'o') ADVANCE(49);
-      if (lookahead == '%' ||
+      if (lookahead == '!' ||
+          lookahead == '%' ||
           lookahead == '&' ||
           lookahead == '*' ||
           lookahead == '+' ||
@@ -1022,7 +1027,8 @@ static bool ts_lex(TSLexer *lexer, TSStateId state) {
       END_STATE();
     case 51:
       ACCEPT_TOKEN(aux_sym_operator_token1);
-      if (lookahead == '%' ||
+      if (lookahead == '!' ||
+          lookahead == '%' ||
           lookahead == '&' ||
           lookahead == '*' ||
           lookahead == '+' ||
