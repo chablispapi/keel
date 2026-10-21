@@ -205,6 +205,11 @@ decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
       e <- expr
       pure (Def name t e, [s])
 
+-- | A type, constructor or effect name, maybe qualified by an import: @Status@,
+-- @uart.Status@ (resolved by "Keel.Modules").
+qualUpper :: Parser String
+qualUpper = try (do q <- lower; op "."; (\n -> q ++ "." ++ n) <$> upper) <|> upper
+
 -- Types -----------------------------------------------------------------------------------
 
 ty :: Parser Ty
@@ -225,7 +230,7 @@ arrowTy = do
   p <- paramTy
   option p $ do
     arrow <- (op "->" $> TFun) <|> (op "-o" $> TLFun)
-    e <- option S.empty (S.fromList <$> braces (sepBy (upper <|> effVar) comma))
+    e <- option S.empty (S.fromList <$> braces (sepBy (qualUpper <|> effVar) comma))
     arrow p e <$> arrowTy
 
 paramTy :: Parser Ty
@@ -234,14 +239,14 @@ paramTy = (op "&" >> ((reserved "mut" >> TMut <$> appTy) <|> (TRef <$> appTy))) 
 appTy :: Parser Ty
 appTy =
   (reserved "Box" >> TBox <$> atomTy)
-    <|> (TData <$> upper <*> many atomTy)
+    <|> (TData <$> qualUpper <*> many atomTy)
     <|> atomTy
 
 atomTy :: Parser Ty
 atomTy =
   (reserved "Bool" $> TBool)
     <|> (reserved "Unit" $> TUnit)
-    <|> ((`TData` []) <$> upper)
+    <|> ((`TData` []) <$> qualUpper)
     <|> (named <$> lower)
     <|> parens (do a <- ty; option a (comma >> TPair a <$> ty))
   where
@@ -306,7 +311,7 @@ opExpr = located (lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> cm
       reserved "handle"
       e <- expr
       reserved "with"
-      l <- upper
+      l <- qualUpper
       Handle l e <$> braces (sepBy1 ((,,) <$> lower <*> lower <* op "->" <*> expr) (op "|"))
     assign = try (do x <- lower; op ":="; Assign x <$> opExpr)
 
@@ -402,7 +407,7 @@ atom =
     <|> (Var <$> lower)
   where
     constructor = do
-      c <- upper
+      c <- qualUpper
       bitsLit c <|> do
         ts <- option [] (brackets (sepBy ty comma))
         Con c ts <$> option [] (parens (sepBy expr comma))
@@ -414,13 +419,13 @@ atom =
       reserved "of"
       Case e <$> braces (sepBy1 alt (op "|"))
     alt = do
-      c <- upper
+      c <- qualUpper
       xs <- option [] (parens (sepBy lower comma))
       op "->"
       b <- expr
       pure (c, xs, b)
     cocaseE = do
       reserved "cocase"
-      d <- upper
+      d <- qualUpper
       ts <- option [] (brackets (sepBy ty comma))
       Cocase d ts <$> braces (sepBy1 ((,) <$> lower <* op "->" <*> expr) (op "|"))

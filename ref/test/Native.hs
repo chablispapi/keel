@@ -202,6 +202,7 @@ exampleFiles =
   , ("examples/reuse.kl", (Just "1500500", ""))
   , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
   , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
+  , ("test/modules/qual/main.kl", (Just "48", ""))
   ]
 
 -- | Multi-file programs the module loader must refuse, and part of the message.
@@ -211,6 +212,7 @@ moduleErrors =
   , ("test/modules/dup/main.kl", "main.kl:3:8: shared is ambiguous: it is declared in x and y; write x.shared or y.shared")
   , ("test/modules/scope/hidden.kl", "hidden.kl:3:8: hidden is declared in module b; import b to use it")
   , ("test/modules/scope/private.kl", "private.kl:3:8: secret is private to module a")
+  , ("test/modules/qual/ambiguous.kl", "ambiguous.kl:3:8: Ready is ambiguous: it is declared in x and y; write x.Ready or y.Ready")
   , ("test/modules/missing/main.kl", "test/modules/missing/main.kl:1:1: module nowhere not found")
   ]
 

@@ -1,0 +1,3 @@
+data Status = Ready | Busy(i64)
+
+def weight : Status -> i64 = \s. case s of { Ready -> 1 | Busy(n) -> 2 }

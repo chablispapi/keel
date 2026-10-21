@@ -105,9 +105,16 @@ main.kl:8:8: init is ambiguous: it is declared in drivers.console and drivers.le
 
 A declaration marked `private` is visible only in its own file, so two modules can each have a
 `private def helper`. A qualifier wins over a projection only when no local variable has that
-name: with a local `console`, `console.greet` observes it. Only definitions and effect
-operations can be qualified; types and constructors are used plain, so an ambiguous one has to
-be renamed.
+name: with a local `console`, `console.greet` observes it. Types, constructors and effects are
+qualified the same way, in types, expressions and patterns:
+
+```
+def code : uart.Status -> i64 = \s. case s of { uart.Ready -> 0 | uart.Busy(n) -> n }
+main = handle poll () with uart.Port { get u -> 1 }
+```
+
+The operations in a handler's clauses are written plain; an operation name two imported
+effects share can't be handled yet.
 
 The loader reports import cycles (`import cycle: a → b → a`), missing modules (at the
 `import`), names from a module that isn't imported (`hidden is declared in module b; import b

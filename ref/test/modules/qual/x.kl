@@ -1,0 +1,5 @@
+data Status = Ready | Busy(i64)
+
+effect Port { get : Unit => i64 }
+
+def code : Status -> i64 = \s. case s of { Ready -> 0 | Busy(n) -> n }

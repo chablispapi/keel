@@ -1,0 +1,11 @@
+-- x and y both declare Status, Ready and Busy: qualify them.
+import x
+import y
+
+def both : x.Status -> y.Status ->{Panic} i64 = \a b. x.code a + y.weight b
+
+def busy : Unit ->{x.Port} x.Status = \u. x.Busy(get ())
+
+main =
+  let s = handle busy () with x.Port { get u -> 40 } in
+  both s y.Ready + (case y.Busy(7) of { y.Ready -> 0 | y.Busy(n) -> n })

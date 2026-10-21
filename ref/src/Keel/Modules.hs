@@ -8,9 +8,10 @@
 -- later phases see one flat program: a name declared by one module only keeps its name, and
 -- private names and names declared by several modules become @name\@module@.
 --
--- ponytail: only values (definitions, effect operations) can be qualified; @uart.Status@ needs
--- the parser to read qualified names in types and patterns. An ambiguous type or constructor
--- is reported, and the fix is to rename one.
+-- Types, constructors and effects are qualified the same way: @uart.Status@, @uart.Ready@.
+--
+-- ponytail: handler clauses name operations unqualified (@handle e with uart.Uart { read x ->
+-- … }@); an operation two imported effects share can't be handled there.
 module Keel.Modules (loadModules, loadModulesWith, importPath) where
 
 import Control.Monad (foldM, forM, forM_, when)
@@ -138,7 +139,7 @@ resolveModule scope self path (Module imports decls main _) = do
         Left (at pos ++ "module " ++ m ++ " has no " ++ n)
       Right (internal scope m False n)
 
-    -- A dotted name from explicit type arguments (q.f[t]).
+    -- A name the parser read with its qualifier: q.f[t], q.Type, q.Con.
     name pos n = case break (== '.') n of
       (q, '.' : f) | M.member q quals -> qualified pos q f
       _ -> plain pos n
@@ -155,7 +156,7 @@ resolveModule scope self path (Module imports decls main _) = do
         top = Just (path, 1, 1)
 
     ty pos t = case t of
-      TData n as -> TData <$> plain pos n <*> mapM (ty pos) as
+      TData n as -> TData <$> name pos n <*> mapM (ty pos) as
       TFun a e b -> TFun <$> ty pos a <*> effs pos e <*> ty pos b
       TLFun a e b -> TLFun <$> ty pos a <*> effs pos e <*> ty pos b
       TBox a -> TBox <$> ty pos a
@@ -164,7 +165,7 @@ resolveModule scope self path (Module imports decls main _) = do
       TMut a -> TMut <$> ty pos a
       TForall vs es b -> TForall vs es <$> ty pos b
       _ -> Right t
-    effs pos e = S.fromList <$> mapM (\l -> if take 1 l == "'" then Right l else plain pos l) (S.toList e)
+    effs pos e = S.fromList <$> mapM (\l -> if take 1 l == "'" then Right l else name pos l) (S.toList e)
 
     -- Global names in a term, leaving local variables (which may shadow) alone. pos is the
     -- innermost enclosing source position, for errors.
@@ -177,12 +178,12 @@ resolveModule scope self path (Module imports decls main _) = do
       Let x e b -> Let x <$> go bound e <*> go (S.insert x bound) b
       LetVar x e b -> LetVar x <$> go bound e <*> go (S.insert x bound) b
       LetPair x y e b -> LetPair x y <$> go bound e <*> go (S.insert x (S.insert y bound)) b
-      Case e alts -> Case <$> go bound e <*> mapM (\(c, xs, b) -> (,xs,) <$> plain pos c <*> go (bound <> S.fromList xs) b) alts
-      Handle l e cs -> Handle <$> plain pos l <*> go bound e <*> mapM (\(op, x, b) -> (,x,) <$> plain pos op <*> go (S.insert x bound) b) cs
-      Con c ts as -> Con <$> plain pos c <*> mapM (ty pos) ts <*> mapM (go bound) as
+      Case e alts -> Case <$> go bound e <*> mapM (\(c, xs, b) -> (,xs,) <$> name pos c <*> go (bound <> S.fromList xs) b) alts
+      Handle l e cs -> Handle <$> name pos l <*> go bound e <*> mapM (\(op, x, b) -> (,x,) <$> plain pos op <*> go (S.insert x bound) b) cs
+      Con c ts as -> Con <$> name pos c <*> mapM (ty pos) ts <*> mapM (go bound) as
       TyApp f ts es -> TyApp <$> name pos f <*> mapM (ty pos) ts <*> mapM (effs pos) es
-      Cocase dn ts bs -> Cocase <$> plain pos dn <*> mapM (ty pos) ts <*> mapM (\(o, b) -> (o,) <$> go bound b) bs
-      BitsLit b fs -> BitsLit <$> plain pos b <*> mapM (\(f, e) -> (f,) <$> go bound e) fs
+      Cocase dn ts bs -> Cocase <$> name pos dn <*> mapM (ty pos) ts <*> mapM (\(o, b) -> (o,) <$> go bound b) bs
+      BitsLit b fs -> BitsLit <$> name pos b <*> mapM (\(f, e) -> (f,) <$> go bound e) fs
       Perform op e -> Perform <$> plain pos op <*> go bound e
       _ -> descendM (go bound) tm
       where
