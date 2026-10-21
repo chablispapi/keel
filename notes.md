@@ -826,14 +826,47 @@ development for over a decade.
 **Suggested path:** M0 first, to see λ compile and run on the Mac. Then M1. Then choose between M2
 (the memory model, most novel) and M3 (running on a microcontroller, most fun).
 
-## 18. Open threads / next steps
+## 18. Real hardware: Raspberry Pi Pico 2 W (planned)
+
+Goal: run Keel firmware on real silicon, not only QEMU. The user has a Pico 2 W.
+
+**The board.** RP2350 chip: two ARM Cortex-M33 cores and two RISC-V Hazard3 cores (32-bit,
+RV32IMAC plus extensions); the boot image selects the architecture. Start on the RISC-V cores,
+since Keel already has a RISC-V back end. On the "W" boards the onboard LED is wired to the
+wireless chip (CYW43439), not to a GPIO, so blinking it is a project of its own.
+
+**Getting output.** The language isn't the blocker: Keel firmware already writes bytes to a UART
+through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
+- **Raspberry Pi Debug Probe or a USB-to-serial adapter on GPIO0/GPIO1 + GND (preferred).** It
+  appears on the Mac as `/dev/cu.usb…`; Claude can capture it non-interactively (`stty` +
+  a background read) and check the same `result:` / `keel-stats:` lines as on QEMU. The Debug
+  Probe also flashes and resets over SWD (OpenOCD), so no BOOTSEL button presses.
+- **An external LED and resistor on a GPIO pin**: enough for a first "it runs" blink, but no
+  results can be read back.
+- **Serial over the Pico's own USB port** needs a USB device stack (USB CDC; the C SDK uses
+  TinyUSB). Possible later, but a large project.
+
+**Work needed:**
+1. **32-bit RISC-V output (RV32).** The back end is RV64, and Keel assumes 64-bit values. On
+   RV32, either implement `i64` with register pairs and 32-bit heap words, or start with `i64`
+   unsupported. This is the largest piece.
+2. **Boot image:** the RP2350 boot ROM needs an image definition block, packaged as UF2; flash by
+   copying to the BOOTSEL drive or with `picotool` (`brew install picotool`).
+3. **Startup code:** release peripherals from reset, configure clocks, select the pin functions
+   for UART0, set the baud rate. Ordinary `MMIO` register writes, a natural first Keel driver.
+4. **Tests:** run the native test programs on the board over serial, like the QEMU runs.
+
+**Decision pending:** which output path. Waiting for an adapter or Debug Probe.
+
+## 19. Open threads / next steps
 
 - [ ] Work out what opt-in `Lazy a` costs without a GC (section 7).
 - [ ] Prototype C header import and the `Unsafe`/`Tainted` effects (section 10).
 - [ ] Design the unsafe C-level dialect and a stage-1 C → dialect translator (section 11).
 - [ ] Design the real-time effects (`Alloc`, `Block`, `Diverge`) and the termination checker (section 13).
 - [ ] Design refinement types and constant-time `Secret a` typing; choose translation validation or a verified compiler (section 14).
-- [ ] First RISC-V milestone: "hello world" over the QEMU `virt` UART (section 15).
+- [x] First RISC-V milestone: "hello world" over the QEMU `virt` UART (section 15). Done in M3: `keelc qemu ref/examples/firmware/hello.kl`.
+- [ ] Run Keel on the Pico 2 W (section 18): RV32 back end, RP2350 boot image and startup, UART output through a Debug Probe or USB-serial adapter.
 - [x] Write the core calculus formally: linear types + second-class refs + effects + codata (section 16). Done: `spec/core.md` (Keel Core, stages 1–4) with the Haskell reference checker/evaluator in `ref/` (`cd ref && cabal test`).
 - [x] Turn the evaluator from section 5 into a tiny compiler: λ-terms → ANF → closure conversion → ARM64 asm that assembles and runs on this Mac. Done (M0): `ref/src/Keel/Lower.hs` + `AArch64.hs`, checked against the reference evaluator by `ref/test/Native.hs`.
 - [ ] Deep dive: closures and defunctionalization (eval/apply, partial application).
