@@ -2,18 +2,19 @@
 -- and linked with the system @cc@ (notes.md §12, §17).
 --
 -- Deliberately simple: every variable lives in a stack slot and values pass through scratch
--- registers x9–x16, so nothing needs saving across calls.
+-- registers x9–x17, so nothing needs saving across calls.
 -- ponytail: no register allocation (M4); a call in tail position reuses the frame, so loops
 -- written as tail recursion run in constant stack.
 --
 -- Conventions: every function is called with its closure (or codata block) in x0 and its
--- argument in x1, and returns its result in x0. Heap blocks come from a never-freed bump
--- arena; running out is a panic. Panics exit with status 101 after flushing stdout.
+-- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
+-- word at offset -8 (reference count, size, pointer map) and are recycled through free lists
+-- (spec/memory.md). Panics exit with status 101 after flushing stdout.
 module Keel.AArch64 (compileNative, emitProgram) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.List (nub)
 import Data.Map.Strict qualified as M
 import Keel.Check (checkProgram)
@@ -32,6 +33,10 @@ compileNative p = do
 
 heapSize :: Integer
 heapSize = 64 * 1024 * 1024
+
+-- | Blocks of up to this many payload words are recycled through free lists.
+maxSmall :: Int
+maxSmall = 64
 
 data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String}
 
@@ -69,25 +74,28 @@ printStr s = do
 
 -- | Emit a program whose @main@ has type @mainTy@.
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainE) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty))))
+emitProgram decls mainTy (LProg funs statics mainF) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty))))
   where
     printers = printerTypes decls mainTy
     gen = do
       line "\t.section __TEXT,__text,regular,pure_instructions"
       forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
-      emitFun "_kf_main" (Fun "main" "%unused" 1 [] mainE)
+      emitFun "_kf_main" mainF
       emitEntry printers mainTy
       forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
       emitRuntime
       line "\t.section __DATA,__data"
       line "\t.p2align 3"
       forM_ statics $ \(i, name, fs) -> do
+        ins ".quad 0x80000000\t\t// header: immortal"
         line ("_kc_" ++ show i ++ ":\t\t\t// static block of " ++ name)
         forM_ fs $ \f -> ins (".quad _kf_" ++ show f)
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
       ins (".quad _keel_heap+" ++ show heapSize)
       line ("\t.zerofill __DATA,__bss,_keel_heap," ++ show heapSize ++ ",4")
+      line ("\t.zerofill __DATA,__bss,_keel_freelists," ++ show (8 * (maxSmall + 1)) ++ ",3")
+      line "\t.zerofill __DATA,__bss,_keel_stats,32,3"
       line "\t.section __TEXT,__cstring,cstring_literals"
       strs <- gets gsStrings
       forM_ (M.toList strs) $ \(s, l) -> line (l ++ ":\t.asciz " ++ show s)
@@ -96,7 +104,7 @@ emitProgram decls mainTy (LProg funs statics mainE) = unlines (reverse (gsLines 
 
 -- | A function with its stack frame: one 8-byte slot per variable.
 emitFun :: String -> Fun -> G ()
-emitFun lbl (Fun name x base env body) = do
+emitFun lbl (Fun name x base env envPtrs dropsSelf body) = do
   let vars = nub (x : env ++ bound body)
       slots = M.fromList (zip vars [0 :: Int ..])
       frame = 16 * ((8 * length vars + 15) `div` 16)
@@ -109,6 +117,9 @@ emitFun lbl (Fun name x base env body) = do
     ins ("ldr x9, [x0, #" ++ show (8 * j) ++ "]")
     store slots "x9" v
   store slots "x1" x
+  -- Own the captured pointers, then release the block (x0 is still the block: dup uses x16/x17).
+  forM_ envPtrs $ \v -> dup slots v
+  when dropsSelf $ ins "bl _keel_drop"
   expr slots Nothing body
 
 subSp :: Int -> G ()
@@ -125,7 +136,10 @@ bound e = case e of
   Ret _ -> []
   Bind x _ rest -> x : bound rest
   BindIf x _ a b rest -> x : bound a ++ bound b ++ bound rest
-  BindCase x _ bs rest -> x : concatMap (bound . snd) bs ++ bound rest
+  BindCase x _ bs rest -> x : concat [bound b | (_, _, b) <- bs] ++ bound rest
+  Dup _ rest -> bound rest
+  Drop _ rest -> bound rest
+  DropReuse _ tok rest -> tok : bound rest
 
 type Slots = M.Map String Int
 
@@ -160,6 +174,19 @@ movImm r n =
     chunks = [(u `shiftR` (16 * k)) .&. 0xffff | k <- [0 .. 3]]
     shift k = if k == 0 then "" else ", lsl #" ++ show (16 * k)
 
+-- | Increment the reference count of a variable's block (inline; uses x16, x17). Immortal
+-- blocks (bit 31) are skipped; a count of zero means a freed block, which is a bug.
+dup :: Slots -> String -> G ()
+dup slots v = do
+  lSkip <- newLabel
+  load' slots "x16" v
+  ins "ldr w17, [x16, #-8]"
+  ins ("tbnz w17, #31, " ++ lSkip)
+  ins "cbz w17, _keel_panic_rc"
+  ins "add w17, w17, #1"
+  ins "str w17, [x16, #-8]"
+  line (lSkip ++ ":")
+
 -- | @join@ is Nothing in tail position (return), or the slot and label a branch delivers to.
 expr :: Slots -> Maybe (String, String) -> Expr -> G ()
 expr slots join e = case e of
@@ -192,16 +219,26 @@ expr slots join e = case e of
     atom slots "x9" s
     ins "ldr x9, [x9]"
     -- Compare against every tag but the last, which falls through.
-    forM_ (zip (init bs) labels) $ \((tag, _), l) -> do
+    forM_ (zip (init bs) labels) $ \((tag, _, _), l) -> do
       ins ("cmp x9, #" ++ show tag)
       ins ("b.eq " ++ l)
     ins ("b " ++ last labels)
-    forM_ (zip bs labels) $ \((_, body), l) -> do
+    forM_ (zip bs labels) $ \((_, _, body), l) -> do
       line (l ++ ":")
       expr slots (target tailPos x lJoin) body
     unless tailPos $ do
       line (lJoin ++ ":")
       expr slots join rest
+  Dup v rest -> dup slots v >> expr slots join rest
+  Drop v rest -> do
+    load' slots "x0" v
+    ins "bl _keel_drop"
+    expr slots join rest
+  DropReuse v tok rest -> do
+    load' slots "x0" v
+    ins "bl _keel_drop_reuse"
+    store slots "x0" tok
+    expr slots join rest
   where
     isNothingJ = case join of
       Nothing -> True
@@ -231,18 +268,17 @@ expr slots join e = case e of
         ins "br x16"
       _ -> Nothing
 
--- | Allocate @n@ words from the arena into x0 (uses x13–x15).
-alloc :: Int -> G ()
-alloc n = do
-  address "x13" "_keel_heap_ptr"
-  ins "ldr x0, [x13]"
-  if 8 * n < 4096
-    then ins ("add x14, x0, #" ++ show (8 * n))
-    else movImm "x14" (toInteger (8 * n)) >> ins "add x14, x0, x14"
-  ins "ldr x15, [x13, #8]"
-  ins "cmp x14, x15"
-  ins "b.hi _keel_panic_oom"
-  ins "str x14, [x13]"
+-- | Allocate a block of @n@ payload words with a pointer map into x0 (header written).
+-- The runtime allocator clobbers only x0, x1 and x13–x16.
+alloc :: Int -> Integer -> G ()
+alloc n bm = do
+  movImm "x0" (toInteger (max 1 n))
+  movImm "x1" bm
+  ins "bl _keel_alloc"
+
+-- | Header word of a fresh block: count 1, size, pointer map.
+header :: Int -> Integer -> Integer
+header n bm = 1 .|. (toInteger (max 1 n) `shiftL` 32) .|. (bm `shiftL` 48)
 
 -- | Compute a right-hand side into x0.
 rhsCode :: Slots -> Rhs -> G ()
@@ -264,13 +300,13 @@ rhsCode slots rhs = case rhs of
     address "x0" ("_kc_" ++ show i)
     atom slots "x1" a
     ins ("bl _kf_" ++ show i)
-  RClosure i fvs -> do
-    alloc (1 + length fvs)
+  RClosure i fvs bm -> do
+    alloc (1 + length fvs) bm
     address "x11" ("_kf_" ++ show i)
     ins "str x11, [x0]"
     storeAll 1 fvs
-  RCodata is fvs -> do
-    alloc (length is + length fvs)
+  RCodata is fvs bm -> do
+    alloc (length is + length fvs) bm
     forM_ (zip [0 :: Int ..] is) $ \(j, i) -> do
       address "x11" ("_kf_" ++ show i)
       ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
@@ -280,13 +316,26 @@ rhsCode slots rhs = case rhs of
     ins "mov x1, #0"
     ins ("ldr x16, [x0, #" ++ show (8 * i) ++ "]")
     ins "blr x16"
-  RAlloc tag as -> do
-    alloc (1 + length as)
-    movImm "x11" tag
-    ins "str x11, [x0]"
-    forM_ (zip [1 :: Int ..] as) $ \(j, a) -> do
-      atom slots "x11" a
-      ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
+  RAlloc tag bm as -> do
+    alloc (1 + length as) bm
+    fields tag as
+  RAllocAt tok tag bm as -> do
+    -- In place if the token holds a block (it was unique); otherwise allocate.
+    lFresh <- newLabel
+    lDone <- newLabel
+    load' slots "x0" tok
+    ins ("cbz x0, " ++ lFresh)
+    movImm "x15" (header (1 + length as) bm)
+    ins "str x15, [x0, #-8]"
+    address "x13" "_keel_stats"
+    ins "ldr x14, [x13, #16]"
+    ins "add x14, x14, #1"
+    ins "str x14, [x13, #16]"
+    ins ("b " ++ lDone)
+    line (lFresh ++ ":")
+    alloc (1 + length as) bm
+    line (lDone ++ ":")
+    fields tag as
   RField a i -> do
     atom slots "x9" a
     ins ("ldr x0, [x9, #" ++ show (8 * (i + 1)) ++ "]")
@@ -305,6 +354,13 @@ rhsCode slots rhs = case rhs of
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
       load' slots "x11" v
       ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
+    fields :: Integer -> [Atom] -> G ()
+    fields tag as = do
+      movImm "x11" tag
+      ins "str x11, [x0]"
+      forM_ (zip [1 :: Int ..] as) $ \(j, a) -> do
+        atom slots "x11" a
+        ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
 
 -- | Integer arithmetic (spec §2.5) with x9, x10 as operands and the result in x0. Values are
 -- canonical: sign- or zero-extended to 64 bits by their type.
@@ -325,14 +381,14 @@ arith it@(IntTy sgn n) ov aop
           line (lDone ++ ":")
         Optional -> do
           lDone <- newLabel
-          ins "mov x12, x0"
-          alloc 2
+          ins "mov x12, x0" -- the allocator leaves x9–x12 alone
+          alloc 2 0
           ins "mov x11, #1" -- Some
           ins "str x11, [x0]"
           ins "str x12, [x0, #8]"
           ins ("b " ++ lDone)
           line (lOvf ++ ":")
-          alloc 1
+          alloc 1 0
           ins "str xzr, [x0]" -- None
           line (lDone ++ ":")
         _ -> pure ()
@@ -412,7 +468,7 @@ dataOf decls d = case [(ps, cs) | Data _ d' ps cs <- decls, d' == d] of
   r : _ -> Just r
   [] -> Nothing
 
--- | A printer: value in x0, prints it in the reference evaluator's format (Show Value).
+-- | A printer: value in x0 (borrowed), prints it in the reference evaluator's format.
 emitPrinter :: [Decl] -> M.Map String (Ty, String) -> String -> Ty -> G ()
 emitPrinter decls printers lbl t = do
   line "\t.p2align 2"
@@ -478,7 +534,8 @@ emitPrinter decls printers lbl t = do
         Just (_, l) -> ins ("bl " ++ l)
         Nothing -> printStr "..."
 
--- | @_main@ runs the Keel main and prints its result as a last line.
+-- | @_main@ runs the Keel main, prints its result as a last line, drops it, and with
+-- KEEL_STATS set reports the allocator counters on stderr.
 emitEntry :: M.Map String (Ty, String) -> Ty -> G ()
 emitEntry printers t = do
   line "\t.globl _main"
@@ -486,28 +543,192 @@ emitEntry printers t = do
   line "_main:"
   ins "stp x29, x30, [sp, #-16]!"
   ins "mov x29, sp"
-  ins "sub sp, sp, #16"
+  ins "sub sp, sp, #64"
+  ins "mov x0, #0"
   ins "bl _kf_main"
-  ins "str x0, [sp]"
+  ins "str x0, [sp, #48]"
   printStr "result: "
-  ins "ldr x0, [sp]"
+  ins "ldr x0, [sp, #48]"
   forM_ (M.lookup (prettyTy t) printers) $ \(_, l) -> ins ("bl " ++ l)
   printStr "\n"
+  when (isPtr t) $ ins "ldr x0, [sp, #48]" >> ins "bl _keel_drop"
+  lNoStats <- newLabel
+  name <- str "KEEL_STATS"
+  address "x0" name
+  ins "bl _getenv"
+  ins ("cbz x0, " ++ lNoStats)
+  -- dprintf(2, fmt, allocs, recycled, in-place, freed, live): variadic arguments on the stack
+  address "x13" "_keel_stats"
+  ins "ldp x9, x10, [x13]"
+  ins "ldp x11, x12, [x13, #16]"
+  ins "stp x9, x10, [sp]"
+  ins "stp x11, x12, [sp, #16]"
+  ins "add x14, x9, x10"
+  ins "add x14, x14, x11"
+  ins "sub x14, x14, x12"
+  ins "str x14, [sp, #32]"
+  fmt <- str "keel-stats: allocs=%lld recycled=%lld inplace=%lld freed=%lld live=%lld\n"
+  ins "mov x0, #2"
+  address "x1" fmt
+  ins "bl _dprintf"
+  line (lNoStats ++ ":")
   ins "mov x0, #0"
   epilogue
   ins "ret"
 
--- | Panics write a message to stderr and exit with status 101. C @exit@ flushes stdout first,
--- so output written before the panic is kept (spec §2.5).
+-- Runtime ---------------------------------------------------------------------------------
+
+-- | Allocation, reference counting and panics. Header word: bits 0–31 reference count (bit 31
+-- marks an immortal static block, 0 a freed one), 32–47 payload size in words, 48–63 pointer
+-- map. Statistics at @_keel_stats@: fresh allocations, recycled, in place, freed.
 emitRuntime :: G ()
 emitRuntime = do
+  -- _keel_alloc: x0 = payload words, x1 = pointer map → x0 = payload. Clobbers x13–x16 only.
+  fn "_keel_alloc"
+  ins ("cmp x0, #" ++ show maxSmall)
+  ins "b.hi L_alloc_bump"
+  address "x13" "_keel_freelists"
+  ins "ldr x14, [x13, x0, lsl #3]"
+  ins "cbz x14, L_alloc_bump"
+  ins "ldr x15, [x14]" -- next free block
+  ins "str x15, [x13, x0, lsl #3]"
+  stat 8 "x15" "x16"
+  ins "b L_alloc_header"
+  line "L_alloc_bump:"
+  address "x13" "_keel_heap_ptr"
+  ins "ldr x14, [x13]"
+  ins "add x15, x14, x0, lsl #3"
+  ins "add x15, x15, #8"
+  ins "ldr x16, [x13, #8]"
+  ins "cmp x15, x16"
+  ins "b.hi _keel_panic_oom"
+  ins "str x15, [x13]"
+  ins "add x14, x14, #8"
+  stat 0 "x15" "x16"
+  line "L_alloc_header:"
+  ins "lsl x15, x0, #32"
+  ins "orr x15, x15, x1, lsl #48"
+  ins "orr x15, x15, #1"
+  ins "str x15, [x14, #-8]"
+  ins "mov x0, x14"
+  ins "ret"
+
+  -- _keel_drop: x0 = block. Decrement; at zero, drop the children and free the block. The last
+  -- pointer child is handled by looping, so dropping a long list uses constant stack.
+  fn "_keel_drop"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  line "L_drop_top:"
+  ins "ldr w9, [x0, #-8]"
+  ins "tbnz w9, #31, L_drop_ret"
+  ins "cbz w9, _keel_panic_rc"
+  ins "sub w9, w9, #1"
+  ins "str w9, [x0, #-8]"
+  ins "cbnz w9, L_drop_ret"
+  stat 24 "x12" "x13"
+  ins "str x0, [sp, #16]"
+  ins "ldr x11, [x0, #-8]"
+  ins "lsr x11, x11, #48"
+  line "L_drop_loop:"
+  ins "cbz x11, L_drop_free"
+  ins "sub x13, x11, #1"
+  ins "tst x11, x13"
+  ins "b.eq L_drop_last" -- one pointer child left
+  ins "rbit x13, x11"
+  ins "clz x13, x13"
+  ins "mov x14, #1"
+  ins "lsl x14, x14, x13"
+  ins "bic x11, x11, x14"
+  ins "str x11, [sp, #24]"
+  ins "ldr x9, [sp, #16]"
+  ins "ldr x0, [x9, x13, lsl #3]"
+  ins "bl _keel_drop"
+  ins "ldr x11, [sp, #24]"
+  ins "b L_drop_loop"
+  line "L_drop_last:"
+  ins "rbit x13, x11"
+  ins "clz x13, x13"
+  ins "ldr x0, [sp, #16]"
+  ins "ldr x9, [x0, x13, lsl #3]"
+  ins "str x9, [sp, #24]"
+  ins "bl _keel_free_block"
+  ins "ldr x0, [sp, #24]"
+  ins "b L_drop_top"
+  line "L_drop_free:"
+  ins "ldr x0, [sp, #16]"
+  ins "bl _keel_free_block"
+  line "L_drop_ret:"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
+  -- _keel_free_block: x0 = block with count 0 → push it on its size's free list.
+  fn "_keel_free_block"
+  ins "ldr x10, [x0, #-8]"
+  ins "ubfx x11, x10, #32, #16"
+  ins ("cmp x11, #" ++ show maxSmall)
+  ins "b.hi L_free_ret" -- ponytail: large blocks are not recycled
+  address "x12" "_keel_freelists"
+  ins "ldr x13, [x12, x11, lsl #3]"
+  ins "str x13, [x0]"
+  ins "str x0, [x12, x11, lsl #3]"
+  line "L_free_ret:"
+  ins "ret"
+
+  -- _keel_drop_reuse: x0 = block → x0 = the block, if it was unique (its children dropped,
+  -- count 0 until reused), or 0 after an ordinary decrement.
+  fn "_keel_drop_reuse"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  ins "ldr w9, [x0, #-8]"
+  ins "tbnz w9, #31, L_reuse_none"
+  ins "cbz w9, _keel_panic_rc"
+  ins "cmp w9, #1"
+  ins "b.ne L_reuse_shared"
+  stat 24 "x12" "x13"
+  ins "str x0, [sp, #16]"
+  ins "ldr x11, [x0, #-8]"
+  ins "lsr x11, x11, #48"
+  line "L_reuse_loop:"
+  ins "cbz x11, L_reuse_done"
+  ins "rbit x13, x11"
+  ins "clz x13, x13"
+  ins "mov x14, #1"
+  ins "lsl x14, x14, x13"
+  ins "bic x11, x11, x14"
+  ins "str x11, [sp, #24]"
+  ins "ldr x9, [sp, #16]"
+  ins "ldr x0, [x9, x13, lsl #3]"
+  ins "bl _keel_drop"
+  ins "ldr x11, [sp, #24]"
+  ins "b L_reuse_loop"
+  line "L_reuse_done:"
+  ins "ldr x0, [sp, #16]"
+  ins "str wzr, [x0, #-8]"
+  ins "b L_reuse_ret"
+  line "L_reuse_shared:"
+  ins "sub w9, w9, #1"
+  ins "str w9, [x0, #-8]"
+  line "L_reuse_none:"
+  ins "mov x0, #0"
+  line "L_reuse_ret:"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"
   panic "_keel_panic_oom" "panic: out of memory\n"
+  panic "_keel_panic_rc" "panic: reference count error\n"
   where
+    fn lbl = line "\t.p2align 2" >> line (lbl ++ ":")
+    -- Increment the statistics counter at this byte offset, using two free scratch registers.
+    stat :: Int -> String -> String -> G ()
+    stat off r1 r2 = do
+      address r1 "_keel_stats"
+      ins ("ldr " ++ r2 ++ ", [" ++ r1 ++ ", #" ++ show off ++ "]")
+      ins ("add " ++ r2 ++ ", " ++ r2 ++ ", #1")
+      ins ("str " ++ r2 ++ ", [" ++ r1 ++ ", #" ++ show off ++ "]")
     panic lbl msg = do
       l <- str msg
-      line "\t.p2align 2"
-      line (lbl ++ ":")
+      fn lbl
       ins "mov x0, #2"
       address "x1" l
       ins ("mov x2, #" ++ show (length msg))

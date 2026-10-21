@@ -1,6 +1,8 @@
 -- | Native differential tests: each program is compiled to ARM64 assembly, linked with the
 -- system @cc@ and run. Its output must match the reference evaluator: same @out@ trace, and
 -- the same result (last line @result: …@, printed like the evaluator) or a panic (exit 101).
+-- Every run also reports its allocator counters (KEEL_STATS): a program that finishes must
+-- end with no live heap blocks, so a missing drop (a leak) fails the test.
 --
 -- Programs: every accepted example of spec/core.md (test/Cases.hs), back-end tests below, and
 -- the example files (examples/*.kl), which also have hand-written expected output.
@@ -18,9 +20,10 @@ import Keel.Parser (parseProgram)
 import Keel.Mono (compile)
 import Keel.Syntax
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
-import System.Process (readProcessWithExitCode)
+import System.Process (env, proc, readCreateProcessWithExitCode, readProcessWithExitCode)
 
 tI :: Ty
 tI = TInt i64
@@ -136,9 +139,24 @@ cases =
   , ("u32 saturating mul", Program [] (Prim (Arith Saturate Mul) (IntLit u32 4000000000) (IntLit u32 4000000000)))
   , ("u16 +? overflow", Program [] (Prim (Arith Optional Add) (IntLit u16 65535) (IntLit u16 1)))
   , ("i16 wrapping sub", Program [] (Prim (Arith Wrap Sub) (IntLit i16 (-32768)) (IntLit i16 1)))
+  , ("memory is freed: 10M pairs in a 64 MB heap", Program [churnDef] (App (App (Var "churn") (int 10000000)) (int 0)))
   ]
 
--- | Programs M0 must refuse cleanly.
+-- def churn : i64 → i64 →{Panic, Diverge} i64: allocates a pair per iteration and drops it.
+-- 10 million pairs are ~320 MB, five times the heap: this only finishes if memory is freed.
+churnDef :: Decl
+churnDef =
+  Def "churn" (fn tI (fnE [panicE, divergeE] tI tI)) $
+    Lam "i" tI $
+      Lam "acc" tI $
+        If
+          (lt (Var "i") (int 1))
+          (Var "acc")
+          ( LetPair "p" "q" (Pair (Var "i") (Var "acc")) $
+              App (App (Var "churn") (sub (Var "p") (int 1))) (add (Var "q") (int 1))
+          )
+
+-- | Programs that must be refused cleanly.
 unsupportedCases :: [(String, Program)]
 unsupportedCases =
   [("effect handlers (M3)", Program [] (Handle ioE (Perform "out" (int 5)) [("out", "x", UnitLit)]))]
@@ -167,6 +185,7 @@ exampleFiles =
   , ("examples/uart.kl", (Just "()", [72, 105]))
   , ("examples/overflow.kl", (Nothing, [1, 2]))
   , ("examples/widths.kl", (Just "(4, (255, (None, Some(3))))", []))
+  , ("examples/reuse.kl", (Just "1500500", []))
   ]
 
 -- | Parse and infer an example; check the evaluator against the expected output, and return
@@ -214,12 +233,35 @@ runCase dir i (name, prog) = case (compile prog, compileNative prog) of
     case ccCode of
       ExitFailure _ -> pure [failMsg ("cc failed:\n" ++ ccErr)]
       ExitSuccess -> do
-        (code, stdout, _) <- readProcessWithExitCode exe [] ""
+        environment <- getEnvironment
+        (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) ""
         let native = parseRun code (lines stdout)
             reference = reduce (evalProgram mono)
-        pure [failMsg ("native " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]
+            stats = parseStats stderr
+        pure $
+          [failMsg ("native " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]
+            ++ [failMsg ("leak: " ++ show stats) | code == ExitSuccess, fmap live stats /= Just 0]
+            ++ [ failMsg ("expected most cells to be reused in place: " ++ show stats)
+               | name == "examples/reuse.kl"
+               , maybe True (\s -> inplace s < 990000 || allocs s > 5000) stats
+               ]
   where
     failMsg msg = "FAIL " ++ name ++ ": " ++ msg
+
+data Stats = Stats {allocs, recycled, inplace, freed, live :: Integer}
+  deriving (Show)
+
+-- | Parse @keel-stats: allocs=… recycled=… inplace=… freed=… live=…@ from stderr.
+parseStats :: String -> Maybe Stats
+parseStats err = case [l | l <- lines err, "keel-stats:" `isInfixOf` l] of
+  l : _ -> case mapM (readNum . drop 1 . dropWhile (/= '=')) (drop 1 (words l)) of
+    Just [a, r, i, f, v] -> Just (Stats a r i f v)
+    _ -> Nothing
+  [] -> Nothing
+  where
+    readNum s = case reads s of
+      [(n, "")] -> Just n
+      _ -> Nothing
 
 -- | (result line or Nothing for a panic, out trace)
 type Run = (Maybe String, [Integer])

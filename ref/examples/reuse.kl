@@ -1,0 +1,21 @@
+-- In-place updates from pure code (spec/memory.md): map takes each Cons cell apart and
+-- builds a new one of the same size, so when the list is not shared, the cell is reused.
+-- Run with KEEL_STATS=1 to see the counters: ~1,000 fresh allocations, ~1,000,000 in place.
+
+data List a = Nil | Cons(a, Box (List a))
+
+def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
+  \f xs. case xs of
+    { Nil -> Nil
+    | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
+
+def range : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \n acc. if n < 1 then acc else range (n - 1) (Cons(n, box acc))
+
+def repeat : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \k xs. if k < 1 then xs else repeat (k - 1) (map (\x. x + 1) xs)
+
+def sum : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> x + sum (unbox rest) }
+
+main = sum (repeat 1000 (range 1000 Nil))
