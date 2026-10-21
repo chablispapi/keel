@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- | Native differential tests: each program is compiled to ARM64 assembly, linked with the
 -- system @cc@ and run. Its output must match the reference evaluator: same @out@ trace, and
 -- the same result (last line @result: …@, printed like the evaluator) or a panic (exit 101).
@@ -6,17 +8,22 @@
 --
 -- Programs: every accepted example of spec/core.md (test/Cases.hs), back-end tests below, and
 -- the example files (examples/*.kl), which also have hand-written expected output.
+--
+-- When Homebrew's llvm, lld and qemu are installed, every program also runs on the RISC-V back
+-- end, freestanding on QEMU's virt board, with the same checks; so does examples/firmware.
 module Main (main) where
 
 import Cases (Expect (..))
 import Cases qualified
 import Control.Monad (forM, unless)
-import Data.List (isInfixOf, stripPrefix)
+import Data.List (isInfixOf, isPrefixOf, stripPrefix)
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative)
 import Keel.Eval (Outcome (..), evalProgram)
 import Keel.Infer (inferProgram)
 import Keel.Parser (parseProgram)
+import Keel.RiscV (compileRiscV)
+import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
 import Keel.Syntax
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory)
@@ -159,20 +166,14 @@ churnDef =
 -- | Programs that must be refused cleanly.
 unsupportedCases :: [(String, Program)]
 unsupportedCases =
-  [("effect handlers (M3)", Program [] (Handle ioE (Perform "out" (int 5)) [("out", "x", UnitLit)]))]
+  [("a block with a pointer beyond word 16", Program [Data False "Big" [] [("Big", replicate 16 tI ++ [TData "Big2" []])], Data False "Big2" [] [("B2", [])]] (Con "Big" [] (replicate 16 (int 0) ++ [Con "B2" [] []])))]
 
--- | Accepted spec examples; those using handlers are skipped until M3.
+-- | Accepted spec examples.
 specCases :: [(String, Program)]
-specCases = [("spec: " ++ name, p) | (name, p, e) <- Cases.cases, runs e, not (usesHandlers p)]
+specCases = [("spec: " ++ name, p) | (name, p, e) <- Cases.cases, runs e]
   where
     runs (Rejects _) = False
     runs _ = True
-
-usesHandlers :: Program -> Bool
-usesHandlers (Program _ m) = any isHandle (universe m)
-  where
-    isHandle Handle {} = True
-    isHandle _ = False
 
 -- | Example files and what they must print: (result, or Nothing for a panic; out trace).
 exampleFiles :: [(FilePath, Run)]
@@ -200,7 +201,7 @@ loadExample (path, expected) = do
       Right mono -> do
         let got = reduce (evalProgram mono)
             fails = ["FAIL " ++ path ++ ": evaluator gave " ++ show got ++ ", expected " ++ show expected | got /= expected]
-        pure (fails, [(path, core) | not (usesHandlers core)])
+        pure (fails, [(path, core)])
 
 main :: IO ()
 main = do
@@ -219,7 +220,53 @@ main = do
       total = length programs + length unsupportedCases + length exampleFiles
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
-  unless (null allFailures) exitFailure
+  rvFailures <-
+    findRiscVTools >>= \case
+      Nothing -> putStrLn "RISC-V: llvm, lld or qemu not found; skipped" >> pure []
+      Just tools -> do
+        fs <- concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runRiscV tools dir))
+        fw <- firmware tools dir
+        let n = length programs + 1
+            bad = fs ++ fw
+        mapM_ putStrLn bad
+        putStrLn (show (n - length bad) ++ "/" ++ show n ++ " RISC-V cases passed (QEMU virt)")
+        pure bad
+  unless (null allFailures && null rvFailures) exitFailure
+
+-- | Compile for RISC-V, boot in QEMU, and compare with the reference evaluator.
+runRiscV :: RiscVTools -> FilePath -> Int -> (String, Program) -> IO [String]
+runRiscV tools dir i (name, prog) = case (compile prog, compileRiscV prog) of
+  (Left e, _) -> pure [failMsg ("does not type-check: " ++ show e)]
+  (_, Left e) -> pure [failMsg e]
+  (Right mono, Right asm) ->
+    buildRiscV tools (dir </> ("rv" ++ show i)) asm >>= \case
+      Left e -> pure [failMsg e]
+      Right elf -> do
+        (code, uart) <- runQemu tools elf
+        let ls = lines uart
+            stats = parseStats (unlines (filter ("keel-stats:" `isPrefixOf`) ls))
+            rest = filter (\l -> not ("keel-stats:" `isPrefixOf` l || "panic:" `isPrefixOf` l)) ls
+            native = parseRun code rest
+            reference = reduce (evalProgram mono)
+        pure $
+          [failMsg ("RISC-V " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]
+            ++ [failMsg ("leak: " ++ show stats) | code == ExitSuccess, fmap live stats /= Just 0]
+  where
+    failMsg msg = "FAIL [riscv] " ++ name ++ ": " ++ msg
+
+-- | The firmware example drives the board's UART itself.
+firmware :: RiscVTools -> FilePath -> IO [String]
+firmware tools dir = do
+  let path = "examples/firmware/hello.kl"
+  src <- readFile path
+  case parseProgram path src >>= either (Left . show) Right . inferProgram >>= compileRiscV of
+    Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
+    Right asm ->
+      buildRiscV tools (dir </> "firmware") asm >>= \case
+        Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
+        Right elf -> do
+          (code, uart) <- runQemu tools elf
+          pure ["FAIL [riscv] " ++ path ++ ": got " ++ show (code, uart) | code /= ExitSuccess || not ("Hi!\nresult: ()\n" `isPrefixOf` uart)]
 
 runCase :: FilePath -> Int -> (String, Program) -> IO [String]
 runCase dir i (name, prog) = case (compile prog, compileNative prog) of

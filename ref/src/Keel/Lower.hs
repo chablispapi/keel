@@ -3,7 +3,7 @@
 --
 -- Covered: all integer widths, Bool, Unit, arithmetic in every overflow mode, if, let,
 -- λ / λ°, application, recursive top-level definitions, data and case, Box, pairs, codata,
--- and the built-in @out@. Effect handlers come with M3 and are reported as unsupported.
+-- effect handlers and operations (M3).
 --
 -- Representation: every value is one 64-bit word. Integers are sign- or zero-extended to
 -- 64 bits by their type; Bool and Unit are 0/1 and 0. Data values, pairs, closures and codata
@@ -42,7 +42,10 @@ data Rhs
   | RAlloc Integer Integer [Atom]       -- ^ allocate a data block: tag, bitmap, fields
   | RAllocAt String Integer Integer [Atom] -- ^ the same, reusing a token's block if it has one
   | RField Atom Int                     -- ^ read field i of a data block (borrowed)
-  | ROut Atom                           -- ^ print an integer
+  | RPushHandler [(Int, Atom)] Integer  -- ^ push a handler frame: (operation number, clause closure)
+  | RPopHandler Atom                    -- ^ pop (and drop) the frame
+  | RPerform Int Atom                   -- ^ perform operation n: innermost handler, else the machine
+  | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
   deriving (Show)
 
 data Expr
@@ -82,7 +85,7 @@ data Info = Info
   , iCons :: M.Map String (Integer, String, [Ty]) -- ^ constructor ↦ (tag, data name, field types)
   , iParams :: M.Map String [String]              -- ^ data / codata name ↦ parameters
   , iObs :: M.Map String [(String, Ty)]           -- ^ codata name ↦ observations in order
-  , iOps :: M.Map String Ty                       -- ^ operation ↦ result type
+  , iOps :: M.Map String (Int, Ty, Ty)            -- ^ operation ↦ (number, argument, result)
   }
 
 -- | Values that live on the heap and are reference counted.
@@ -142,8 +145,9 @@ lower (Program userDecls main) = do
           , iCons = M.fromList [(c, (tag, d, fs)) | Data _ d _ cs <- decls, (tag, (c, fs)) <- zip [0 ..] cs]
           , iParams = M.fromList ([(d, ps) | Data _ d ps _ <- decls] ++ [(d, ps) | Codata d ps _ <- decls])
           , iObs = M.fromList [(d, os) | Codata d _ os <- decls]
-          , iOps = M.fromList (("out", TUnit) : [(op, r) | Effect _ ops <- decls, (op, _, r) <- ops])
+          , iOps = M.fromList [(op, (n, a, r)) | (n, (op, a, r)) <- zip [0 ..] allOps]
           }
+      allOps = concat (map snd builtinEffects) ++ [o | Effect _ os <- decls, o <- os]
   ((statics, mainF), s) <-
     runStateT
       ( do
@@ -193,6 +197,7 @@ expr info env tm k = case tm of
   Prim op a b -> case typeOf info env a of
     TInt it -> sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
+  Convert to e -> sub e $ \v -> bindRhs (RConv to v)
   Let x e b -> sub e $ \v -> do
     let t = typeOf info env e
     x' <- newVar x t
@@ -202,8 +207,8 @@ expr info env tm k = case tm of
     ea <- branch env a
     eb <- branch env b
     BindIf x vc ea eb <$> k (AVar x)
-  Lam x t b -> closure x t b
-  LLam x t b -> closure x t b
+  Lam x t b -> closure x t b k
+  LLam x t b -> closure x t b k
   App (Var g) a
     | Just (i, _) <- M.lookup g (iGlobals info)
     , g `S.member` iKnown info
@@ -256,9 +261,22 @@ expr info env tm k = case tm of
   Proj e o -> sub e $ \ve -> case typeOf info env e of
     TData d _ | Just i <- elemIndex o (map fst (M.findWithDefault [] d (iObs info))) -> bindRhs (RProj ve i)
     t -> lift (Left ("observation " ++ o ++ " on " ++ prettyTy t))
-  Perform "out" a -> sub a $ \va -> bindRhs (ROut va)
-  Perform op _ -> unsupported ("operation " ++ op ++ " (effect handlers are milestone M3)")
-  Handle {} -> unsupported "effect handlers (milestone M3)"
+  Perform op a -> case M.lookup op (iOps info) of
+    Just (n, _, _) -> sub a $ \va -> bindRhs (RPerform n va)
+    Nothing -> lift (Left ("unknown operation " ++ op))
+  -- Clauses become closures in a frame pushed for the body and popped after it.
+  Handle _ body cs -> clauses cs []
+    where
+      clauses [] acc = do
+        bm <- bitmap 0 (False : False : concat [[False, True] | _ <- acc])
+        fr <- newVar "frame" (TData "%frame" [])
+        rest <- expr info env body $ \v -> do
+          u <- newVar "pop" TUnit
+          Bind u (RPopHandler (AVar fr)) <$> k v
+        pure (Bind fr (RPushHandler (reverse acc) bm) rest)
+      clauses ((op, x, e) : more) acc = case M.lookup op (iOps info) of
+        Just (n, ta, _) -> closure x ta e $ \cv -> clauses more ((n, cv) : acc)
+        Nothing -> lift (Left ("unknown operation " ++ op))
   _ -> unsupported (takeWhile (/= ' ') (show tm))
   where
     ty = typeOf info env tm
@@ -278,8 +296,8 @@ expr info env tm k = case tm of
 
     ptrsOf captured = [ir | (_, ir, t) <- captured, isPtr t]
 
-    -- Lift the λ to a numbered function capturing its free locals.
-    closure x t b = do
+    -- Lift the λ to a numbered function capturing its free locals; @kk@ gets the closure.
+    closure x t b kk = do
       let captured = [(v, ir, vt) | v <- S.toList (S.delete x (freeVars b)), Just (ir, vt) <- [M.lookup v env]]
           fvs = [ir | (_, ir, _) <- captured]
       x' <- newVar x t
@@ -287,7 +305,8 @@ expr info env tm k = case tm of
       body <- expr info env' b (pure . Ret)
       i <- liftFun info (Fun ("λ" ++ x) x' 1 fvs (ptrsOf captured) True body)
       bm <- bitmap 1 [isPtr vt | (_, _, vt) <- captured]
-      bindRhs (RClosure i fvs bm)
+      c <- newVar "clo" (TFun t S.empty TUnit)
+      Bind c (RClosure i fvs bm) <$> kk (AVar c)
 
 -- | The type of a well-typed term (effects omitted: lowering doesn't need them).
 typeOf :: Info -> Env -> Term -> Ty
@@ -300,6 +319,7 @@ typeOf info env tm = case tm of
   Prim Lt _ _ -> TBool
   Prim (Arith Optional _) a _ -> TData "Option" [go a]
   Prim _ a _ -> go a
+  Convert to _ -> TInt to
   If _ a _ -> go a
   Lam x t b -> TFun t S.empty (typeOf info (M.insert x (x, t) env) b)
   LLam x t b -> TLFun t S.empty (typeOf info (M.insert x (x, t) env) b)
@@ -330,7 +350,7 @@ typeOf info env tm = case tm of
       | Just t <- lookup o (M.findWithDefault [] d (iObs info)) ->
           substTy (M.fromList (zip (M.findWithDefault [] d (iParams info)) tys)) M.empty t
     _ -> TUnit
-  Perform op _ -> M.findWithDefault TUnit op (iOps info)
+  Perform op _ -> maybe TUnit (\(_, _, r) -> r) (M.lookup op (iOps info))
   Handle _ e _ -> go e
   _ -> TUnit
   where
@@ -441,6 +461,9 @@ consumed rhs = case rhs of
   RProj a _ -> atomVars a
   RAlloc _ _ as -> concatMap atomVars as
   RAllocAt _ _ _ as -> concatMap atomVars as
+  RPushHandler cs _ -> concatMap (atomVars . snd) cs
+  RPopHandler a -> atomVars a
+  RPerform _ a -> atomVars a
   _ -> []
 
 -- | Variables a right-hand side only reads.

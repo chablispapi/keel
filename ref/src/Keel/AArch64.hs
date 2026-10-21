@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, emitProgram) where
+module Keel.AArch64 (compileNative, emitProgram, prepare, bound, printerTypes, dataOf, header, heapSize, maxSmall) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
@@ -25,11 +25,18 @@ import Keel.Syntax
 -- | The whole pipeline: check, elaborate, monomorphize, lower, emit.
 compileNative :: Program -> Either String String
 compileNative p = do
+  (decls, t, lp) <- prepare p
+  pure (emitProgram decls t lp)
+
+-- | The target-independent part of every back end: the core pipeline and lowering. Returns
+-- the declarations (with built-ins), @main@'s type, and the lowered program.
+prepare :: Program -> Either String ([Decl], Ty, LProg)
+prepare p = do
   mono <- either (Left . show) Right (compile p)
   (t, _) <- either (Left . show) Right (checkProgram mono)
   lp <- lower mono
   let Program decls _ = mono
-  pure (emitProgram (optionDecl : decls) t lp)
+  pure (optionDecl : decls, t, lp)
 
 heapSize :: Integer
 heapSize = 64 * 1024 * 1024
@@ -96,6 +103,7 @@ emitProgram decls mainTy (LProg funs statics mainF) = unlines (reverse (gsLines 
       line ("\t.zerofill __DATA,__bss,_keel_heap," ++ show heapSize ++ ",4")
       line ("\t.zerofill __DATA,__bss,_keel_freelists," ++ show (8 * (maxSmall + 1)) ++ ",3")
       line "\t.zerofill __DATA,__bss,_keel_stats,32,3"
+      line "\t.zerofill __DATA,__bss,_keel_handlers,8,3"
       line "\t.section __TEXT,__cstring,cstring_literals"
       strs <- gets gsStrings
       forM_ (M.toList strs) $ \(s, l) -> line (l ++ ":\t.asciz " ++ show s)
@@ -291,6 +299,7 @@ rhsCode slots rhs = case rhs of
       Eq -> ins "cmp x9, x10" >> ins "cset x0, eq"
       Lt -> ins "cmp x9, x10" >> ins ("cset x0, " ++ if signed it then "lt" else "lo")
       Arith ov aop -> arith it ov aop
+      Bits bop -> bitwise it bop
   RCall f a -> do
     atom slots "x0" f
     atom slots "x1" a
@@ -339,16 +348,34 @@ rhsCode slots rhs = case rhs of
   RField a i -> do
     atom slots "x9" a
     ins ("ldr x0, [x9, #" ++ show (8 * (i + 1)) ++ "]")
-  ROut a -> do
-    -- Apple ARM64 passes variadic arguments on the stack.
-    atom slots "x9" a
-    ins "sub sp, sp, #16"
-    ins "str x9, [sp]"
-    l <- str "%lld\n"
-    address "x0" l
-    ins "bl _printf"
-    ins "add sp, sp, #16"
+  RPushHandler cs bm -> do
+    alloc (2 + 2 * length cs) bm
+    address "x12" "_keel_handlers"
+    ins "ldr x11, [x12]"
+    ins "str x11, [x0]" -- the enclosing frame
+    movImm "x11" (toInteger (length cs))
+    ins "str x11, [x0, #8]"
+    forM_ (zip [0 :: Int ..] cs) $ \(i, (n, a)) -> do
+      movImm "x11" (toInteger n)
+      ins ("str x11, [x0, #" ++ show (8 * (2 + 2 * i)) ++ "]")
+      atom slots "x11" a
+      ins ("str x11, [x0, #" ++ show (8 * (3 + 2 * i)) ++ "]")
+    ins "str x0, [x12]"
+  RPopHandler a -> do
+    atom slots "x0" a
+    ins "ldr x9, [x0]"
+    address "x10" "_keel_handlers"
+    ins "str x9, [x10]"
+    ins "bl _keel_drop"
     ins "mov x0, #0"
+  RConv to a -> do
+    -- Canonical values already have the right 64-bit pattern; narrow targets re-extend.
+    atom slots "x0" a
+    canonical to
+  RPerform n a -> do
+    atom slots "x1" a
+    movImm "x0" (toInteger n)
+    ins "bl _keel_perform"
   where
     storeAll :: Int -> [String] -> G ()
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
@@ -446,6 +473,39 @@ arith it@(IntTy sgn n) ov aop
           -- add/sub overflow toward the sign of a; mul toward the sign of a·b
           if aop == Mul then ins "eor x13, x9, x10" >> ins "cmp x13, #0" else ins "cmp x9, #0"
           ins "csel x0, x11, x12, lt"
+
+-- | Re-extend x0 to the canonical form of an integer type (no-op for 64-bit types).
+canonical :: IntTy -> G ()
+canonical it@(IntTy sgn n)
+  | n == 64 = pure ()
+  | sgn = ins ((case n of 8 -> "sxtb"; 16 -> "sxth"; _ -> "sxtw") ++ " x0, w0")
+  | otherwise = ins ("and x0, x0, #" ++ show (snd (intRange it)))
+
+-- | Bitwise operations with x9, x10 as operands and the result in x0, matching the evaluator:
+-- a shift by a negative amount is a shift by 0, and by 64 or more shifts everything out.
+bitwise :: IntTy -> BitOp -> G ()
+bitwise it@(IntTy sgn n) bop = case bop of
+  And -> ins "and x0, x9, x10"
+  Or -> ins "orr x0, x9, x10"
+  Xor -> ins "eor x0, x9, x10"
+  Shl -> shift "lsl" >> when (n < 64) extend
+  Shr -> shift (if sgn then "asr" else "lsr")
+  where
+    (_, hi) = intRange it
+    extend
+      | sgn = ins ((case n of 8 -> "sxtb"; 16 -> "sxth"; _ -> "sxtw") ++ " x0, w0")
+      | otherwise = ins ("and x0, x0, #" ++ show hi)
+    shift instr = do
+      lBig <- newLabel
+      lDone <- newLabel
+      when sgn $ ins "cmp x10, #0" >> ins "csel x10, xzr, x10, lt"
+      ins "cmp x10, #63"
+      ins ("b.hi " ++ lBig)
+      ins (instr ++ " x0, x9, x10")
+      ins ("b " ++ lDone)
+      line (lBig ++ ":")
+      if instr == "asr" then ins "asr x0, x9, #63" else ins "mov x0, #0"
+      line (lDone ++ ":")
 
 -- Results ---------------------------------------------------------------------------------
 
@@ -714,6 +774,60 @@ emitRuntime = do
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 
+  -- _keel_perform: x0 = operation number, x1 = argument (owned) → x0 = result. Finds the
+  -- innermost frame handling the operation and calls its clause with the frames outside it
+  -- installed; unhandled operations go to the machine.
+  fn "_keel_perform"
+  ins "stp x29, x30, [sp, #-32]!"
+  ins "mov x29, sp"
+  address "x9" "_keel_handlers"
+  ins "ldr x10, [x9]"
+  ins "str x10, [sp, #16]" -- restored afterwards
+  line "L_perform_frame:"
+  ins "cbz x10, L_perform_machine"
+  ins "ldr x11, [x10, #8]" -- clauses in this frame
+  ins "add x12, x10, #16"
+  line "L_perform_scan:"
+  ins "cbz x11, L_perform_next"
+  ins "ldr x13, [x12]"
+  ins "cmp x13, x0"
+  ins "b.eq L_perform_found"
+  ins "add x12, x12, #16"
+  ins "sub x11, x11, #1"
+  ins "b L_perform_scan"
+  line "L_perform_next:"
+  ins "ldr x10, [x10]"
+  ins "b L_perform_frame"
+  line "L_perform_found:"
+  ins "ldr x14, [x10]"
+  ins "str x14, [x9]" -- the clause runs under the enclosing frames
+  ins "ldr x0, [x12, #8]"
+  -- the call consumes the closure, but the frame keeps it: duplicate first
+  ins "ldr w15, [x0, #-8]"
+  ins "tbnz w15, #31, L_perform_call"
+  ins "add w15, w15, #1"
+  ins "str w15, [x0, #-8]"
+  line "L_perform_call:"
+  ins "ldr x16, [x0]"
+  ins "blr x16"
+  ins "ldr x10, [sp, #16]"
+  address "x9" "_keel_handlers"
+  ins "str x10, [x9]"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+  line "L_perform_machine:"
+  ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
+  ins "sub sp, sp, #16"
+  ins "str x1, [sp]" -- printf's variadic argument
+  fmt <- str "%lld\n"
+  address "x0" fmt
+  ins "bl _printf"
+  ins "add sp, sp, #16"
+  ins "mov x0, #0"
+  ins "ldp x29, x30, [sp], #32"
+  ins "ret"
+
+  panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO needs a freestanding target)\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"

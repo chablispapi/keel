@@ -9,7 +9,14 @@ keelc check FILE.kl            type-check; print main's type and effects
 keelc run   FILE.kl            run with the reference evaluator
 keelc asm   FILE.kl            print the ARM64 assembly
 keelc build FILE.kl [-o OUT]   compile to a native executable (via the system cc)
+keelc build --target riscv64 FILE.kl [-o OUT]
+                               freestanding RISC-V image for QEMU's virt board
+keelc qemu  FILE.kl            build for RISC-V and boot it in QEMU
 ```
+
+The RISC-V target needs Homebrew's `llvm`, `lld` and `qemu`. It is freestanding: no operating
+system and no C library. Output goes through the board's 16550 UART, and the program exits
+through its test device (status 101 on a panic).
 
 ## Programs
 
@@ -18,6 +25,7 @@ A file is a list of declarations followed by `main = expression`. Comments are `
 ```
 [linear] data List a = Nil | Cons(a, Box (List a))
 codata Ord a { lt : a -> a -> Bool }
+bitdata LineStatus : u8 { thr_empty @ 5 ; parity @ 1..2 }
 effect MMIO { read : i64 => i64 ; write : W => Unit }
 def name : type = expression        -- top-level definitions need a type
 main = expression
@@ -53,15 +61,37 @@ Arrows associate to the right. Effect variables start with `'`.
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |
 | `read(4)`, `out(x)` | performing an operation |
 | `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs |
-| `42`, `250u8`, `-5`, `true`, `()` | literals (width inferred unless suffixed) |
+| `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
+| `x land y`, `lor`, `lxor`, `lsl`, `lsr` | bitwise and, or, xor, shifts (logical for unsigned types, arithmetic for signed) |
+| `e as u8` | wrapping conversion between integer types |
+| `s.thr_empty`, `s.raw`, `LineStatus(x)`, `LineStatus { thr_empty = 1 }` | bitdata field, raw value, from raw, from fields |
 | `+ - *`, `+% -% *%`, `+\| -\| *\|`, `+? -? *?` | checked, wrapping, saturating, Option arithmetic |
 | `==`, `<` | comparisons |
 | `f[i64]`, `Nil[i64]` | explicit type arguments (usually inferred) |
 
 Precedence, loosest first: `;`, then `λ` / `let` / `var` / `if` / `handle` / `:=` (their bodies
-extend as far as possible), then `==` `<`, then `+ -` (all variants), then `* `, then
-application, then `.obs` and `[types]`. A `-` directly before a number at the start of an
+extend as far as possible), then `==` `<`, then `+ -` (all variants), then `*` and the bitwise
+operators, then `as`, then application, then `.obs` and `[types]`. A `-` directly before a number at the start of an
 operand is a negative literal; `n -1` still means `n - 1`.
+
+## Hardware access
+
+**MMIO** is a built-in effect, like `IO`:
+
+| Operation | Type |
+|---|---|
+| `read8(addr)`, `read32(addr)` | `u64 => u8`, `u64 => u32` |
+| `write8(addr, v)`, `write32(addr, v)` | `(u64, u8) => Unit`, `(u64, u32) => Unit` |
+
+Unhandled, the machine performs them as real (volatile) memory accesses: only on the
+freestanding RISC-V target; on the Mac and in the evaluator an unhandled MMIO operation panics.
+Handled, they are an ordinary effect, so a driver can be tested against a mock device:
+`examples/uart.kl` and `examples/firmware/hello.kl` are the same driver, mocked and on QEMU.
+
+**bitdata** declares a register layout over an integer type: fields are a bit (`@ 5`) or an
+inclusive range (`@ 1..2`). A bitdata type is distinct from its integer while type checking
+(a `LineStatus` can't be passed where a `u8` is expected) and is the plain integer at run time:
+field reads compile to a shift and a mask.
 
 ## What inference fills in
 

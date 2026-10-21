@@ -57,12 +57,10 @@ data Sig = Sig
   , sigEv :: S.Set String                                      -- ^ effect variables in scope
   }
 
-builtinEffects :: [(String, [(String, Ty, Ty)])]
-builtinEffects = [(ioE, [("out", TInt i64, TUnit)])]
-
--- | Effects @main@ may leave unhandled: the machine provides them.
+-- | Effects @main@ may leave unhandled: the machine provides them (MMIO only on freestanding
+-- targets; elsewhere an unhandled MMIO operation panics at run time).
 topLevelEffects :: Eff
-topLevelEffects = S.fromList [ioE, panicE, divergeE]
+topLevelEffects = S.fromList [ioE, mmioE, panicE, divergeE]
 
 -- | §1.2 and §4.2: a data type is linear if declared so or if any type argument is linear;
 -- codata is always Free; a type variable has its declared kind.
@@ -323,7 +321,13 @@ infer s rec ctx tm = case tm of
           Arith Checked _ -> (ta, S.singleton panicE)
           Arith Optional _ -> (TData "Option" [ta], S.empty)
           Arith _ _ -> (ta, S.empty)
+          Bits _ -> (ta, S.empty)
     pure (t, S.unions [ea, eb, extra], u)
+  Convert to e -> do
+    (te, ee, ue) <- infer s rec ctx e
+    case te of
+      TInt _ -> pure (TInt to, ee, ue)
+      _ -> err Mismatch ("conversion of non-integer " ++ prettyTy te)
   If c a b -> do
     (ec, uc) <- expect TBool c
     (ta, ea, ua) <- infer s rec ctx a

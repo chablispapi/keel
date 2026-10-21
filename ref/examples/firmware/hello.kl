@@ -1,0 +1,20 @@
+-- Freestanding firmware for QEMU's RISC-V virt board: the driver from ../uart.kl, this time
+-- with no mock. MMIO is not handled, so it reaches the machine: real (emulated) device memory.
+--
+--   keelc qemu examples/firmware/hello.kl
+
+data List a = Nil | Cons(a, Box (List a))
+
+bitdata LineStatus : u8 { thr_empty @ 5 }
+
+def putc : u8 ->{MMIO, Diverge} Unit =
+  \c. if LineStatus(read8(0x1000_0005)).thr_empty == 1 then write8(0x1000_0000, c)
+      else putc c
+
+def send : List u8 ->{MMIO, Diverge} Unit =
+  \xs. case xs of
+    { Nil -> ()
+    | Cons(c, rest) -> putc c; send (unbox rest) }
+
+-- "Hi!\n"
+main = send (Cons(72, box Cons(105, box Cons(33, box Cons(10, box Nil)))))

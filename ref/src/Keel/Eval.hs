@@ -6,6 +6,7 @@ module Keel.Eval (Value (..), Outcome (..), evalProgram) where
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Control.Monad.Trans.State.Strict (State, modify, runState)
+import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Map.Strict qualified as M
 import Keel.Syntax
 
@@ -76,6 +77,11 @@ eval hs env tm = case tm of
   UnitLit -> pure VUnit
   IntLit t n -> pure (VInt t n)
   BoolLit b -> pure (VBool b)
+  Convert to e -> do
+    v <- eval hs env e
+    case v of
+      VInt _ n -> let (lo, hi) = intRange to in pure (VInt to (lo + (n - lo) `mod` (hi - lo + 1)))
+      _ -> stuck "conversion of a non-integer"
   Prim op a b -> do
     va <- eval hs env a
     vb <- eval hs env b
@@ -142,15 +148,28 @@ perform hs op v = case break handles hs of
   where
     handles (Handler clauses _) = M.member op clauses
 
--- | Operations no handler caught are performed by the machine.
+-- | Operations no handler caught are performed by the machine. The evaluator has no device
+-- memory, so an unhandled MMIO operation panics (handle MMIO with a mock to run drivers here).
 machine :: String -> Value -> Run Value
 machine "out" (VInt _ n) = lift (modify (n :)) >> pure VUnit
-machine op _ = stuck ("unhandled operation " ++ op)
+machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
 
 prim :: Prim -> Value -> Value -> Run Value
 prim op (VInt t a) (VInt _ b) = case op of
   Eq -> pure (VBool (a == b))
   Lt -> pure (VBool (a < b))
+  Bits bop ->
+    -- Canonical values: and/or/xor stay in range; a left shift wraps to the width; shifting
+    -- right is arithmetic on signed values (Integer shiftR) and logical on unsigned ones.
+    let (lo, hi) = intRange t
+        wrap r = lo + (r - lo) `mod` (hi - lo + 1)
+        amount = fromInteger (max 0 (min 64 b))
+     in pure . VInt t $ case bop of
+          And -> a .&. b
+          Or -> a .|. b
+          Xor -> xor a b
+          Shl -> wrap (a `shiftL` amount)
+          Shr -> a `shiftR` amount
   Arith ov aop ->
     let r = arith aop a b
         (lo, hi) = intRange t

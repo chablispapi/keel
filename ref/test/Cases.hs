@@ -88,7 +88,7 @@ letTok = Let "t" (Con "Token" [] [])
 
 -- effect MMIO { read : i64 ⇒ i64 ; write : W ⇒ Unit },  data W = W(i64, i64)
 mmio, wData :: Decl
-mmio = Effect "MMIO" [("read", tI, tI), ("write", TData "W" [], TUnit)]
+mmio = Effect "Port" [("read", tI, tI), ("write", TData "W" [], TUnit)]
 wData = Data False "W" [] [("W", [tI, tI])]
 
 -- def send : IntList →{MMIO, Diverge} Unit
@@ -98,7 +98,7 @@ wData = Data False "W" [] [("W", [tI, tI])]
 --                       else send (Cons(c, rest))
 sendDef :: Decl
 sendDef =
-  Def "send" (fnE ["MMIO", divergeE] tList TUnit) $
+  Def "send" (fnE ["Port", divergeE] tList TUnit) $
     Lam "xs" tList $
       Case
         (Var "xs")
@@ -116,7 +116,7 @@ sendDef =
 mockUart :: Term -> Term
 mockUart body =
   Handle
-    "MMIO"
+    "Port"
     body
     [ ("read", "addr", int 1)
     , ("write", "w", Case (Var "w") [("W", ["reg", "v"], Perform "out" (Var "v"))])
@@ -142,7 +142,7 @@ tickDef =
 --   Cons(c, rest) → write(W(0, c)); q := unbox rest; drain(&mut q)
 drainDef :: Decl
 drainDef =
-  Def "drain" (fnE ["MMIO", divergeE] (TMut tList) TUnit) $
+  Def "drain" (fnE ["Port", divergeE] (TMut tList) TUnit) $
     Lam "q" (TMut tList) $
       Case
         (Var "q")
@@ -161,7 +161,7 @@ drainDef =
 --   Cons(c, rest) → let d = write(W(0, c)) in drainSP (unbox rest)
 drainSPDef :: Decl
 drainSPDef =
-  Def "drainSP" (fnE ["MMIO", divergeE] tList (TPair TUnit tList)) $
+  Def "drainSP" (fnE ["Port", divergeE] tList (TPair TUnit tList)) $
     Lam "q" tList $
       Case
         (Var "q")
@@ -394,7 +394,7 @@ cases =
     , Rejects LinearCapture
     )
   , ( "handler misses an operation"
-    , Program [mmio, wData] (Handle "MMIO" (Perform "read" (int 4)) [("read", "addr", int 1)])
+    , Program [mmio, wData] (Handle "Port" (Perform "read" (int 4)) [("read", "addr", int 1)])
     , Rejects NonExhaustive
     )
   , ("Panic cannot be handled", Program [] (Handle panicE (int 1) []), Rejects Unbound)

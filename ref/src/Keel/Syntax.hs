@@ -62,7 +62,12 @@ data Overflow = Checked | Wrap | Saturate | Optional -- ^ Optional: @+?@ returns
 data ArithOp = Add | Sub | Mul
   deriving (Eq, Show)
 
-data Prim = Arith Overflow ArithOp | Eq | Lt
+-- | Bitwise operations: never overflow; shifts are logical for unsigned types and
+-- arithmetic for signed ones, and a left shift wraps to the width.
+data BitOp = And | Or | Xor | Shl | Shr
+  deriving (Eq, Show)
+
+data Prim = Arith Overflow ArithOp | Bits BitOp | Eq | Lt
   deriving (Eq, Show)
 
 data Term
@@ -70,6 +75,7 @@ data Term
   | UnitLit
   | IntLit IntTy Integer
   | NumLit (Maybe Ty) Integer -- ^ literal whose width is inferred, front end only
+  | Convert IntTy Term        -- ^ e as ι: wrapping conversion between integer types
   | BoolLit Bool
   | Prim Prim Term Term
   | If Term Term Term
@@ -93,6 +99,7 @@ data Term
   | LetVar String Term Term                 -- ^ var x = e in e, surface
   | Borrow String                           -- ^ &x, surface: only as a function argument
   | BorrowMut String                        -- ^ &mut x, surface: only as a function argument
+  | BitsLit String [(String, Term)]         -- ^ Status { field = e, … }, bitdata value, front end only
   deriving (Eq, Show)
 
 -- | Immediate subterms.
@@ -114,6 +121,7 @@ children tm = case tm of
   LetPair _ _ e b -> [e, b]
   Cocase _ _ bs -> map snd bs
   Proj e _ -> [e]
+  Convert _ e -> [e]
   Assign _ e -> [e]
   Seq a b -> [a, b]
   LetVar _ e b -> [e, b]
@@ -138,6 +146,7 @@ descend f tm = case tm of
   LetPair x y e b -> LetPair x y (f e) (f b)
   Cocase d ts bs -> Cocase d ts [(o, f b) | (o, b) <- bs]
   Proj e o -> Proj (f e) o
+  Convert t e -> Convert t (f e)
   Assign x e -> Assign x (f e)
   Seq a b -> Seq (f a) (f b)
   LetVar x e b -> LetVar x (f e) (f b)
@@ -162,6 +171,7 @@ descendM f tm = case tm of
   LetPair x y e b -> LetPair x y <$> f e <*> f b
   Cocase d ts bs -> Cocase d ts <$> mapM (\(o, b) -> (o,) <$> f b) bs
   Proj e o -> (`Proj` o) <$> f e
+  Convert t e -> Convert t <$> f e
   Assign x e -> Assign x <$> f e
   Seq a b -> Seq <$> f a <*> f b
   LetVar x e b -> LetVar x <$> f e <*> f b
@@ -245,17 +255,34 @@ data Decl
   | Codata String [String] [(String, Ty)]      -- ^ name, type parameters, observations
   | Effect String [(String, Ty, Ty)]           -- ^ label, operations with argument and result types
   | Def String Ty Term
+  | Bitdata String IntTy [(String, Int, Int)] -- ^ name, underlying integer, fields (low bit, width); front end only
   deriving (Eq, Show)
 
 data Program = Program [Decl] Term
   deriving (Eq, Show)
 
--- | Built-in effect labels. @IO@ has one operation, @out : i64 ⇒ Unit@; the other two have
--- none and cannot be handled.
-ioE, panicE, divergeE :: String
+-- | Built-in effect labels. @IO@ and @MMIO@ have the operations in 'builtinEffects';
+-- @Panic@ and @Diverge@ have none and cannot be handled.
+ioE, mmioE, panicE, divergeE :: String
 ioE = "IO"
+mmioE = "MMIO"
 panicE = "Panic"
 divergeE = "Diverge"
+
+-- | Built-in effects and their operations, in operation-number order (the native runtime
+-- numbers operations this way, then user operations in declaration order). Unhandled, @out@
+-- prints and the MMIO operations access device memory (freestanding targets only).
+builtinEffects :: [(String, [(String, Ty, Ty)])]
+builtinEffects =
+  [ (ioE, [("out", TInt i64, TUnit)])
+  , ( mmioE
+    , [ ("read8", TInt u64, TInt u8)
+      , ("read32", TInt u64, TInt u32)
+      , ("write8", TPair (TInt u64) (TInt u8), TUnit)
+      , ("write32", TPair (TInt u64) (TInt u32), TUnit)
+      ]
+    )
+  ]
 
 -- | Built-in data: @data Option a = None | Some(a)@, the result of @+?@.
 optionDecl :: Decl

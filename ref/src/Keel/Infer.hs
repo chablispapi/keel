@@ -7,7 +7,9 @@
 -- * type arguments of constructors, cocases and polymorphic definitions, and effect
 --   arguments of polymorphic definitions;
 -- * whether a λ is linear (λ°): it is when it captures a linear value;
--- * operations are written like calls, @read(4)@, and become @Perform@.
+-- * operations are written like calls, @read(4)@, and become @Perform@;
+-- * @bitdata@ types: distinct types while checking, plain integers in the output; @s.field@
+--   reads a bit field, @s.raw@ the whole value, @Status(x)@ and @Status { f = e, … }@ build one.
 --
 -- Binders may shadow: they are renamed apart (@x~1@), since the core forbids shadowing.
 --
@@ -31,7 +33,11 @@ data Sig = Sig
   , sCodata :: M.Map String ([String], [(String, Ty)])
   , sDefs :: M.Map String Ty
   , sOps :: M.Map String (String, Ty, Ty) -- ^ operation ↦ (label, argument, result)
+  , sBits :: BitsInfo
   }
+
+-- | bitdata name ↦ (underlying integer, fields with low bit and width).
+type BitsInfo = M.Map String (IntTy, [(String, Int, Int)])
 
 data St = St
   { stNext :: Int
@@ -40,6 +46,7 @@ data St = St
   , stUsed :: S.Set String           -- ^ names taken in the current definition
   , stBinders :: M.Map String Ty     -- ^ types of the binders of the current definition
   , stLits :: [Int]                  -- ^ type variables of width-inferred literals
+  , stBits :: BitsInfo
   }
 
 type I = StateT St (Either TypeError)
@@ -56,16 +63,18 @@ failWith k msg = lift (Left (TypeError k msg))
 
 -- | Infer a surface program; the result is a λK₃ program for "Keel.Mono".compile.
 inferProgram :: Program -> Either TypeError Program
-inferProgram (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty M.empty [])
+inferProgram (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty M.empty [] bitsInfo)
   where
     decls = optionDecl : userDecls
+    bitsInfo = M.fromList [(b, (it, fs)) | Bitdata b it fs <- userDecls]
     sig =
       Sig
         { sData = M.fromList [(d, (lin, ps, cs)) | Data lin d ps cs <- decls]
         , sCons = M.fromList [(c, (d, fs)) | Data _ d _ cs <- decls, (c, fs) <- cs]
         , sCodata = M.fromList [(d, (ps, os)) | Codata d ps os <- decls]
         , sDefs = M.fromList [(f, t) | Def f t _ <- userDecls]
-        , sOps = M.fromList (("out", (ioE, TInt i64, TUnit)) : [(op, (l, a, r)) | Effect l ops <- decls, (op, a, r) <- ops])
+        , sOps = M.fromList [(op, (l, a, r)) | (l, ops) <- builtinEffects ++ [(l, os) | Effect l os <- decls], (op, a, r) <- ops]
+        , sBits = bitsInfo
         }
     groups = recursiveGroups userDecls
     go = do
@@ -77,12 +86,15 @@ inferProgram (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.em
               env = Env sig M.empty (M.findWithDefault S.empty f groups) (M.fromList vs)
           startDef
           (e', _) <- check env e body
-          Def f t <$> finish env e'
-        _ -> pure d
+          Just . Def f (resolveBits bitsInfo t) <$> finish env e'
+        Bitdata {} -> pure Nothing
+        Data lin n ps cs -> pure (Just (Data lin n ps [(c, map (resolveBits bitsInfo) fs) | (c, fs) <- cs]))
+        Codata n ps os -> pure (Just (Codata n ps [(o, resolveBits bitsInfo ot) | (o, ot) <- os]))
+        Effect l ops -> pure (Just (Effect l [(op, resolveBits bitsInfo a, resolveBits bitsInfo r) | (op, a, r) <- ops]))
       startDef
       let env = Env sig M.empty S.empty M.empty
       (m, _, _) <- infer env main
-      Program decls' <$> finish env m
+      Program [d | Just d <- decls'] <$> finish env m
     startDef = modify (\s -> s {stUsed = M.keysSet (sDefs sig), stBinders = M.empty})
 
 -- Variables ---------------------------------------------------------------------------------
@@ -355,6 +367,14 @@ infer env tm = case tm of
       _ -> pure ()
     pure (NumLit (Just m) n, m, S.empty)
   NumLit (Just t) _ -> pure (tm, t, S.empty)
+  Convert to e -> do
+    (e', te, ee) <- infer env e
+    zt <- zonk te
+    case zt of
+      TInt _ -> pure ()
+      TMeta _ -> pure () -- a literal: defaults to i64
+      _ -> failWith Mismatch ("conversion of non-integer " ++ prettyTy zt)
+    pure (Convert to e', TInt to, ee)
   Prim op a b -> do
     (a', ta, ea) <- infer env a
     (b', eb) <- check env b ta
@@ -364,6 +384,7 @@ infer env tm = case tm of
           Arith Checked _ -> (ta, S.singleton panicE)
           Arith Optional _ -> (TData "Option" [ta], S.empty)
           Arith _ _ -> (ta, S.empty)
+          Bits _ -> (ta, S.empty)
     pure (Prim op a' b', t, S.unions [ea, eb, extra])
   If c a b -> do
     (c', ec) <- check env c TBool
@@ -417,6 +438,19 @@ infer env tm = case tm of
     (a', ea) <- check env a TUnit
     (b', tb, eb) <- infer env b
     pure (Seq a' b', tb, ea <> eb)
+  -- Status(x): a bitdata value from its raw integer.
+  Con c [] [x] | Just (it, _) <- M.lookup c (sBits sig) -> do
+    (x', ex) <- check env x (TInt it)
+    pure (x', TData c [], ex)
+  BitsLit b fs -> case M.lookup b (sBits sig) of
+    Nothing -> failWith Unbound ("bitdata " ++ b)
+    Just (it, fields) -> do
+      parts <- forM fs $ \(f, e) -> case [(lo, w) | (f', lo, w) <- fields, f' == f] of
+        (lo, w) : _ -> do
+          (e', ee) <- check env e (TInt it)
+          pure (Prim (Bits Shl) (Prim (Bits And) e' (IntLit it (mask w))) (IntLit it (toInteger lo)), ee)
+        [] -> failWith Unbound (b ++ " has no field " ++ f)
+      pure (foldl (Prim (Bits Or)) (IntLit it 0) (map fst parts), TData b [], S.unions (map snd parts))
   Con c tys args -> do
     (d, fields, tys') <- conInfo env c tys
     rs <- zipWithM (check env) args (map (inst env c tys') fields)
@@ -463,6 +497,11 @@ infer env tm = case tm of
     (e', te, ee) <- infer env e
     zt <- zonk te
     case zt of
+      TData b []
+        | Just (it, fields) <- M.lookup b (sBits sig) -> case [(lo, w) | (f, lo, w) <- fields, f == o] of
+            _ | o == "raw" -> pure (e', TInt it, ee)
+            (lo, w) : _ -> pure (Prim (Bits And) (Prim (Bits Shr) e' (IntLit it (toInteger lo))) (IntLit it (mask w)), TInt it, ee)
+            [] -> failWith Unbound (b ++ " has no field " ++ o)
       TData d tys
         | Just (ps, obs) <- M.lookup d (sCodata sig)
         , Just t <- lookup o obs ->
@@ -511,7 +550,8 @@ finish env tm = do
 finalTy :: Ty -> I Ty
 finalTy t = do
   z <- zonk t
-  deflt z
+  bits <- gets stBits
+  resolveBits bits <$> deflt z
   where
     deflt u = case u of
       TMeta _ -> pure TUnit
@@ -546,6 +586,26 @@ zonkTerm tm = do
     NumLit Nothing n -> pure (IntLit i64 n)
     _ -> pure tm
   descendM zonkTerm here
+
+-- | A field of @w@ bits, as a mask.
+mask :: Int -> Integer
+mask w = 2 ^ w - 1
+
+-- | bitdata types are their underlying integers in the output.
+resolveBits :: BitsInfo -> Ty -> Ty
+resolveBits bits t = case t of
+  TData b [] | Just (it, _) <- M.lookup b bits -> TInt it
+  TFun a e r -> TFun (go a) e (go r)
+  TLFun a e r -> TLFun (go a) e (go r)
+  TData d as -> TData d (map go as)
+  TBox a -> TBox (go a)
+  TPair a b -> TPair (go a) (go b)
+  TRef a -> TRef (go a)
+  TMut a -> TMut (go a)
+  TForall vs es b -> TForall vs es (go b)
+  _ -> t
+  where
+    go = resolveBits bits
 
 -- | λ captures a linear value ⇒ λ°.
 linearize :: Env -> M.Map String Ty -> Term -> Term

@@ -4,6 +4,7 @@
 -- > [linear] data List a = Nil | Cons(a, Box (List a))
 -- > codata Ord a { lt : a -> a -> Bool }
 -- > effect MMIO { read : i64 => i64 ; write : W => Unit }
+-- > bitdata LineStatus : u8 { ready @ 0 ; thr_empty @ 5 ; parity @ 1..2 }
 -- > def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
 -- >   \f xs. case xs of { Nil -> Nil | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
 -- > main = ...
@@ -38,6 +39,7 @@ lexer =
           [ "data", "linear", "codata", "effect", "def", "main", "forall", "let", "in", "var"
           , "if", "then", "else", "case", "of", "cocase", "handle", "with", "box", "unbox"
           , "true", "false", "mut", "Box", "Unit", "Bool", "Free", "Lin"
+          , "bitdata", "land", "lor", "lxor", "lsl", "lsr", "as"
           ]
       , Tok.reservedOpNames = []
       , Tok.caseSensitive = True
@@ -83,15 +85,25 @@ hole = TMeta (-1)
 intTypes :: [(String, IntTy)]
 intTypes = [("i8", i8), ("i16", i16), ("i32", i32), ("i64", i64), ("u8", u8), ("u16", u16), ("u32", u32), ("u64", u64)]
 
--- | @42@ (width inferred) or @250u8@. A negative literal is @-@ before a number at the start
--- of an operand (see 'appE'), so @n -1@ still means @n - 1@.
+-- | @42@ (width inferred), @250u8@, @0x1000_0000@. Underscores separate digits. A negative
+-- literal is @-@ before a number at the start of an operand (see 'appE'), so @n -1@ still
+-- means @n - 1@.
 number :: Parser Term
 number = Tok.lexeme lexer $ try $ do
-  ds <- many1 digit
+  n <- hex <|> decimal
   suffix <- optionMaybe (choice [try (string s <* notFollowedBy alphaNum) $> t | (s, t) <- intTypes])
   notFollowedBy alphaNum
-  let n = read ds
   pure (maybe (NumLit Nothing n) (`IntLit` n) suffix)
+  where
+    hex = try (string "0x") >> digitsIn 16 hexDigit
+    decimal = digitsIn 10 digit
+    digitsIn base d = do
+      ds <- (:) <$> d <*> many (d <|> (char '_' >> d))
+      pure (foldl (\acc c -> acc * base + toInteger (digitValue c)) 0 ds)
+    digitValue c
+      | c >= 'a' = fromEnum c - fromEnum 'a' + 10
+      | c >= 'A' = fromEnum c - fromEnum 'A' + 10
+      | otherwise = fromEnum c - fromEnum '0'
 
 negative :: Term -> Term
 negative (NumLit t n) = NumLit t (negate n)
@@ -108,8 +120,22 @@ program = do
   Program ds <$> expr
 
 decl :: Parser Decl
-decl = dataDecl <|> codataDecl <|> effectDecl <|> defDecl
+decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
   where
+    -- bitdata Name : u8 { field @ bit ; field @ lo..hi }
+    bitdataDecl = do
+      reserved "bitdata"
+      name <- upper
+      op ":"
+      it <- choice [reserved' s $> i | (s, i) <- intTypes]
+      Bitdata name it <$> braces (sepEndBy bitField semi)
+    reserved' s = try (do n <- lower; if n == s then pure () else unexpected n)
+    bitField = do
+      f <- lower
+      op "@"
+      lo <- fromInteger <$> Tok.natural lexer
+      hi <- option lo (op ".." >> fromInteger <$> Tok.natural lexer)
+      pure (f, lo, hi - lo + 1)
     dataDecl = do
       lin <- option False (reserved "linear" $> True)
       reserved "data"
@@ -241,7 +267,18 @@ cmpE = do
 
 addE, mulE :: Parser Term
 addE = chainl1 mulE (arithOp [("+", Add), ("-", Sub)])
-mulE = chainl1 appE (arithOp [("*", Mul)])
+mulE = chainl1 convE (arithOp [("*", Mul)] <|> bitOp)
+
+-- | @e as u8@: wrapping integer conversion, binding tighter than the operators.
+convE :: Parser Term
+convE = do
+  e <- appE
+  ts <- many (reserved "as" >> choice [try (do n <- lower; maybe (unexpected n) pure (lookup n intTypes))])
+  pure (foldl (flip Convert) e ts)
+
+-- | Bitwise operators, written as words (as in OCaml) since @&@ is a borrow.
+bitOp :: Parser (Term -> Term -> Term)
+bitOp = choice [reserved w $> Prim (Bits b) | (w, b) <- [("land", And), ("lor", Or), ("lxor", Xor), ("lsl", Shl), ("lsr", Shr)]]
 
 -- | @+@ checked, @+%@ wrapping, @+|@ saturating, @+?@ returning Option (same for - and *).
 arithOp :: [(String, ArithOp)] -> Parser (Term -> Term -> Term)
@@ -294,8 +331,11 @@ atom =
   where
     constructor = do
       c <- upper
-      ts <- option [] (brackets (sepBy ty comma))
-      Con c ts <$> option [] (parens (sepBy expr comma))
+      bitsLit c <|> do
+        ts <- option [] (brackets (sepBy ty comma))
+        Con c ts <$> option [] (parens (sepBy expr comma))
+    -- Status { field = e, … }
+    bitsLit c = BitsLit c <$> braces (sepBy ((,) <$> lower <* op "=" <*> expr) comma)
     caseE = do
       reserved "case"
       e <- expr

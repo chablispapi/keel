@@ -9,6 +9,7 @@ the REPL and the compiler. It is built in four stages, each extending the previo
 | 2 | λK₂ | Effects, tail-resumptive handlers, fixed-width checked arithmetic, `Panic`, `Diverge` | done |
 | 3 | λK₃ | Second-class references `&` / `&mut`, `var`, assignment; elaborated to state passing | done |
 | 4 | λK₄ | `codata`, rank-1 type and effect polymorphism, monomorphization | done |
+| 5 | — | Bitwise operations, integer conversions, the `MMIO` effect (systems additions, §5) | done |
 
 The executable reference checker and evaluator live in `ref/` (Haskell). Every rule below
 corresponds to a case in `ref/src/Keel/Check.hs`, `Eval.hs`, `Elab.hs` or `Mono.hs`, and the examples in
@@ -928,3 +929,41 @@ and effects only through the function types it returns.
   effect-free values. A compiler would build the record of closures once.
 - **The size rule is conservative over type arguments** (§4.3).
 - **Instance names are strings** (`pmap[i64; i64; {Panic}]`). A compiler would intern them.
+
+---
+
+## 5. Additions for systems code (M3)
+
+Three small extensions, added with the native back ends. None changes the metatheory: they are
+new primitives with ordinary typing rules.
+
+**Bitwise operations.** `e₁ ⊙ e₂` with `⊙ ∈ { land, lor, lxor, lsl, lsr }`: both operands have
+the same integer type ι, the result has type ι, and the effect is `{}` (they can't overflow).
+`lsl` wraps to the width. `lsr` is logical on unsigned types and arithmetic on signed ones. A
+shift amount below 0 counts as 0, and 64 or more shifts everything out.
+
+```
+         Γ₁ ⊢ e₁ : ι ! ε₁    Γ₂ ⊢ e₂ : ι ! ε₂
+ (Bits) ───────────────────────────────────────
+         Γ₁ ⋈ Γ₂ ⊢ e₁ ⊙ e₂ : ι ! ε₁ ∪ ε₂
+```
+
+**Conversions.** `e as ι'` converts between integer types by wrapping (two's complement
+truncation or extension, like Rust's `as`): if `Γ ⊢ e : ι ! ε` then `Γ ⊢ e as ι' : ι' ! ε`, and
+the value is `lo + (n − lo) mod (hi − lo + 1)` for the range `[lo, hi]` of ι'.
+
+**MMIO.** A built-in effect label with four operations:
+
+| Operation | Type |
+|---|---|
+| `read8`, `read32` | `u64 ⇒ u8`, `u64 ⇒ u32` |
+| `write8`, `write32` | `u64 ⊗ u8 ⇒ Unit`, `u64 ⊗ u32 ⇒ Unit` |
+
+`main` may leave `MMIO` unhandled, like `IO`: the machine then performs the operations on device
+memory. In the reference evaluator, which has no device memory, an unhandled MMIO operation
+panics; a handler is how drivers are tested there. The operations are ordinary operations in
+every other respect, so Theorem 4 (effect soundness) covers them: code whose type has no `MMIO`
+never touches device memory.
+
+The surface language adds `bitdata` register layouts on top of these (`spec/surface.md`); they
+are elaborated away before Keel Core.
