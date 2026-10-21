@@ -72,6 +72,7 @@ evalProgram (Program decls main) = (either Panicked Done r, reverse trace)
 -- the monad, left to right, before its value is used.
 eval :: [Handler] -> Env -> Term -> Run Value
 eval hs env tm = case tm of
+  At _ e -> eval hs env e
   Var x -> pure (env M.! x)
   TyApp f _ _ -> pure (env M.! f)
   UnitLit -> pure VUnit

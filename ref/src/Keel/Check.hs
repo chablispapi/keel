@@ -4,7 +4,7 @@
 --
 -- @infer@ implements Γ ⊢ e ⇒ τ ! ε ▷ U: it synthesizes a type, the effect of evaluating the
 -- term, and the set U of linear local variables the term uses.
-module Keel.Check (ErrKind (..), TypeError (..), checkProgram, recursiveGroups, typeOfClosed) where
+module Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram, recursiveGroups, typeOfClosed) where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.List (nub, sort)
@@ -37,13 +37,19 @@ data ErrKind
   | PolyRecursion -- ^ a recursive group calling itself at different types (§4.4)
   deriving (Eq, Show)
 
-data TypeError = TypeError ErrKind String
+-- | An error, with the position of the innermost source term around it (when known).
+data TypeError = TypeError {errKind :: ErrKind, errMsg :: String, errPos :: Maybe Pos}
   deriving (Eq, Show)
+
+-- | Attach a position to an error that has none yet (the innermost position wins).
+atPos :: Pos -> Either TypeError a -> Either TypeError a
+atPos p (Left (TypeError k m Nothing)) = Left (TypeError k m (Just p))
+atPos _ r = r
 
 type TC = Either TypeError
 
 err :: ErrKind -> String -> TC a
-err k msg = Left (TypeError k msg)
+err k msg = Left (TypeError k msg Nothing)
 
 -- | The signature Σ, plus the type and effect variables in scope.
 data Sig = Sig
@@ -119,9 +125,13 @@ checkProgram (Program decls main) = do
           _ -> ([], [], t)
         sig' = sig {sigTv = M.fromList vs, sigEv = S.fromList es}
     wfTy sig' body
-    (t', eff, _) <- infer sig' (M.findWithDefault S.empty f groups) M.empty e
-    unless (S.null eff) $ err Unhandled ("def " ++ f ++ " has effects " ++ prettyEff eff)
-    unless (sub t' body) $ mismatch body t'
+    -- Errors about the definition as a whole point at its body.
+    atPos' e $ do
+      (t', eff, _) <- infer sig' (M.findWithDefault S.empty f groups) M.empty e
+      unless (S.null eff) $ err Unhandled ("def " ++ f ++ " has effects " ++ prettyEff eff)
+      unless (sub t' body) $ case mismatch body t' of
+        Left (TypeError k msg p) -> Left (TypeError k ("def " ++ f ++ ": " ++ msg) p)
+        r -> r
   (t, eff, _) <- infer sig S.empty M.empty main
   let extra = eff S.\\ topLevelEffects
   unless (S.null extra) $ err Unhandled ("main performs " ++ prettyEff extra)
@@ -134,6 +144,11 @@ typeOfClosed decls tm = do
   sig <- buildSig decls
   (t, _, _) <- infer sig S.empty M.empty tm
   pure t
+
+-- | Attach the position of a term's outermost source location, if it has one.
+atPos' :: Term -> TC a -> TC a
+atPos' (At p _) = atPos p
+atPos' _ = id
 
 -- | For each definition, its recursive group: the definitions it reaches that reach it back.
 recursiveGroups :: [Decl] -> M.Map String (S.Set String)
@@ -291,6 +306,7 @@ wfEff s e = forM_ e $ \l ->
 -- members has the effect Diverge (§2.4).
 infer :: Sig -> S.Set String -> Ctx -> Term -> TC (Ty, Eff, Usage)
 infer s rec ctx tm = case tm of
+  At p e -> atPos p (infer s rec ctx e)
   Var x -> case M.lookup x ctx of
     Just t -> pure (t, S.empty, if kindOf s t == Lin then S.singleton x else S.empty)
     Nothing -> case M.lookup x (sigDefs s) of

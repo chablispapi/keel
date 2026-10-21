@@ -100,7 +100,16 @@ data Term
   | Borrow String                           -- ^ &x, surface: only as a function argument
   | BorrowMut String                        -- ^ &mut x, surface: only as a function argument
   | BitsLit String [(String, Term)]         -- ^ Status { field = e, … }, bitdata value, front end only
+  | At Pos Term                             -- ^ source position (line, column) of the term; stripped before optimization
   deriving (Eq, Show)
+
+-- | A source position: line and column.
+type Pos = (Int, Int)
+
+-- | Remove source positions.
+stripAt :: Term -> Term
+stripAt (At _ e) = stripAt e
+stripAt tm = descend stripAt tm
 
 -- | Immediate subterms.
 children :: Term -> [Term]
@@ -125,6 +134,7 @@ children tm = case tm of
   Assign _ e -> [e]
   Seq a b -> [a, b]
   LetVar _ e b -> [e, b]
+  At _ e -> [e]
   _ -> []
 
 -- | Apply a function to every immediate subterm.
@@ -150,6 +160,7 @@ descend f tm = case tm of
   Assign x e -> Assign x (f e)
   Seq a b -> Seq (f a) (f b)
   LetVar x e b -> LetVar x (f e) (f b)
+  At p e -> At p (f e)
   _ -> tm
 
 -- | Monadic 'descend': rewrite every immediate subterm, left to right.
@@ -175,6 +186,7 @@ descendM f tm = case tm of
   Assign x e -> Assign x <$> f e
   Seq a b -> Seq <$> f a <*> f b
   LetVar x e b -> LetVar x <$> f e <*> f b
+  At p e -> At p <$> f e
   _ -> pure tm
 
 -- | All subterms, including the term itself.

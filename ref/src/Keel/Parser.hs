@@ -209,8 +209,16 @@ atomTy =
 expr :: Parser Term
 expr = foldr1 Seq <$> sepBy1 opExpr (op ";")
 
+-- | Record where a term starts, for error messages. Whole expressions and applications are
+-- marked, never a call's head or an argument atom, so the shapes later passes look for
+-- (@App (Var f) a@, @Con c [] [x]@) stay intact.
+located :: Parser Term -> Parser Term
+located p = do
+  pos <- getPosition
+  At (sourceLine pos, sourceColumn pos) <$> p
+
 opExpr :: Parser Term
-opExpr = lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> cmpE
+opExpr = located (lambda <|> letE <|> varE <|> ifE <|> handleE <|> assign <|> cmpE)
   where
     lambda = do
       _ <- Tok.symbol lexer "\\"
@@ -290,7 +298,7 @@ arithOp ops =
     ]
 
 appE :: Parser Term
-appE = do
+appE = located $ do
   h <-
     (reserved "box" >> Box <$> postfix)
       <|> (reserved "unbox" >> Unbox <$> postfix)

@@ -32,20 +32,20 @@ main = do
   args <- getArgs
   case args of
     ["check", f] -> do
-      core <- load f
-      mono <- orDie (showErr (compile core))
-      (t, eff) <- orDie (showErr (checkProgram mono))
+      (src, core) <- load f
+      mono <- orDie (showErr f src (compile core))
+      (t, eff) <- orDie (showErr f src (checkProgram mono))
       putStrLn ("ok: main : " ++ prettyTy t ++ (if null (prettyEff eff) then "" else " ! " ++ prettyEff eff))
     ["run", f] -> do
-      core <- load f
-      mono <- orDie (showErr (compile core))
+      (src, core) <- load f
+      mono <- orDie (showErr f src (compile core))
       let (outcome, trace) = evalProgram mono
       mapM_ print trace
       case outcome of
         Done v -> putStrLn ("result: " ++ show v)
         Panicked msg -> hPutStrLn stderr ("panic: " ++ msg) >> exitWith (ExitFailure 101)
     ["asm", f] -> do
-      core <- load f
+      (_, core) <- load f
       putStr =<< orDie (compileNative core)
     "build" : "--target" : "riscv64" : rest -> case rest of
       [f] -> buildRv f (dropExtension f) >> pure ()
@@ -63,16 +63,19 @@ main = do
       exitWith code
     _ -> die usage
 
--- | Parse and infer: the λK₃ program the core pipeline takes.
-load :: FilePath -> IO Program
+-- | Parse and infer: the source and the λK₃ program the core pipeline takes.
+load :: FilePath -> IO (String, Program)
 load f = do
   src <- readFile f
   surface <- orDie (parseProgram f src)
-  orDie (showErr (inferProgram surface))
+  core <- orDie (showErr f src (inferProgram surface))
+  -- Report core errors (linearity, effects, references) with positions too.
+  _ <- orDie (showErr f src (compile core))
+  pure (src, core)
 
 build :: FilePath -> FilePath -> IO ()
 build f out = do
-  core <- load f
+  (_, core) <- load f
   asm <- orDie (compileNative core)
   let s = out <.> "s"
   writeFile s asm
@@ -83,15 +86,27 @@ build f out = do
 
 buildRv :: FilePath -> FilePath -> IO (RiscVTools, FilePath)
 buildRv f out = do
-  core <- load f
+  (_, core) <- load f
   asm <- orDie (compileRiscV core)
   tools <- maybe (die "RISC-V needs Homebrew's llvm, lld and qemu: brew install llvm lld qemu") pure =<< findRiscVTools
   elf <- orDie =<< buildRiscV tools out asm
   hPutStrLn stderr ("built " ++ elf ++ " (RISC-V, QEMU virt)")
   pure (tools, elf)
 
-showErr :: Either TypeError a -> Either String a
-showErr = either (\(TypeError k msg) -> Left ("error [" ++ show k ++ "]: " ++ msg)) Right
+-- | @file:line:col: error [Kind]: message@, then the source line with a caret under the column.
+showErr :: FilePath -> String -> Either TypeError a -> Either String a
+showErr f src = either (Left . render) Right
+  where
+    render (TypeError k msg pos) = case pos of
+      Nothing -> f ++ ": error [" ++ show k ++ "]: " ++ msg
+      Just (l, c) ->
+        let srcLine = case drop (l - 1) (lines src) of
+              s : _ -> s
+              [] -> ""
+            gutter = show l ++ " | "
+         in f ++ ":" ++ show l ++ ":" ++ show c ++ ": error [" ++ show k ++ "]: " ++ msg ++ "\n"
+              ++ gutter ++ srcLine ++ "\n"
+              ++ replicate (length gutter + c - 1) ' ' ++ "^"
 
 orDie :: Either String a -> IO a
 orDie = either die pure

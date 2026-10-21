@@ -26,7 +26,13 @@ import Keel.Check (recursiveGroups, typeOfClosed)
 import Keel.Syntax
 
 optimize :: Program -> Program
-optimize = removeDead . simplify . specialize . liftClosed
+optimize = removeDead . simplify . specialize . liftClosed . stripPositions
+
+stripPositions :: Program -> Program
+stripPositions (Program decls main) = Program [strip d | d <- decls] (stripAt main)
+  where
+    strip (Def f t e) = Def f t (stripAt e)
+    strip d = d
 
 -- Lifting closed λ arguments ------------------------------------------------------------------
 

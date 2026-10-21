@@ -10,7 +10,7 @@ module Keel.Elab (checkRefs, elaborate, checkSurface) where
 import Control.Monad (forM_, when)
 import Control.Monad.Trans.State.Strict (State, evalState, get, put)
 import Data.Map.Strict qualified as M
-import Keel.Check (ErrKind (..), TypeError (..), checkProgram)
+import Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram)
 import Keel.Syntax
 
 -- | Place-check, elaborate and type-check a λK₃ program.
@@ -29,7 +29,7 @@ data Access
 type TC = Either TypeError
 
 err :: ErrKind -> String -> TC a
-err k msg = Left (TypeError k msg)
+err k msg = Left (TypeError k msg Nothing)
 
 checkRefs :: Program -> TC ()
 checkRefs (Program decls main) = do
@@ -62,6 +62,7 @@ paramOk t = case t of
 
 places :: M.Map String Access -> Term -> TC ()
 places env tm = case tm of
+  At p e -> atPos p (places env e)
   Var x -> readable x
   Assign x e -> writable x >> places env e
   App f (Borrow x) -> readable x >> rebindable x >> places env f
@@ -181,6 +182,7 @@ expr :: Places -> Term -> K -> M Term
 expr ps tm k
   | not (usesRefs tm) = k ps (rename ps tm)
   | otherwise = case tm of
+      At _ e -> expr ps e k -- positions are kept only where no references are elaborated
       Assign x e -> expr ps e $ \ps1 v -> do
         x' <- fresh x
         Let x' v <$> k (M.insert x x' ps1) UnitLit

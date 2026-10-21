@@ -94,6 +94,7 @@ noPolyRecursion decls = forM_ [(f, vs, e) | Def f (TForall vs _ _) e <- decls] $
         ( TypeError
             PolyRecursion
             (f ++ " calls " ++ g ++ " at [" ++ intercalate ", " (map prettyTy tys) ++ "]: recursion must keep the same type variables")
+            Nothing
         )
   where
     groups = recursiveGroups decls

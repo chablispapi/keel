@@ -20,11 +20,11 @@ module Keel.Infer (inferProgram) where
 
 import Control.Monad (forM, forM_, unless, when, zipWithM, zipWithM_)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.State.Strict (StateT, evalStateT, get, gets, modify, put)
+import Control.Monad.Trans.State.Strict (StateT (..), evalStateT, get, gets, modify, put)
 import Data.List (isPrefixOf)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.Check (ErrKind (..), TypeError (..), recursiveGroups)
+import Keel.Check (ErrKind (..), TypeError (..), atPos, recursiveGroups)
 import Keel.Syntax
 
 data Sig = Sig
@@ -59,7 +59,11 @@ data Env = Env
   }
 
 failWith :: ErrKind -> String -> I a
-failWith k msg = lift (Left (TypeError k msg))
+failWith k msg = lift (Left (TypeError k msg Nothing))
+
+-- | Run an inference step, attaching this position to its error if it has none.
+located :: Pos -> I a -> I a
+located p m = StateT $ \s -> atPos p (runStateT m s)
 
 -- | Infer a surface program; the result is a λK₃ program for "Keel.Mono".compile.
 inferProgram :: Program -> Either TypeError Program
@@ -176,6 +180,12 @@ bindMeta :: Int -> Ty -> I ()
 bindMeta n t = do
   t' <- zonk t
   when (occurs t') $ failWith Mismatch ("infinite type: ?" ++ show n ++ " = " ++ prettyTy t')
+  -- The type of an integer literal can only become an integer type: say so where it happens.
+  lits <- gets stLits
+  when (n `elem` lits) $ case t' of
+    TInt _ -> pure ()
+    TMeta m -> modify (\s -> s {stLits = m : stLits s})
+    _ -> failWith Mismatch ("expected " ++ prettyTy t' ++ ", got an integer")
   modify (\s -> s {stTy = M.insert n t' (stTy s)})
   where
     occurs u = case u of
@@ -238,6 +248,9 @@ local env x = maybe (failWith NotAPlace (x ++ " is not a local variable")) pure 
 -- Inference -------------------------------------------------------------------------------
 
 check :: Env -> Term -> Ty -> I (Term, Eff)
+check env (At p e) expected = located p $ do
+  (e', eff) <- check env e expected
+  pure (At p e', eff)
 check env tm expected = do
   ex <- shallow expected
   case (tm, ex) of
@@ -339,6 +352,9 @@ binders env ((x, t) : rest) = do
 
 infer :: Env -> Term -> I (Term, Ty, Eff)
 infer env tm = case tm of
+  At p e -> located p $ do
+    (e', t, eff) <- infer env e
+    pure (At p e', t, eff)
   Var x
     | Just (x', t) <- M.lookup x (eLocals env) -> pure (Var x', t, S.empty)
     | Just t <- M.lookup x (sDefs sig) -> case t of
