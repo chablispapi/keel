@@ -1,0 +1,15 @@
+-- Shifts and divisions by constants, and conversions to narrow types, take shortcuts in the
+-- AArch64 back end (one instruction, no checks); they must agree with the evaluator.
+
+def mix : i64 -> i64 ->{Panic} i64 =
+  \x y.
+    let a = (x lsl 13) lxor (x lsr 7) lxor (x lsr 63) in
+    let b = (y as i8) lsr 2 in
+    let c = (y as u8) lsr 3 in
+    let d = (x as i16) lsr 15 in
+    let e = x / 7 + x % 7 + x / (0 - 3) + x % (0 - 3) in
+    let f = ((x as u64) / 10) as i64 + ((x as u32) % 1000) as i64 in
+    let g = (x as i32) as i64 + (x as u16) as i64 + (y as i8) as i64 + (y as u32) as i64 in
+    a +% (b as i64) +% (c as i64) +% (d as i64) +% e +% f +% g
+
+main = mix 123456789 (0 - 77) +% mix (0 - 987654321987) 300 +% mix 9223372036854775807 (0 - 1)

@@ -80,6 +80,14 @@ widening conversions as moves and letting a `case`'s last branch fall through ga
 port now keeps its tree in an `arena` (as Goose keeps its in one pool), 0.79× more. Reading the
 layout costs one instruction more per `case` than the old tag byte (`map` 1.03×).
 
+**4-byte array elements** (both back ends). `Array i32` (and `u32`, `u8`, `Bool`, …) stores
+4 bytes per element, read sign- or zero-extended; the vectorized reduction loads eight such
+elements per iteration and widens them to 64-bit lanes (`sxtl`/`uxtl`). `sum` ported to `i32`
+elements: peak memory equal to Goose's (63 MB at 16M), 0.96× the time: what is left is
+building the array (each push stores the length that the next one loads). Also: shifts by a
+constant, division by a constant other than 0 and -1, and narrowing conversions are one or
+two instructions with no checks.
+
 Both back ends (ARM64 and RISC-V) share the allocation (`allocate` in `ref/src/Keel/AArch64.hs`),
 and the full test suite passes on both after each step.
 

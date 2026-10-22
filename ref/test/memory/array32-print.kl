@@ -1,0 +1,5 @@
+-- The result printer reads 4-byte elements.
+
+import std.array
+
+main = array.push (array.push (array.make 2 (0 - 5 as i32)) 2147483647) (0 - 2147483647 - 1)

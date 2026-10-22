@@ -1,0 +1,36 @@
+-- Arrays of narrow elements (an integer of at most 32 bits, or Bool) take 4 bytes each: every
+-- operation at i32 (negative values sign-extend), u32 (large ones zero-extend), u8 and Bool;
+-- growth in place and by copy (a shared array keeps its contents); and the vectorized sum over
+-- i32 and u32 elements, including a negative element (the scalar loop redoes it).
+
+import std.array
+
+def fill : i32 -> i32 -> Array i32 ->{Panic, Diverge} Array i32 =
+  \i n xs. if i == n then xs else fill (i + 1) n (array.push xs (i * 7 - 50))
+
+def sum32 : Array i32 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else sum32 xs (i + 1) (acc + (array.get xs i as i64))
+
+def sumW : Array i32 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else sumW xs (i + 1) (acc +% (array.get xs i as i64))
+
+def sumU : Array u32 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else sumU xs (i + 1) (acc +% (array.get xs i as i64))
+
+def fillU : i64 -> Array u32 ->{Panic, Diverge} Array u32 =
+  \i xs. if i == 37 then xs else fillU (i + 1) (array.push xs ((4000000000 - i * 3) as u32))
+
+def bools : Array Bool -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else bools xs (i + 1) (if array.get xs i then acc + 1 else acc)
+
+main =
+  let a = fill 0 1000 array.empty in
+  let pos = fill 8 203 array.empty in
+  let b = array.set (array.pop (array.pop a)) 3 (0 - 2000000000) in
+  let shared = fill 0 4 array.empty in
+  let c = array.push shared 9 in
+  let u = fillU 0 array.empty in
+  let bs = array.set (array.make 21 true) 4 false in
+  let bytes = array.push (array.make 3 (250 as u8)) (7 as u8) in
+  sum32 a 0 0 + sum32 b 0 0 * 3 + sum32 shared 0 0 * 5 + sum32 c 0 0 * 7 + sumU u 0 0
+    + sum32 pos 0 0 * 17 + sumW a 0 0 * 19 + bools bs 0 0 * 11 + (array.get bytes 0 as i64) * 13 + (array.get bytes 3 as i64) + array.length b

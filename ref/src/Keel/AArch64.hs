@@ -268,6 +268,16 @@ leave slots = do
   saveRegs ("ldr", "ldp") (fSaved slots)
   epilogue
 
+-- | An array's payload words for @n@ elements (2 + n elements, rounded up to words) into @d@,
+-- after a compare whose ne means words (eq: 4-byte elements). Uses x16.
+elemWords :: String -> String -> G ()
+elemWords d n = do
+  ins "cset x16, ne"
+  ins "add x16, x16, #2" -- log2 of the element size
+  ins ("lsl " ++ d ++ ", " ++ n ++ ", x16")
+  ins ("add " ++ d ++ ", " ++ d ++ ", #23") -- + 7 to round up, + 16 for length and capacity
+  ins ("lsr " ++ d ++ ", " ++ d ++ ", #3")
+
 -- | Store or load callee-saved registers at their save offsets, two at a time where adjacent.
 saveRegs :: (String, String) -> [(String, Int)] -> G ()
 saveRegs (one, two) rs = case rs of
@@ -307,7 +317,7 @@ uses e = case e of
       RPerform _ a -> av a
       RConv _ a -> av a
       RArray _ _ as -> concatMap av as
-      RIndex a i -> av a ++ av i
+      RIndex a i _ -> av a ++ av i
       RArena _ -> []
 
 -- | Variables bound in a body.
@@ -559,12 +569,14 @@ expr slots join e = case e of
 -- > f … xs … i … acc … = if i == length xs then acc else f … xs … (i + 1) … (acc + e) …
 --
 -- where e is computed from @get xs i@ (unchecked: "Keel.Range" proved the index in bounds), the
--- parameters passed on unchanged, and constants, by 64-bit @land lor lxor +% -%@.
+-- parameters passed on unchanged, and constants, by 64-bit @land lor lxor +% -%@ and
+-- conversions to 64 bits (an @i32@ element's @as i64@).
 data Reduction = Reduction
   { rXs, rI, rAcc, rE :: String
   , rChecked :: Bool                  -- ^ acc + e panics on overflow (else it wraps)
-  , rNodes :: [(String, Prim, Atom, Atom)] -- ^ e's computation, in order; the last is e
-  , rElems :: [String]                -- ^ variables holding get xs i
+  , rNodes :: [(String, Prim, Atom, Atom)] -- ^ e's computation, in order
+  , rElems :: [String]                -- ^ variables holding get xs i (or it converted)
+  , rElem :: Elem                     -- ^ how xs holds its elements
   }
 
 reduction :: String -> Fun -> Maybe Reduction
@@ -575,20 +587,29 @@ reduction lbl (Fun _ params _ [] _ False body) = case body of
         i1 <- listToMaybe [t | (t, RPrim (Arith ov Add) it (AVar i') (AInt 1)) <- binds, i' == i, ov /= Saturate, ov /= Optional, bits it == 64]
         -- acc: the parameter added to (the branch that ends the loop doesn't matter here)
         (acc, acc1, checked, e) <- listToMaybe [(a, t, ov == Checked, e) | (t, RPrim (Arith ov Add) it (AVar a) (AVar e)) <- binds, a `elem` params, ov `elem` [Checked, Wrap], bits it == 64, ov == Wrap || signed it]
-        let elems = [t | (t, RIndex (AVar xs') (AVar i')) <- binds, xs' == xs, i' == i]
-            nodes = [(t, op, a, b) | (t, RPrim op it a b) <- binds, t `notElem` [i1, acc1], bits it == 64, op `elem` vectorOps]
+        let loads = [(t, k) | (t, RIndex (AVar xs') (AVar i') k) <- binds, xs' == xs, i' == i]
+            -- A conversion to 64 bits doesn't change a canonical value: another name for it.
+            convs = [(t, v) | (t, RConv to (AVar v)) <- binds, bits to == 64]
+            name v = maybe v name (lookup v convs)
+            nm a = case a of
+              AVar v -> AVar (name v)
+              _ -> a
+            elems = map fst loads
+            nodes = [(t, op, nm a, nm b) | (t, RPrim op it a b) <- binds, t `notElem` [i1, acc1], bits it == 64, op `elem` vectorOps]
             invariant = [p | (p, AVar a) <- zip params args, a == p]
             known v = v `elem` elems || v `elem` invariant || v `elem` [t | (t, _, _, _) <- nodes]
             operandOk a = case a of
               AVar v -> v `notElem` [i, acc] && known v
               AInt _ -> True
               _ -> False
+        k <- listToMaybe (map snd loads)
         if args == [if p == i then AVar i1 else if p == acc then AVar acc1 else AVar p | p <- params]
           && xs `elem` invariant
-          && length binds == 2 + length elems + length nodes
+          && all ((== k) . snd) loads
+          && length binds == 2 + length elems + length nodes + length convs
           && all (\(_, _, a, b) -> operandOk a && operandOk b) nodes
-          && known e
-          then Just (Reduction xs i acc e checked nodes elems)
+          && known (name e)
+          then Just (Reduction xs i acc (name e) checked nodes elems k)
           else Nothing
     where
       counter = case (x, y) of
@@ -607,55 +628,66 @@ reduction _ _ = Nothing
 vectorOps :: [Prim]
 vectorOps = [Bits And, Bits Or, Bits Xor, Arith Wrap Add, Arith Wrap Sub]
 
--- | The reduction four elements at a time (two NEON registers of two lanes), from the current i
--- to the last multiple of four before the end; the scalar loop does the rest. With a checked
--- acc + e, the result is kept only if every e was ≥ 0 and no lane's sum overflowed: then the
--- running sum only grows, so adding the lanes to acc with checked adds panics exactly when
--- some step of the scalar loop would. Otherwise nothing was stored, and the scalar loop starts
--- over from the same i (the loop is pure, so running it again shows no difference).
+-- | The reduction several elements at a time, from the current i to the last multiple of a
+-- step before the end; the scalar loop does the rest. Each iteration loads two NEON registers:
+-- four 8-byte elements, or eight 4-byte ones widened to 64 bits (four registers of two lanes).
+-- With a checked acc + e, the result is kept only if every e was ≥ 0 and no lane's sum
+-- overflowed: then the running sum only grows, so adding the lanes to acc with checked adds
+-- panics exactly when some step of the scalar loop would. Otherwise nothing was stored, and
+-- the scalar loop starts over from the same i (the loop is pure, so running it again shows no
+-- difference).
 --
--- Registers: v0, v1 the lane sums, v2 and v30 the sign bits seen (two, so that each iteration
--- adds one OR to each chain), v28 and v29 the ORs feeding them, v3–v7 the invariants and
--- constants, v16, v17 the elements, v18–v27 the other values (two each); v8–v15 are
+-- Registers, with u = 2 or 4 registers per value: v0… the lane sums, v4–v7 the invariants and
+-- constants, v16… the elements, v20–v27 the other values, v30 and v31 the sign bits seen (two
+-- chains, one OR each per iteration), v28 and v29 the ORs feeding them; v8–v15 are
 -- callee-saved in C.
 -- ponytail: one loop shape, recognised by pattern; a loop IR when more loops need it.
 vectorLoop :: Slots -> Reduction -> G ()
-vectorLoop slots red = when (length scalars <= 5 && length (rNodes red) <= 5) $ do
+vectorLoop slots red = when (length scalars <= 4 && u * length (rNodes red) <= 8) $ do
   lSkip <- newLabel
   lLoop <- newLabel
   atom slots "x9" (AVar (rXs red))
   atom slots "x10" (AVar (rI red))
   ins "ldr x11, [x9]"
   ins "sub x12, x11, x10"
-  ins "cmp x12, #4"
+  ins ("cmp x12, #" ++ show step)
   ins ("b.lt " ++ lSkip)
-  ins "and x12, x12, #-4"
+  ins ("and x12, x12, #-" ++ show step)
   ins "add x13, x9, #16"
-  ins "add x13, x13, x10, lsl #3"
-  ins "add x14, x13, x12, lsl #3"
-  forM_ ["v0", "v1", "v2", "v30"] $ \v -> ins ("movi " ++ v ++ ".2d, #0")
-  forM_ (zip scalars [3 :: Int ..]) $ \(a, k) -> atom slots "x15" a >> ins ("dup v" ++ show k ++ ".2d, x15")
+  ins ("add x13, x13, x10, lsl #" ++ show sh)
+  ins ("add x14, x13, x12, lsl #" ++ show sh)
+  forM_ (map sum' halves ++ ["v30", "v31"]) $ \v -> ins ("movi " ++ v ++ ".2d, #0")
+  forM_ (zip scalars [4 :: Int ..]) $ \(a, k) -> atom slots "x15" a >> ins ("dup v" ++ show k ++ ".2d, x15")
   line (lLoop ++ ":")
   ins "ldp q16, q17, [x13], #32"
-  forM_ (rNodes red) $ \(t, op, a, b) -> forM_ [0, 1] $ \h ->
+  case rElem red of
+    -- Widen in place, last first: v18, v19 from v17, then v16, v17 from v16.
+    ENarrow sgn -> do
+      let xtl = if sgn then "sxtl" else "uxtl"
+      ins (xtl ++ "2 v19.2d, v17.4s")
+      ins (xtl ++ " v18.2d, v17.2s")
+      ins (xtl ++ "2 v17.2d, v16.4s")
+      ins (xtl ++ " v16.2d, v16.2s")
+    _ -> pure ()
+  forM_ (rNodes red) $ \(t, op, a, b) -> forM_ halves $ \h ->
     ins (opName op ++ " " ++ vreg (AVar t) h ++ arr op ++ ", " ++ vreg a h ++ arr op ++ ", " ++ vreg b h ++ arr op)
   let e = AVar (rE red)
-  forM_ [0, 1] $ \h -> ins ("add v" ++ show h ++ ".2d, v" ++ show h ++ ".2d, " ++ vreg e h ++ ".2d")
+  forM_ halves $ \h -> ins ("add " ++ sum' h ++ ".2d, " ++ sum' h ++ ".2d, " ++ vreg e h ++ ".2d")
   when (rChecked red) $ do
-    ins ("orr v28.16b, " ++ vreg e 0 ++ ".16b, " ++ vreg e 1 ++ ".16b")
-    ins "orr v29.16b, v0.16b, v1.16b"
-    ins "orr v2.16b, v2.16b, v28.16b"
-    ins "orr v30.16b, v30.16b, v29.16b"
+    orAll "v28" [vreg e h | h <- halves]
+    orAll "v29" (map sum' halves)
+    ins "orr v30.16b, v30.16b, v28.16b"
+    ins "orr v31.16b, v31.16b, v29.16b"
   ins "cmp x13, x14"
   ins ("b.ne " ++ lLoop)
   when (rChecked red) $ do
-    ins "orr v2.16b, v2.16b, v30.16b"
-    ins "mov x15, v2.d[0]"
-    ins "mov x16, v2.d[1]"
+    ins "orr v30.16b, v30.16b, v31.16b"
+    ins "mov x15, v30.d[0]"
+    ins "mov x16, v30.d[1]"
     ins "orr x15, x15, x16"
     ins ("tbnz x15, #63, " ++ lSkip)
   atom slots "x15" (AVar (rAcc red))
-  forM_ ["v0.d[0]", "v0.d[1]", "v1.d[0]", "v1.d[1]"] $ \l -> do
+  forM_ [sum' h ++ ".d[" ++ show lane ++ "]" | h <- halves, lane <- [0, 1 :: Int]] $ \l -> do
     ins ("mov x16, " ++ l)
     if rChecked red
       then ins "adds x15, x15, x16" >> ins "b.vs _keel_panic_overflow"
@@ -665,12 +697,22 @@ vectorLoop slots red = when (length scalars <= 5 && length (rNodes red) <= 5) $ 
   store slots "x15" (rAcc red)
   line (lSkip ++ ":")
   where
+    (u, sh) = case rElem red of
+      ENarrow _ -> (4, 2 :: Int)
+      _ -> (2, 3)
+    halves = [0 .. u - 1] :: [Int]
+    step = 2 * u
+    sum' h = "v" ++ show h
     temps = rElems red ++ [t | (t, _, _, _) <- rNodes red]
     scalars = nub [o | (_, _, a, b) <- rNodes red, o <- [a, b], case o of AVar v -> v `notElem` temps; _ -> True]
     vreg a h = case a of
-      AVar v | v `elem` rElems red -> "v" ++ show (16 + h :: Int)
-      AVar v | Just k <- elemIndex v [t | (t, _, _, _) <- rNodes red] -> "v" ++ show (18 + 2 * k + h)
-      _ -> "v" ++ show (3 + fromMaybe 0 (elemIndex a scalars))
+      AVar v | v `elem` rElems red -> "v" ++ show (16 + h)
+      AVar v | Just k <- elemIndex v [t | (t, _, _, _) <- rNodes red] -> "v" ++ show (20 + u * k + h)
+      _ -> "v" ++ show (4 + fromMaybe 0 (elemIndex a scalars))
+    orAll d (v : w : vs) = do
+      ins ("orr " ++ d ++ ".16b, " ++ v ++ ".16b, " ++ w ++ ".16b")
+      forM_ vs $ \x -> ins ("orr " ++ d ++ ".16b, " ++ d ++ ".16b, " ++ x ++ ".16b")
+    orAll _ _ = pure ()
     opName op = case op of
       Bits And -> "and"
       Bits Or -> "orr"
@@ -783,26 +825,47 @@ rhsInto slots d rhs = case rhs of
     ra <- operand slots "x9" a
     ins (headerRead sgn d ++ ", [" ++ ra ++ ", #-4]")
     pure True
-  -- To a 64-bit type the canonical form doesn't change: a move.
+  -- To a 64-bit type the canonical form doesn't change: a move. Narrower: re-extend.
   RConv to a | bits to == 64 -> atom slots d a >> pure True
+  RConv to@(IntTy sgn n) a -> do
+    ra <- operand slots "x9" a
+    let w r = 'w' : drop 1 r
+    ins $ case () of
+      _ | sgn -> (case n of 8 -> "sxtb "; 16 -> "sxth "; _ -> "sxtw ") ++ d ++ ", " ++ w ra
+        | n == 32 -> "mov " ++ w d ++ ", " ++ w ra
+        | otherwise -> "and " ++ d ++ ", " ++ ra ++ ", #" ++ show (snd (intRange to))
+    pure True
+  -- A shift by a constant in range: one instruction. A right shift of a canonical value stays
+  -- canonical; a left shift only at 64 bits, where nothing needs re-extending.
+  RPrim (Bits bop) (IntTy sgn n) a (AInt k)
+    | k >= 0, k < 64, bop == Shr || (bop == Shl && n == 64) -> do
+        ra <- operand slots "x9" a
+        ins ((if bop == Shl then "lsl " else if sgn then "asr " else "lsr ") ++ d ++ ", " ++ ra ++ ", #" ++ show k)
+        pure True
+  -- Division by a constant that is neither 0 nor -1 can't panic.
+  RPrim (Arith Checked aop) (IntTy sgn _) a (AInt k)
+    | aop `elem` [Div, Rem], k /= 0, k /= -1 || not sgn -> do
+        ra <- operand slots "x9" a
+        movImm "x10" k
+        ins ((if sgn then "sdiv" else "udiv") ++ " x11, " ++ ra ++ ", x10")
+        ins (if aop == Div then "mov " ++ d ++ ", x11" else "msub " ++ d ++ ", x11, x10, " ++ ra)
+        pure True
   RArray ALength _ [a] -> do
     ra <- operand slots "x9" a
     ins ("ldr " ++ d ++ ", [" ++ ra ++ "]")
     pure True
-  RArray AGet _ [a, i] -> do
+  RArray AGet e [a, i] -> do
     ra <- operand slots "x9" a
     ri <- operand slots "x10" i
     ins ("ldr x11, [" ++ ra ++ "]")
     ins ("cmp " ++ ri ++ ", x11")
     ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
-    ins ("add x11, " ++ ra ++ ", " ++ ri ++ ", lsl #3")
-    ins ("ldr " ++ d ++ ", [x11, #16]")
+    element e d ra ri
     pure True
-  RIndex a i -> do
+  RIndex a i e -> do
     ra <- operand slots "x9" a
     ri <- operand slots "x10" i
-    ins ("add x11, " ++ ra ++ ", " ++ ri ++ ", lsl #3")
-    ins ("ldr " ++ d ++ ", [x11, #16]")
+    element e d ra ri
     pure True
   _ -> pure False
   where
@@ -811,6 +874,12 @@ rhsInto slots d rhs = case rhs of
       ins ("cmp " ++ ra ++ ", " ++ rb)
       ins ("cset " ++ d ++ ", " ++ cond)
       pure True
+
+-- | Load element ri of array ra into d (uses x11).
+element :: Elem -> String -> String -> String -> G ()
+element e d ra ri = do
+  ins ("add x11, " ++ ra ++ ", " ++ ri ++ ", lsl #" ++ (case e of ENarrow _ -> "2"; _ -> "3"))
+  ins ((case e of ENarrow sgn -> headerRead sgn d; _ -> "ldr " ++ d) ++ ", [x11, #16]")
 
 -- | Load the header field into register x…: sign- or zero-extended to the canonical form.
 headerRead :: Bool -> String -> String
@@ -909,20 +978,19 @@ rhsCode slots rhs = case rhs of
   RArena False -> ins "bl _keel_arena_close"
   -- Arrays (spec/memory.md): length and get read the block; the rest are runtime routines.
   RArray ALength _ [a] -> atom slots "x9" a >> ins "ldr x0, [x9]"
-  RArray AGet _ [a, i] -> do
+  RArray AGet e [a, i] -> do
     atom slots "x9" a
     atom slots "x10" i
     ins "ldr x11, [x9]"
     ins "cmp x10, x11"
     ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
-    ins "add x9, x9, x10, lsl #3"
-    ins "ldr x0, [x9, #16]"
-  RIndex a i -> atom slots "x9" a >> atom slots "x10" i >> ins "add x9, x9, x10, lsl #3" >> ins "ldr x0, [x9, #16]"
-  RArray op ptr as -> do
+    element e "x0" "x9" "x10"
+  RIndex a i e -> atom slots "x9" a >> atom slots "x10" i >> element e "x0" "x9" "x10"
+  RArray op e as -> do
     forM_ (zip [0 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
     case op of
-      AEmpty -> ins "mov x0, #0" >> ins ("mov x1, #" ++ flag) >> ins "bl _keel_array_alloc"
-      ANew -> ins ("mov x2, #" ++ flag) >> ins "bl _keel_array_new"
+      AEmpty -> ins "mov x0, #0" >> ins ("mov x1, #" ++ kind) >> ins "bl _keel_array_alloc"
+      ANew -> ins ("mov x2, #" ++ kind) >> ins "bl _keel_array_new"
       ASet -> ins "bl _keel_array_set"
       -- A unique array with room: store and count, without calling the runtime.
       APush -> do
@@ -935,8 +1003,9 @@ rhsCode slots rhs = case rhs of
         ins "lsr w11, w11, #10"
         ins "cmp w11, #1"
         ins ("b.ne " ++ lSlow)
-        ins "add x11, x0, x9, lsl #3"
-        ins "str x1, [x11, #16]"
+        case e of
+          ENarrow _ -> ins "add x11, x0, x9, lsl #2" >> ins "str w1, [x11, #16]"
+          _ -> ins "add x11, x0, x9, lsl #3" >> ins "str x1, [x11, #16]"
         ins "add x9, x9, #1"
         ins "str x9, [x0]"
         ins ("b " ++ lDone)
@@ -945,7 +1014,7 @@ rhsCode slots rhs = case rhs of
         line (lDone ++ ":")
       _ -> ins "bl _keel_array_pop"
     where
-      flag = if ptr then "1" else "0"
+      kind = show (elemKind e)
   where
     storeAll :: Int -> [String] -> G ()
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
@@ -1193,8 +1262,7 @@ emitPrinter decls printers lbl t = do
       printStr ", "
       line (lFirst ++ ":")
       ins "ldp x9, x11, [sp, #16]"
-      ins "add x9, x9, x11, lsl #3"
-      ins "ldr x0, [x9, #16]"
+      element (elemOf a) "x0" "x9" "x11"
       maybe (printStr "...") (\(_, l) -> ins ("bl " ++ l)) (M.lookup (prettyTy a) printers)
       ins "ldr x11, [sp, #24]"
       ins "add x11, x11, #1"
@@ -1437,7 +1505,7 @@ emitRuntime = do
   ins "b L_drop_loop"
   -- An array: drop its elements if they are pointers, last first, then free it.
   line "L_drop_array:"
-  ins ("cmp w12, #" ++ show (arrayLayout + 1))
+  ins ("cmp w12, #" ++ show (arrayLayout + 2))
   ins "b.ne L_drop_free"
   ins "ldr x12, [x0]"
   line "L_drop_elems:"
@@ -1535,28 +1603,32 @@ emitRuntime = do
   -- An update to an array nothing else references happens in place; otherwise the array is
   -- copied first.
 
-  -- _keel_array_alloc: x0 = capacity, x1 = 1 if the elements are pointers → x0 = an empty array.
+  -- An array's kind (spec/memory.md) is its layout minus arrayLayout: 0 for 4-byte elements,
+  -- 1 for words, 2 for pointers. Its payload words: 2 + its capacity's elements, rounded up.
+
+  -- _keel_array_alloc: x0 = capacity, x1 = kind → x0 = an empty array.
   fn "_keel_array_alloc"
   ins "stp x29, x30, [sp, #-32]!"
   ins "mov x29, sp"
   ins "stp x0, x1, [sp, #16]"
-  ins "add x0, x0, #2"
+  ins "cmp x1, #0"
+  elemWords "x0" "x0"
+  ins "mov x11, x0" -- the allocator leaves x9–x12 alone
   ins "mov x1, #0"
   ins "bl _keel_alloc"
   ins "ldp x9, x10, [sp, #16]"
-  movImm "x11" (1024 + arrayLayout) -- count 1, an array's layout; the next for pointers
-  ins "add x11, x11, x10"
-  ins "add x12, x9, #2" -- its words, capped at 255
-  ins "mov x13, #0xFF"
-  ins "cmp x12, x13"
-  ins "csel x12, x12, x13, lo"
-  ins "orr x11, x11, x12, lsl #32"
-  ins "str x11, [x0, #-8]"
+  movImm "x12" (1024 + arrayLayout) -- count 1, the kind's layout
+  ins "add x12, x12, x10"
+  ins "mov x13, #0xFF" -- its words, capped at 255
+  ins "cmp x11, x13"
+  ins "csel x11, x11, x13, lo"
+  ins "orr x12, x12, x11, lsl #32"
+  ins "str x12, [x0, #-8]"
   ins "stp xzr, x9, [x0]"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 
-  -- _keel_array_new: x0 = length, x1 = the element (owned), x2 = pointer flag → x0.
+  -- _keel_array_new: x0 = length, x1 = the element (owned), x2 = kind → x0.
   fn "_keel_array_new"
   ins "stp x29, x30, [sp, #-48]!"
   ins "mov x29, sp"
@@ -1569,6 +1641,7 @@ emitRuntime = do
   ins "ldp x10, x11, [sp, #16]"
   ins "str x9, [x0]"
   ins "mov x12, #0"
+  ins "cbz x11, L_anew_fill4"
   line "L_anew_fill:"
   ins "cmp x12, x9"
   ins "b.hs L_anew_filled"
@@ -1576,8 +1649,16 @@ emitRuntime = do
   ins "str x10, [x13, #16]"
   ins "add x12, x12, #1"
   ins "b L_anew_fill"
+  line "L_anew_fill4:"
+  ins "cmp x12, x9"
+  ins "b.hs L_anew_filled"
+  ins "add x13, x0, x12, lsl #2"
+  ins "str w10, [x13, #16]"
+  ins "add x12, x12, #1"
+  ins "b L_anew_fill4"
   line "L_anew_filled:"
-  ins "cbz x11, L_anew_ret"
+  ins "cmp x11, #2"
+  ins "b.ne L_anew_ret"
   -- The element now has n references in the array; the caller gave one.
   ins "cbz x9, L_anew_drop"
   ins "ldr w13, [x10, #-8]"
@@ -1611,14 +1692,20 @@ emitRuntime = do
   ins "ldr w9, [x0, #-8]"
   ins "mov x0, x1"
   ins "and w1, w9, #0x3ff"
-  ins ("sub w1, w1, #" ++ show arrayLayout) -- 1 for pointers
+  ins ("sub w1, w1, #" ++ show arrayLayout) -- the kind
   ins "bl _keel_array_alloc"
   ins "ldr x9, [sp, #16]"
   ins "ldr x10, [x9]"
   ins "str x10, [x0]"
+  -- Copy the elements' words.
+  ins "ldr w15, [x9, #-8]"
+  ins "and w15, w15, #0x3ff"
+  ins ("cmp w15, #" ++ show arrayLayout)
+  elemWords "x15" "x10"
+  ins "sub x15, x15, #2"
   ins "mov x11, #0"
   line "L_aclone_copy:"
-  ins "cmp x11, x10"
+  ins "cmp x11, x15"
   ins "b.hs L_aclone_copied"
   ins "add x12, x9, x11, lsl #3"
   ins "ldr x13, [x12, #16]"
@@ -1645,7 +1732,7 @@ emitRuntime = do
   ins "b L_aclone_ret"
   line "L_aclone_shared:"
   ins "and w13, w12, #0x3ff"
-  ins ("cmp w13, #" ++ show (arrayLayout + 1))
+  ins ("cmp w13, #" ++ show (arrayLayout + 2))
   ins "b.ne L_aclone_dec"
   ins "mov x11, #0"
   line "L_aclone_dup:"
@@ -1683,12 +1770,18 @@ emitRuntime = do
   ins "bl _keel_array_clone"
   ins "ldp x1, x2, [sp, #16]"
   line "L_aset_store:"
+  ins "ldr w11, [x0, #-8]"
+  ins "and w11, w11, #0x3ff"
+  ins ("cmp w11, #" ++ show arrayLayout)
+  ins "b.ne L_aset_word"
+  ins "add x9, x0, x1, lsl #2"
+  ins "str w2, [x9, #16]"
+  ins "b L_aset_ret"
+  line "L_aset_word:"
   ins "add x9, x0, x1, lsl #3"
   ins "ldr x10, [x9, #16]"
   ins "str x2, [x9, #16]"
-  ins "ldr w11, [x0, #-8]"
-  ins "and w11, w11, #0x3ff"
-  ins ("cmp w11, #" ++ show (arrayLayout + 1))
+  ins ("cmp w11, #" ++ show (arrayLayout + 2))
   ins "b.ne L_aset_ret"
   ins "str x0, [sp, #16]"
   ins "mov x0, x10"
@@ -1724,21 +1817,25 @@ emitRuntime = do
   ins "lsr w11, w11, #10"
   ins "cmp w11, #1"
   ins "b.ne L_apush_copy"
-  ins "add x12, x0, #16"
-  ins "add x12, x12, x10, lsl #3" -- the block's end
+  ins "ldr w15, [x0, #-8]"
+  ins "and w15, w15, #0x3ff"
+  ins ("cmp w15, #" ++ show arrayLayout)
+  elemWords "x12" "x10"
+  ins "add x12, x0, x12, lsl #3" -- the block's end
   address "x13" "_keel_heap_ptr"
   ins "ldr x14, [x13]"
   ins "cmp x12, x14"
   ins "b.ne L_apush_copy"
-  ins "add x12, x0, #16"
-  ins "add x12, x12, x1, lsl #3"
+  ins ("cmp w15, #" ++ show arrayLayout)
+  elemWords "x15" "x1"
+  ins "add x12, x0, x15, lsl #3"
   ins "ldr x14, [x13, #8]"
   ins "cmp x12, x14"
   ins "b.hi _keel_panic_oom"
   ins "str x12, [x13]"
   ins "str x1, [x0, #8]"
   -- The header's words (capped at 255, as in _keel_array_alloc).
-  ins "add x12, x1, #2"
+  ins "mov x12, x15"
   ins "mov x13, #0xFF"
   ins "cmp x12, x13"
   ins "csel x12, x12, x13, lo"
@@ -1750,9 +1847,18 @@ emitRuntime = do
   ins "bl _keel_array_clone"
   line "L_apush_store:"
   ins "ldr x9, [x0]"
-  ins "add x10, x0, x9, lsl #3"
   ins "ldr x1, [sp, #16]"
+  ins "ldr w11, [x0, #-8]"
+  ins "and w11, w11, #0x3ff"
+  ins ("cmp w11, #" ++ show arrayLayout)
+  ins "b.ne L_apush_word"
+  ins "add x10, x0, x9, lsl #2"
+  ins "str w1, [x10, #16]"
+  ins "b L_apush_count"
+  line "L_apush_word:"
+  ins "add x10, x0, x9, lsl #3"
   ins "str x1, [x10, #16]"
+  line "L_apush_count:"
   ins "add x9, x9, #1"
   ins "str x9, [x0]"
   ins "ldp x29, x30, [sp], #32"
@@ -1776,7 +1882,7 @@ emitRuntime = do
   ins "str x9, [x0]"
   ins "ldr w11, [x0, #-8]"
   ins "and w11, w11, #0x3ff"
-  ins ("cmp w11, #" ++ show (arrayLayout + 1))
+  ins ("cmp w11, #" ++ show (arrayLayout + 2))
   ins "b.ne L_apop_ret"
   ins "add x10, x0, x9, lsl #3"
   ins "str x0, [sp, #16]"
@@ -1872,8 +1978,8 @@ emitRuntime = do
   line "L_open_copy:"
   ins "cmp x11, x9"
   ins "b.hs L_open_copied"
-  ins "add x12, x1, x11, lsl #3"
-  ins "ldr x12, [x12, #16]"
+  ins "add x12, x1, x11, lsl #2" -- 4-byte elements
+  ins "ldr w12, [x12, #16]"
   ins "strb w12, [sp, x11]"
   ins "add x11, x11, #1"
   ins "b L_open_copy"

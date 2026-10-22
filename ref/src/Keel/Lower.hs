@@ -12,7 +12,7 @@
 -- block's layout (which constructor, how many words, which are pointers) in its low half, and
 -- a data block's first narrow field (an integer of at most 32 bits, or a Bool) in its high
 -- half (spec/memory.md). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey) where
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (foldM, forM, forM_, when)
@@ -32,6 +32,30 @@ data Atom
   | ANullary Integer -- ^ a constructor without fields: the shared static block of its layout
   deriving (Eq, Show)
 
+-- | How an array holds its elements: 4 bytes each (an integer of at most 32 bits, or a Bool;
+-- whether signed), a word each, or a pointer word each.
+data Elem = ENarrow Bool | EWord | EPtr
+  deriving (Eq, Show)
+
+elemOf :: Ty -> Elem
+elemOf t = case narrowTy t of
+  Just sgn -> ENarrow sgn
+  Nothing -> if isPtr t then EPtr else EWord
+
+-- | The runtime's number for it: an array's layout is 'arrayLayout' plus this.
+elemKind :: Elem -> Integer
+elemKind e = case e of
+  ENarrow _ -> 0
+  EWord -> 1
+  EPtr -> 2
+
+-- | Narrow values (an integer of at most 32 bits, or a Bool) fit in 4 bytes: whether signed.
+narrowTy :: Ty -> Maybe Bool
+narrowTy t = case t of
+  TInt it | bits it <= 32 -> Just (signed it)
+  TBool -> Just False
+  _ -> Nothing
+
 -- | Bitmaps mark which payload words hold pointers (bit i = word i); the runtime uses them to
 -- drop children when a block is freed.
 data Rhs
@@ -50,9 +74,9 @@ data Rhs
   | RPopHandler Atom                    -- ^ pop (and drop) the frame
   | RPerform Int Atom                   -- ^ perform operation n: innermost handler, else the machine
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
-  | RArray ArrayOp Bool [Atom]          -- ^ an array operation; whether the elements are pointers
+  | RArray ArrayOp Elem [Atom]          -- ^ an array operation, by how the array holds its elements
   | RArena Bool                         -- ^ open (True) or close the innermost arena
-  | RIndex Atom Atom                    -- ^ element i of an array, known to be in bounds ("Keel.Range")
+  | RIndex Atom Atom Elem               -- ^ element i of an array, known to be in bounds ("Keel.Range")
   deriving (Show)
 
 data Expr
@@ -164,23 +188,18 @@ layoutId field tag n bm = do
         then unsupported "too many block layouts"
         else put s {lsLayouts = M.insert (tag, n, bm) i (lsLayouts s)} >> pure i
 
--- | Arrays' layouts: this one, and the next for arrays of pointers. From 'fieldLayouts' on,
--- layouts whose header holds a field.
+-- | Arrays' layouts: this one plus 'elemKind'. From 'fieldLayouts' on, layouts whose header
+-- holds a field.
 arrayLayout, fieldLayouts :: Integer
-arrayLayout = 510
+arrayLayout = 509
 fieldLayouts = 512
 
 -- | Where a constructor's fields go: the first narrow one (an integer of at most 32 bits, or a
 -- Bool) in the header word's upper half, the others one word each, in order.
 fieldSlots :: [Ty] -> (Maybe Int, [Int])
-fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, narrow t] of
+fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, isJust (narrowTy t)] of
   h : _ -> (Just h, filter (/= h) [0 .. length ts - 1])
   [] -> (Nothing, [0 .. length ts - 1])
-  where
-    narrow t = case t of
-      TInt it -> bits it <= 32
-      TBool -> True
-      _ -> False
 
 -- | A data block's layout at these (instantiated) field types: its id, its header field and
 -- its words.
@@ -334,7 +353,7 @@ expr info env tm k = case tm of
       userEffects = case typeOf info env f of
         TFun _ e _ -> e S.\\ S.fromList (panicE : divergeE : map fst builtinEffects)
         _ -> S.empty
-  ArrayPrim op t args -> subs args $ \vs -> bindRhs (RArray op (isPtr t) vs)
+  ArrayPrim op t args -> subs args $ \vs -> bindRhs (RArray op (elemOf t) vs)
   -- let x = y: x is another name for y, not a second reference (which would cost a dup and a
   -- drop around every use, e.g. an inlined array.length xs).
   Let x e b | Var y <- stripAt e, Just y' <- M.lookup y env -> expr info (M.insert x y' env) b k
@@ -720,7 +739,7 @@ exprAtoms e = case e of
       RPerform _ a -> [a]
       RConv _ a -> [a]
       RArray _ _ as -> as
-      RIndex a i -> [a, i]
+      RIndex a i _ -> [a, i]
       _ -> []
 
 -- | Variables returned (Ret consumes its atom).

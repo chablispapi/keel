@@ -424,30 +424,21 @@ rhsCode slots rhs = case rhs of
   RArena True -> ins "call _keel_arena_open"
   RArena False -> ins "call _keel_arena_close"
   RArray ALength _ [a] -> atom slots "t0" a >> ins "ld a0, 0(t0)"
-  RArray AGet _ [a, i] -> do
+  RArray AGet e [a, i] -> do
     atom slots "t0" a
     atom slots "t1" i
     ins "ld t2, 0(t0)"
     jumpIf "bgeu" ["t1", "t2"] "_keel_panic_bounds" -- unsigned: a negative index is out of bounds too
-    ins "slli t1, t1, 3"
-    ins "add t0, t0, t1"
-    ins "ld a0, 16(t0)"
-  RIndex a i -> do
-    atom slots "t0" a
-    atom slots "t1" i
-    ins "slli t1, t1, 3"
-    ins "add t0, t0, t1"
-    ins "ld a0, 16(t0)"
-  RArray op ptr as -> do
+    element e
+  RIndex a i e -> atom slots "t0" a >> atom slots "t1" i >> element e
+  RArray op e as -> do
     forM_ (zip [0 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
     case op of
-      AEmpty -> li "a0" 0 >> li "a1" flag >> ins "call _keel_array_alloc"
-      ANew -> li "a2" flag >> ins "call _keel_array_new"
+      AEmpty -> li "a0" 0 >> li "a1" (elemKind e) >> ins "call _keel_array_alloc"
+      ANew -> li "a2" (elemKind e) >> ins "call _keel_array_new"
       ASet -> ins "call _keel_array_set"
       APush -> ins "call _keel_array_push"
       _ -> ins "call _keel_array_pop"
-    where
-      flag = if ptr then 1 else 0
   where
     storeAll :: Int -> [String] -> G ()
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
@@ -459,6 +450,13 @@ rhsCode slots rhs = case rhs of
       forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "t2" a
         ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
+
+-- | Load element t1 of array t0 into a0.
+element :: Elem -> G ()
+element e = do
+  ins ("slli t1, t1, " ++ (case e of ENarrow _ -> "2"; _ -> "3"))
+  ins "add t0, t0, t1"
+  ins ((case e of ENarrow True -> "lw"; ENarrow False -> "lwu"; _ -> "ld") ++ " a0, 16(t0)")
 
 -- | Checked division (t0 / t1 into a0), as in "Keel.AArch64": RISC-V doesn't trap on a zero
 -- divisor or on min / -1, so both are checked.
@@ -672,9 +670,7 @@ emitPrinter decls printers lbl t = do
       line (lFirst ++ ":")
       ins "ld t0, 0(sp)"
       ins "ld t1, 8(sp)"
-      ins "slli t1, t1, 3"
-      ins "add t0, t0, t1"
-      ins "ld a0, 16(t0)"
+      element (elemOf a)
       maybe (printStr "...") (\(_, l) -> ins ("call " ++ l)) (M.lookup (prettyTy a) printers)
       ins "ld t1, 8(sp)"
       ins "addi t1, t1, 1"
@@ -902,7 +898,8 @@ emitRuntime = do
   ins "j .L_drop_loop"
   -- An array: drop its elements if they are pointers, last first, then free it.
   line ".L_drop_array:"
-  ins "bne t3, t1, .L_drop_elems_ptr"
+  li "t1" (arrayLayout + 2)
+  ins "beq t3, t1, .L_drop_elems_ptr"
   ins "j .L_drop_free"
   line ".L_drop_elems_ptr:"
   ins "ld t2, 0(a0)"
@@ -952,23 +949,24 @@ emitRuntime = do
   line ".L_free_ret:"
   ins "ret"
 
-  -- Arrays: as in "Keel.AArch64" (payload [length, capacity, elements…]; their own layouts,
-  -- the second for pointer elements).
+  -- Arrays: as in "Keel.AArch64" (payload [length, capacity, elements…]; the layout is
+  -- arrayLayout plus the kind: 0 for 4-byte elements, 1 words, 2 pointers).
 
-  -- _keel_array_alloc: a0 = capacity, a1 = pointer flag → a0 = an empty array.
+  -- _keel_array_alloc: a0 = capacity, a1 = kind → a0 = an empty array.
   fn "_keel_array_alloc"
   ins "addi sp, sp, -32"
   ins "sd ra, 24(sp)"
   ins "sd a0, 0(sp)"
   ins "sd a1, 8(sp)"
-  ins "addi a0, a0, 2"
+  elemWords "a0" "a0" "a1" "t0"
+  ins "sd a0, 16(sp)"
   ins "li a1, 0"
   ins "call _keel_alloc"
   ins "ld t0, 0(sp)"
   ins "ld t1, 8(sp)"
-  li "t2" (1024 + arrayLayout) -- count 1, an array's layout; the next for pointers
+  li "t2" (1024 + arrayLayout) -- count 1, the kind's layout
   ins "add t2, t2, t1"
-  ins "addi t3, t0, 2" -- its words, capped at 255
+  ins "ld t3, 16(sp)" -- its words, capped at 255
   ins "li t4, 0xFF"
   ins "bltu t3, t4, .L_aalloc_size"
   ins "mv t3, t4"
@@ -982,7 +980,7 @@ emitRuntime = do
   ins "addi sp, sp, 32"
   ins "ret"
 
-  -- _keel_array_new: a0 = length, a1 = the element (owned), a2 = pointer flag → a0.
+  -- _keel_array_new: a0 = length, a1 = the element (owned), a2 = kind → a0.
   fn "_keel_array_new"
   ins "addi sp, sp, -48"
   ins "sd ra, 40(sp)"
@@ -997,6 +995,7 @@ emitRuntime = do
   ins "ld t2, 8(sp)"
   ins "sd t0, 0(a0)"
   ins "li t3, 0"
+  ins "beqz t2, .L_anew_fill4"
   line ".L_anew_fill:"
   ins "bgeu t3, t0, .L_anew_filled"
   ins "slli t4, t3, 3"
@@ -1004,8 +1003,16 @@ emitRuntime = do
   ins "sd t1, 16(t4)"
   ins "addi t3, t3, 1"
   ins "j .L_anew_fill"
+  line ".L_anew_fill4:"
+  ins "bgeu t3, t0, .L_anew_filled"
+  ins "slli t4, t3, 2"
+  ins "add t4, t4, a0"
+  ins "sw t1, 16(t4)"
+  ins "addi t3, t3, 1"
+  ins "j .L_anew_fill4"
   line ".L_anew_filled:"
-  ins "beqz t2, .L_anew_ret"
+  ins "li t3, 2"
+  ins "bne t2, t3, .L_anew_ret"
   -- The element now has n references in the array; the caller gave one.
   ins "beqz t0, .L_anew_drop"
   ins "lw t4, -8(t1)"
@@ -1040,16 +1047,21 @@ emitRuntime = do
   ins "sd a0, 0(sp)"
   ins "lw t0, -8(a0)"
   ins "andi t0, t0, 0x3ff"
-  ins ("addi t0, t0, -" ++ show arrayLayout) -- 1 for pointers
+  ins ("addi t0, t0, -" ++ show arrayLayout) -- the kind
+  ins "sd t0, 16(sp)"
   ins "mv a0, a1"
   ins "mv a1, t0"
   ins "call _keel_array_alloc"
   ins "ld t0, 0(sp)"
   ins "ld t1, 0(t0)"
   ins "sd t1, 0(a0)"
+  -- Copy the elements' words.
+  ins "ld t2, 16(sp)"
+  elemWords "t6" "t1" "t2" "t3"
+  ins "addi t6, t6, -2"
   ins "li t2, 0"
   line ".L_aclone_copy:"
-  ins "bgeu t2, t1, .L_aclone_copied"
+  ins "bgeu t2, t6, .L_aclone_copied"
   ins "slli t3, t2, 3"
   ins "add t4, t0, t3"
   ins "ld t5, 16(t4)"
@@ -1075,7 +1087,7 @@ emitRuntime = do
   ins "j .L_aclone_ret"
   line ".L_aclone_shared:"
   ins "andi t3, t2, 0x3ff"
-  ins ("addi t3, t3, -" ++ show (arrayLayout + 1))
+  ins ("addi t3, t3, -" ++ show (arrayLayout + 2))
   ins "bnez t3, .L_aclone_dec"
   ins "li t3, 0"
   line ".L_aclone_dup:"
@@ -1115,13 +1127,20 @@ emitRuntime = do
   ins "ld a1, 0(sp)"
   ins "ld a2, 8(sp)"
   line ".L_aset_store:"
+  ins "lw t2, -8(a0)"
+  ins "andi t2, t2, 0x3ff"
+  ins ("addi t2, t2, -" ++ show arrayLayout)
+  ins "bnez t2, .L_aset_word"
+  ins "slli t0, a1, 2"
+  ins "add t0, t0, a0"
+  ins "sw a2, 16(t0)"
+  ins "j .L_aset_ret"
+  line ".L_aset_word:"
   ins "slli t0, a1, 3"
   ins "add t0, t0, a0"
   ins "ld t1, 16(t0)"
   ins "sd a2, 16(t0)"
-  ins "lw t2, -8(a0)"
-  ins "andi t2, t2, 0x3ff"
-  ins ("addi t2, t2, -" ++ show (arrayLayout + 1))
+  ins "addi t2, t2, -2"
   ins "bnez t2, .L_aset_ret"
   ins "sd a0, 0(sp)"
   ins "mv a0, t1"
@@ -1156,10 +1175,20 @@ emitRuntime = do
   ins "call _keel_array_clone"
   line ".L_apush_store:"
   ins "ld t0, 0(a0)"
+  ins "ld a1, 0(sp)"
+  ins "lw t2, -8(a0)"
+  ins "andi t2, t2, 0x3ff"
+  ins ("addi t2, t2, -" ++ show arrayLayout)
+  ins "bnez t2, .L_apush_word"
+  ins "slli t1, t0, 2"
+  ins "add t1, t1, a0"
+  ins "sw a1, 16(t1)"
+  ins "j .L_apush_count"
+  line ".L_apush_word:"
   ins "slli t1, t0, 3"
   ins "add t1, t1, a0"
-  ins "ld a1, 0(sp)"
   ins "sd a1, 16(t1)"
+  line ".L_apush_count:"
   ins "addi t0, t0, 1"
   ins "sd t0, 0(a0)"
   ins "ld ra, 24(sp)"
@@ -1184,7 +1213,7 @@ emitRuntime = do
   ins "sd t0, 0(a0)"
   ins "lw t2, -8(a0)"
   ins "andi t2, t2, 0x3ff"
-  ins ("addi t2, t2, -" ++ show (arrayLayout + 1))
+  ins ("addi t2, t2, -" ++ show (arrayLayout + 2))
   ins "bnez t2, .L_apop_ret"
   ins "slli t1, t0, 3"
   ins "add t1, t1, a0"
@@ -1448,6 +1477,13 @@ emitRuntime = do
       ins ("ld a6, " ++ show off ++ "(t6)")
       ins "addi a6, a6, 1"
       ins ("sd a6, " ++ show off ++ "(t6)")
+    -- An array's payload words for n elements of a kind (2 + the elements, rounded up to words).
+    elemWords d n kind tmp = do
+      ins ("snez " ++ tmp ++ ", " ++ kind)
+      ins ("addi " ++ tmp ++ ", " ++ tmp ++ ", 2") -- log2 of the element size
+      ins ("sll " ++ d ++ ", " ++ n ++ ", " ++ tmp)
+      ins ("addi " ++ d ++ ", " ++ d ++ ", 23") -- + 7 to round up, + 16 for length and capacity
+      ins ("srli " ++ d ++ ", " ++ d ++ ", 3")
     -- t3 holds a layout id from fieldLayouts on; put its pointer map in t2 (uses t4).
     pointerMap = do
       ins "la t4, _keel_layouts"

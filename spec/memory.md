@@ -50,8 +50,10 @@ gets a layout id from 512 up, and the runtime looks those up in a table. So `Lea
 bytes, the header alone, and `Node(i32, Box T, Box T)` 24. A program may have 510 layouts of
 each kind.
 
-An **array** has layout 510, or 511 when its elements are pointers. Its words field is
-capacity + 2, capped at 255 (blocks that large are never recycled).
+An **array** has layout 509 when its elements are narrow (an integer of at most 32 bits, or a
+`Bool`: 4 bytes each, so `Array i32` holds two per word), 510 for other words, 511 when they
+are pointers. Its words field is 2 + its capacity's elements in words, capped at 255 (blocks
+that large are never recycled).
 
 The **count** has 21 bits. One that overflows (2 million references to one block) carries into
 the immortal bit: the block is never freed. A free block keeps its free-list link in its first

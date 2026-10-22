@@ -159,8 +159,8 @@ bind fs x rhs = case rhs of
   RAtom a | t@(K _) <- atomTm fs a -> (rhs, alias t)
   RAtom (AVar v) -> (rhs, alias (norm fs v))
   RArray ALength _ [AVar a] | V w <- norm fs a -> (rhs, alias (Len w))
-  RArray AGet _ [arr@(AVar a), i]
-    | V w <- norm fs a, let ti = atomTm fs i, le fs (K 0) ti False, le fs ti (Len w) True -> (RIndex arr i, fs)
+  RArray AGet e [arr@(AVar a), i]
+    | V w <- norm fs a, let ti = atomTm fs i, le fs (K 0) ti False, le fs ti (Len w) True -> (RIndex arr i e, fs)
   RPrim op _ a b | op `elem` [Eq, Lt] -> (rhs, fs {fCond = M.insert x (op, atomTm fs a, atomTm fs b) (fCond fs)})
   RPrim (Arith ov aop) it a b | aop `elem` [Add, Sub, Mul], ov `elem` [Checked, Wrap] ->
     let ta = atomTm fs a
