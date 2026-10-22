@@ -16,7 +16,9 @@ clocks, peak RSS. Every row prints the same checksums.
 
 Keel beats the per-node-allocation rows (C++ new/delete, Rust Box) on the trees, and loses
 to every arena row and to Goose by 3–5×. On the flat array loop it is ~20× behind: each
-iteration of `scan` does two reference-count increments, two calls to `_keel_drop` and saves
-and restores ten registers, because a self tail call is a jump to the function's entry, not a
-loop (M4: no dup/drop cancellation, no liveness-based allocation). Memory: Keel stores i64
+iteration of `scan` does two reference-count increments and two calls to `_keel_drop`,
+because `array.length` and `array.get` consume the array and the loop must keep a reference
+(M4: no borrowing for reads, no dup/drop cancellation). Turning self tail calls into loops
+(after this table) removed the per-iteration save and restore of ten registers but changed
+`sum` by under 2%; `bench/loop.kl`, which has no reference counting, got 1.9× faster. Memory: Keel stores i64
 elements where Goose stores i32, and a grown array's old blocks are not reused.

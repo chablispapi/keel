@@ -3,8 +3,8 @@
 --
 -- Deliberately simple: every variable lives in a stack slot and values pass through scratch
 -- registers x9–x17, so nothing needs saving across calls.
--- ponytail: no register allocation (M4); a call in tail position reuses the frame, so loops
--- written as tail recursion run in constant stack.
+-- A call in tail position reuses the frame, and a function calling itself there jumps back
+-- to where it stores its arguments, so loops written as tail recursion are loops.
 --
 -- Conventions: every function is called with its closure (or codata block) in x0 and its
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
@@ -157,13 +157,15 @@ allocate calleeSaved (Fun _ params _ env _ _ body) vars0 =
 data Loc = InReg String | InSlot Int
 
 -- | A function's frame: where each variable lives and which registers to restore.
-data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)]}
+-- fLoop: the function's own label, when a call to itself in tail position can jump back to
+-- where the arguments are stored instead of leaving and re-entering the frame.
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String}
 
 emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   when (length params > 7) $ error "more than 7 parameters"
   let (locs, saved, frame) = allocate ["x" ++ show r | r <- [19 .. 28 :: Int]] f (params ++ env ++ bound body)
-      slots = Slots locs saved
+      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing)
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t// " ++ name)
   line ("L" ++ lbl ++ "_begin:")
@@ -179,6 +181,7 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ldr x9, [x0, #" ++ show (8 * j) ++ "]")
     store slots "x9" v
+  line ("L" ++ lbl ++ "_loop:")
   forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("x" ++ show r) p
   -- Own the captured pointers, then release the block (x0 is still the block: dup uses x16/x17).
   forM_ envPtrs $ \v -> dup slots v
@@ -417,10 +420,14 @@ expr slots join e = case e of
         ins "ldr x16, [x0]"
         leave slots
         ins "br x16"
-      RCallKnown i as -> Just $ do
-        args as
-        leave slots
-        ins ("b _kf_" ++ show i)
+      RCallKnown i as
+        | fLoop slots == Just ("_kf_" ++ show i) -> Just $ do
+            args as
+            ins ("b L_kf_" ++ show i ++ "_loop")
+        | otherwise -> Just $ do
+            args as
+            leave slots
+            ins ("b _kf_" ++ show i)
       RProj a i -> Just $ do
         atom slots "x0" a
         ins "mov x1, #0"

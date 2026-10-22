@@ -151,12 +151,14 @@ emitProgram decls mainTy (LProg funs statics mainF _) = Right (unlines (reverse 
 
 -- | A function's frame: where each variable lives and which registers to restore
 -- (register allocation as in "Keel.AArch64", with s1–s11).
-data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)]}
+-- fLoop: the function's own label, when a call to itself in tail position can jump back to
+-- where the arguments are stored instead of leaving and re-entering the frame.
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String}
 
 emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   let (locs, saved, frame) = allocate ["s" ++ show r | r <- [1 .. 11 :: Int]] f (params ++ env ++ bound body)
-      slots = Slots locs saved
+      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing)
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t# " ++ name)
   ins "addi sp, sp, -16"
@@ -168,6 +170,7 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ld t0, " ++ show (8 * j) ++ "(a0)")
     store slots "t0" v
+  line ("L" ++ lbl ++ "_loop:")
   forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("a" ++ show r) p
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "call _keel_drop"
@@ -286,8 +289,9 @@ expr slots join e = case e of
         ins "jr t6"
       RCallKnown i as -> Just $ do
         forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
-        leave slots
-        ins ("tail _kf_" ++ show i)
+        if fLoop slots == Just ("_kf_" ++ show i)
+          then ins ("j L_kf_" ++ show i ++ "_loop")
+          else leave slots >> ins ("tail _kf_" ++ show i)
       RProj a i -> Just $ do
         atom slots "a0" a
         ins "li a1, 0"
