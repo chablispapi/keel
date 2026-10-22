@@ -19,7 +19,7 @@ import Data.List (elemIndex, nub, sortOn)
 import Data.ByteString qualified as B
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Numeric (showOct)
@@ -246,6 +246,7 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
     ins ("ldr x9, [x0, #" ++ show (8 * j) ++ "]")
     store slots "x9" v
   forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("x" ++ show r) p
+  forM_ (fLoop slots >> reduction lbl f) (vectorLoop slots)
   line ("L" ++ lbl ++ "_loop:")
   -- Own the captured pointers, then release the block (x0 is still the block: dup uses x16/x17).
   forM_ envPtrs $ \v -> dup slots v
@@ -541,6 +542,133 @@ expr slots join e = case e of
       _ -> Nothing
 
     args as = forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
+
+-- | A reduction over an array, the shape of @scan@ in bench/goose/sum.kl:
+--
+-- > f … xs … i … acc … = if i == length xs then acc else f … xs … (i + 1) … (acc + e) …
+--
+-- where e is computed from @get xs i@ (unchecked: "Keel.Range" proved the index in bounds), the
+-- parameters passed on unchanged, and constants, by 64-bit @land lor lxor +% -%@.
+data Reduction = Reduction
+  { rXs, rI, rAcc, rE :: String
+  , rChecked :: Bool                  -- ^ acc + e panics on overflow (else it wraps)
+  , rNodes :: [(String, Prim, Atom, Atom)] -- ^ e's computation, in order; the last is e
+  , rElems :: [String]                -- ^ variables holding get xs i
+  }
+
+reduction :: String -> Fun -> Maybe Reduction
+reduction lbl (Fun _ params _ [] _ False body) = case body of
+  Bind l (RArray ALength _ [AVar xs]) (Bind c (RPrim Eq _ x y) (BindIf r (AVar c') _ els (Ret (AVar r'))))
+    | c == c', r == r', Just i <- counter -> do
+        (binds, args) <- straight els
+        i1 <- listToMaybe [t | (t, RPrim (Arith ov Add) it (AVar i') (AInt 1)) <- binds, i' == i, ov /= Saturate, ov /= Optional, bits it == 64]
+        -- acc: the parameter added to (the branch that ends the loop doesn't matter here)
+        (acc, acc1, checked, e) <- listToMaybe [(a, t, ov == Checked, e) | (t, RPrim (Arith ov Add) it (AVar a) (AVar e)) <- binds, a `elem` params, ov `elem` [Checked, Wrap], bits it == 64, ov == Wrap || signed it]
+        let elems = [t | (t, RIndex (AVar xs') (AVar i')) <- binds, xs' == xs, i' == i]
+            nodes = [(t, op, a, b) | (t, RPrim op it a b) <- binds, t `notElem` [i1, acc1], bits it == 64, op `elem` vectorOps]
+            invariant = [p | (p, AVar a) <- zip params args, a == p]
+            known v = v `elem` elems || v `elem` invariant || v `elem` [t | (t, _, _, _) <- nodes]
+            operandOk a = case a of
+              AVar v -> v `notElem` [i, acc] && known v
+              AInt _ -> True
+              _ -> False
+        if args == [if p == i then AVar i1 else if p == acc then AVar acc1 else AVar p | p <- params]
+          && xs `elem` invariant
+          && length binds == 2 + length elems + length nodes
+          && all (\(_, _, a, b) -> operandOk a && operandOk b) nodes
+          && known e
+          then Just (Reduction xs i acc e checked nodes elems)
+          else Nothing
+    where
+      counter = case (x, y) of
+        (AVar v, AVar w) | w == l -> Just v
+        (AVar v, AVar w) | v == l -> Just w
+        _ -> Nothing
+  _ -> Nothing
+  where
+    -- The else branch: plain bindings, then the call to this function in tail position.
+    straight e = case e of
+      Bind t (RCallKnown j as) (Ret (AVar t')) | t == t', "_kf_" ++ show j == lbl -> Just ([], as)
+      Bind t rhs rest -> (\(bs, as) -> ((t, rhs) : bs, as)) <$> straight rest
+      _ -> Nothing
+reduction _ _ = Nothing
+
+vectorOps :: [Prim]
+vectorOps = [Bits And, Bits Or, Bits Xor, Arith Wrap Add, Arith Wrap Sub]
+
+-- | The reduction four elements at a time (two NEON registers of two lanes), from the current i
+-- to the last multiple of four before the end; the scalar loop does the rest. With a checked
+-- acc + e, the result is kept only if every e was ≥ 0 and no lane's sum overflowed: then the
+-- running sum only grows, so adding the lanes to acc with checked adds panics exactly when
+-- some step of the scalar loop would. Otherwise nothing was stored, and the scalar loop starts
+-- over from the same i (the loop is pure, so running it again shows no difference).
+--
+-- Registers: v0, v1 the lane sums, v2 and v30 the sign bits seen (two, so that each iteration
+-- adds one OR to each chain), v28 and v29 the ORs feeding them, v3–v7 the invariants and
+-- constants, v16, v17 the elements, v18–v27 the other values (two each); v8–v15 are
+-- callee-saved in C.
+-- ponytail: one loop shape, recognised by pattern; a loop IR when more loops need it.
+vectorLoop :: Slots -> Reduction -> G ()
+vectorLoop slots red = when (length scalars <= 5 && length (rNodes red) <= 5) $ do
+  lSkip <- newLabel
+  lLoop <- newLabel
+  atom slots "x9" (AVar (rXs red))
+  atom slots "x10" (AVar (rI red))
+  ins "ldr x11, [x9]"
+  ins "sub x12, x11, x10"
+  ins "cmp x12, #4"
+  ins ("b.lt " ++ lSkip)
+  ins "and x12, x12, #-4"
+  ins "add x13, x9, #16"
+  ins "add x13, x13, x10, lsl #3"
+  ins "add x14, x13, x12, lsl #3"
+  forM_ ["v0", "v1", "v2", "v30"] $ \v -> ins ("movi " ++ v ++ ".2d, #0")
+  forM_ (zip scalars [3 :: Int ..]) $ \(a, k) -> atom slots "x15" a >> ins ("dup v" ++ show k ++ ".2d, x15")
+  line (lLoop ++ ":")
+  ins "ldp q16, q17, [x13], #32"
+  forM_ (rNodes red) $ \(t, op, a, b) -> forM_ [0, 1] $ \h ->
+    ins (opName op ++ " " ++ vreg (AVar t) h ++ arr op ++ ", " ++ vreg a h ++ arr op ++ ", " ++ vreg b h ++ arr op)
+  let e = AVar (rE red)
+  forM_ [0, 1] $ \h -> ins ("add v" ++ show h ++ ".2d, v" ++ show h ++ ".2d, " ++ vreg e h ++ ".2d")
+  when (rChecked red) $ do
+    ins ("orr v28.16b, " ++ vreg e 0 ++ ".16b, " ++ vreg e 1 ++ ".16b")
+    ins "orr v29.16b, v0.16b, v1.16b"
+    ins "orr v2.16b, v2.16b, v28.16b"
+    ins "orr v30.16b, v30.16b, v29.16b"
+  ins "cmp x13, x14"
+  ins ("b.ne " ++ lLoop)
+  when (rChecked red) $ do
+    ins "orr v2.16b, v2.16b, v30.16b"
+    ins "mov x15, v2.d[0]"
+    ins "mov x16, v2.d[1]"
+    ins "orr x15, x15, x16"
+    ins ("tbnz x15, #63, " ++ lSkip)
+  atom slots "x15" (AVar (rAcc red))
+  forM_ ["v0.d[0]", "v0.d[1]", "v1.d[0]", "v1.d[1]"] $ \l -> do
+    ins ("mov x16, " ++ l)
+    if rChecked red
+      then ins "adds x15, x15, x16" >> ins "b.vs _keel_panic_overflow"
+      else ins "add x15, x15, x16"
+  ins "add x10, x10, x12"
+  store slots "x10" (rI red)
+  store slots "x15" (rAcc red)
+  line (lSkip ++ ":")
+  where
+    temps = rElems red ++ [t | (t, _, _, _) <- rNodes red]
+    scalars = nub [o | (_, _, a, b) <- rNodes red, o <- [a, b], case o of AVar v -> v `notElem` temps; _ -> True]
+    vreg a h = case a of
+      AVar v | v `elem` rElems red -> "v" ++ show (16 + h :: Int)
+      AVar v | Just k <- elemIndex v [t | (t, _, _, _) <- rNodes red] -> "v" ++ show (18 + 2 * k + h)
+      _ -> "v" ++ show (3 + fromMaybe 0 (elemIndex a scalars))
+    opName op = case op of
+      Bits And -> "and"
+      Bits Or -> "orr"
+      Bits Xor -> "eor"
+      Arith _ Sub -> "sub"
+      _ -> "add"
+    arr op = case op of
+      Bits _ -> ".16b"
+      _ -> ".2d"
 
 -- | Move atoms into locations all at once (a self tail call's arguments into its parameters):
 -- a move waits while its destination is still to be read; a cycle goes through a scratch

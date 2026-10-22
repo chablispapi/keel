@@ -1,0 +1,14 @@
+-- max + 1 overflows in the scalar loop, but the vector loop's first lane gets max and -max
+-- (elements 0 and 4) and its second 1. The negative element sends it back to the scalar loop,
+-- which must panic.
+
+import std.array
+
+def from : Array i64 -> i64 -> Array i64 = \xs x. array.push xs x
+
+def total : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else total xs (i + 1) (acc + array.get xs i)
+
+main =
+  let xs = from (from (from (from (from (from (from (from array.empty 9223372036854775807) 1) 0) 0) (0 - 9223372036854775807)) 0) 0) 0 in
+  total xs 0 0

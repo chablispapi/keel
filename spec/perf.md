@@ -55,6 +55,16 @@ benchmark's loop this removes `i + 1`'s check and the bounds check; `acc + x` st
 since nothing bounds the elements. No measurable speedup (the checks were never-taken branches
 next to `adds`); fewer checks matter once loops are vectorized.
 
+**Vectorized reductions** (AArch64 only, `vectorLoop` in `ref/src/Keel/AArch64.hs`). A loop of
+the shape `f … xs i acc = if i == length xs then … else f … xs (i + 1) (acc + e)`, where `e` is
+computed from `get xs i` (unchecked, by range analysis), unchanged parameters and constants with
+64-bit `land lor lxor +% -%`, first runs four elements at a time in NEON registers, then the
+scalar loop does the rest. For a checked `acc + e`, the vector result is kept only if every `e`
+was ≥ 0 and no lane overflowed; the sum then only grows, so adding the lanes to `acc` with
+checked adds panics exactly when the scalar loop would. Otherwise the scalar loop redoes those
+elements, which is unobservable because the loop is pure. `sum` 0.64×; on an array that fits
+in cache, the scan is 3.4× faster.
+
 Both back ends (ARM64 and RISC-V) share the allocation (`allocate` in `ref/src/Keel/AArch64.hs`),
 and the full test suite passes on both after each step.
 

@@ -8,22 +8,25 @@ machine's load moves every number by up to 1.6× between runs.
 
 | benchmark | keel | goose | best C++ | C++ new/delete | best Rust | Rust Box |
 |---|---:|---:|---:|---:|---:|---:|
-| sum 16M | 366 ms / 252 MB | 59 / 63 | 57 / 63 | – | 58 / 63 | – |
-| sum 128M | 4695 / 1296 | 422 / 490 | 429 / 490 | – | 430 / 490 | – |
-| tree 20 | 97 / 50 | 47 / 26 | 53 / 26 | 86 / 66 | 49 / 26 | 83 / 66 |
-| tree 24 | 1508 / 770 | 631 / 386 | 802 / 386 | 1879 / 1030 | 628 / 386 | 1298 / 1030 |
-| bintrees 17 | 143 / 8 | 74 / 8 | 101 / 10 | 503 / 10 | 104 / 8 | 503 / 10 |
-| bintrees 19 | 809 / 26 | 347 / 26 | 457 / 38 | 2491 / 34 | 500 / 28 | 2493 / 34 |
+| sum 16M | 109 ms / 252 MB | 65 / 63 | 52 / 63 | – | 56 / 63 | – |
+| sum 128M | 2582 / 1303 | 414 / 490 | 386 / 490 | – | 412 / 490 | – |
+| tree 20 | 60 / 50 | 42 / 26 | 51 / 26 | 82 / 66 | 43 / 26 | 80 / 66 |
+| tree 24 | 874 / 770 | 622 / 386 | 747 / 386 | 1244 / 1030 | 642 / 386 | 2554 / 922 |
+| bintrees 17 | 103 / 8 | 73 / 8 | 104 / 10 | 501 / 10 | 103 / 8 | 503 / 10 |
+| bintrees 19 | 492 / 26 | 322 / 26 | 451 / 34 | 2351 / 34 | 452 / 28 | 2368 / 34 |
 
-- **bintrees**: with each short-lived tree in an `arena`, 3× faster than per-node allocation in
-  C++ and Rust and 1.6–1.8× behind their arenas and Goose, at the same peak memory as Goose.
-- **tree**: level with per-node C++ and Rust, 2.4× behind arenas and Goose. A node is 32 bytes
-  (header + three words) where Goose packs 12, so building and reading move 2× the memory.
-- **sum**: 6–11× behind. The loop does no reference counting; what is left is code quality
-  (the loop is ~15 instructions where clang vectorizes 4 elements at a time: moves and a spill
-  at the back edge, the length loaded twice), i64 elements where the others use i32, and a
-  grown array's old blocks are not reused. The overflow checks cost nothing measurable: with
-  `+%` the loop runs at the same speed, and range analysis (below) removes all but `acc + x`'s.
+(Previous run, before range analysis, the register allocator and vectorizing: sum 16M 366 ms,
+tree 24 1508, bintrees 19 809.)
+
+- **bintrees**: with each short-lived tree in an `arena`, level with C++ and Rust arenas at 17,
+  1.1× behind at 19, 1.4–1.5× behind Goose; 4.8× faster than per-node allocation.
+- **tree**: 1.4× faster than per-node C++ and Rust, 1.2–1.4× behind arenas and Goose. A node is
+  32 bytes (header + three words) where Goose packs 12, so building and reading move 2× the
+  memory, and peak memory is 2× theirs.
+- **sum**: 1.7–2× behind at 16M. The scan is vectorized and close to memory bandwidth (8
+  passes ≈ 30 ms); 70 ms is building the array: one push at a time through the runtime, i64
+  elements where the others use i32, and a grown array's old blocks are not reused, so peak
+  memory is 4× theirs. At 128M that growth (page faults on 1.3 GB) is most of the 6×.
 
 ## What each change did
 
@@ -41,7 +44,8 @@ are time after / time before (sum at 16M elements, tree at depth 24, bintrees at
 | AArch64 operands in registers, compare-and-branch | 9c982d7 | sum 0.84×, loop 0.73× |
 | arenas (`arena (\u. e)`) in the bintrees port | b350761 | bintrees 0.55× |
 | range analysis: unneeded overflow and bounds checks removed | `Keel.Range` | all 1.00× |
-| registers by graph colouring, self tail calls as parallel moves | (next) | sum 0.45×, tree 0.59×, bintrees 0.71×, fib 0.71× |
+| registers by graph colouring, self tail calls as parallel moves | 986e6f4 | sum 0.45×, tree 0.59×, bintrees 0.71×, fib 0.71× |
+| reductions over arrays vectorized (AArch64) | `vectorLoop` | sum 0.64× |
 
 From the first measurement to the last: sum 16M 1329 → 366 ms, tree 24 1754 → 1508 ms,
 bintrees 19 1716 → 809 ms.
@@ -49,5 +53,5 @@ bintrees 19 1716 → 809 ms.
 ## Next
 
 Narrow fields (an `i32` field in 4 bytes) and a smaller header would close most of the tree
-gap; for sum, keeping loop variables in registers across the back edge (no spills, no moves
-for the self call), then vectorizing with one overflow check per loop instead of per add.
+gap; for sum, building the array: pushes inline instead of through the runtime, growth that
+reuses the old block (or `array.new` with a size), and i32 elements.

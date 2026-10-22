@@ -1,0 +1,10 @@
+-- The vector loop's lane sums each stay small; their total overflows, so it must panic.
+
+import std.array
+
+def big : i64 -> Array i64 ->{Panic, Diverge} Array i64 = \i xs. if i == 8 then xs else big (i + 1) (array.push xs 2000000000000000000)
+
+def total : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else total xs (i + 1) (acc + array.get xs i)
+
+main = total (big 0 array.empty) 0 0

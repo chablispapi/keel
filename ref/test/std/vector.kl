@@ -1,0 +1,21 @@
+-- Reductions over arrays run four elements at a time (AArch64, vectorLoop): every length mod 4,
+-- wrapping sums, and a negative element (the vector result is dropped and the scalar loop
+-- redoes it). vector-overflow.kl must still panic.
+
+import std.array
+
+def upto : i64 -> i64 -> Array i64 ->{Panic, Diverge} Array i64 =
+  \i n xs. if i == n then xs else upto (i + 1) n (array.push xs (i * 3))
+
+def sumx : Array i64 -> i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs p i acc. if i == array.length xs then acc else sumx xs p (i + 1) (acc + (array.get xs i lxor p))
+
+def wrap : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else wrap xs (i + 1) (acc +% ((array.get xs i land 255) -% 100))
+
+def lengths : i64 -> i64 ->{Panic, Diverge} i64 =
+  \n acc. if n == 11 then acc else lengths (n + 1) (acc * 7 +% sumx (upto 0 n array.empty) 5 0 0 +% sumx (upto 0 n array.empty) 0 0 1)
+
+main =
+  let neg = array.set (upto 0 9 array.empty) 6 (0 - 40) in
+  lengths 0 0 +% sumx neg 0 0 0 * 1000 +% wrap (upto 0 50 array.empty) 0 0
