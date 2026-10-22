@@ -53,6 +53,11 @@ prepareWith debug p = do
 heapSize :: Integer
 heapSize = 64 * 1024 * 1024
 
+-- | The native heap: address space only (zero-fill pages are mapped when first touched), so
+-- it can be far larger than heapSize, which sizes the freestanding targets' RAM.
+nativeHeapSize :: Integer
+nativeHeapSize = 16 * 1024 * 1024 * 1024
+
 -- | Blocks of up to this many payload words are recycled through free lists.
 maxSmall :: Int
 maxSmall = 64
@@ -118,11 +123,12 @@ emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsL
         forM_ fs $ \f -> ins (".quad _kf_" ++ show f)
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
-      ins (".quad _keel_heap+" ++ show heapSize)
-      line ("\t.zerofill __DATA,__bss,_keel_heap," ++ show heapSize ++ ",4")
+      ins (".quad _keel_heap+" ++ show nativeHeapSize)
       line ("\t.zerofill __DATA,__bss,_keel_freelists," ++ show (8 * (maxSmall + 1)) ++ ",3")
       line "\t.zerofill __DATA,__bss,_keel_stats,32,3"
       line "\t.zerofill __DATA,__bss,_keel_handlers,8,3"
+      -- Last, so the runtime's other data stays within adrp's ±4 GB of the code.
+      line ("\t.zerofill __DATA,__bss,_keel_heap," ++ show nativeHeapSize ++ ",4")
       line "\t.section __TEXT,__cstring,cstring_literals"
       strs <- gets gsStrings
       forM_ (M.toList strs) $ \(s, l) -> line (l ++ ":\t.asciz " ++ show s)

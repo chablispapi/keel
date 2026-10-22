@@ -1,0 +1,4 @@
+-- A top-level n must not hide prelude definitions whose parameters happen to be called n
+-- (printInt goes through printU64, which is \n. …).
+def n : i64 = 42
+main = printInt n; putc('\n'); n

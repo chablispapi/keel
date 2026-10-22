@@ -212,6 +212,7 @@ exampleFiles =
   , ("selfhost/parse.kl", (Just "4", "(import a.b q)\n(data T (a) (A) (B a (Box (T a))))\n(def f (-> i64 (Panic) i64) (\\ x _ (let case% x (if (== case% 0) 1 (let n case% (* n 2))))))\n(main (if (let l% (app f 2) (let r% 3 (< r% l%))) (if (== (con Cons () (int u8 104) (box (con Cons () (int u8 105) (box (con Nil ()))))) (con Nil ())) false true) false))\n"))
   , ("test/syntax/ops.kl", (Just "72", "1\n0\n1\n2\n8\n3\n4\n9\n321\n"))
   , ("test/syntax/wildcard.kl", (Just "2405", ""))
+  , ("test/syntax/prelude-names.kl", (Just "42", "42\n"))
   , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
   ]
 

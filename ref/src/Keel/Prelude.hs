@@ -5,6 +5,7 @@
 module Keel.Prelude (preludeSource, preludeDecls, loadProgram, withPrelude, declared) where
 
 import Data.Set qualified as S
+import Keel.Infer (freeVars)
 import Keel.Parser (parseLibrary, parseProgram)
 import Keel.Syntax
 
@@ -102,17 +103,17 @@ declared d = case d of
   Def f _ _ -> S.singleton f
   Bitdata n _ _ -> S.singleton n
 
--- | Names a declaration refers to: variables, constructors and types.
+-- | Names a declaration refers to: free variables, constructors and types. (A parameter that
+-- happens to share a user definition's name is not a mention.)
 mentions :: Decl -> S.Set String
 mentions d = case d of
-  Def _ t e -> tyNames t <> S.fromList (concatMap termNames (universe e))
+  Def _ t e -> tyNames t <> freeVars e <> S.fromList (concatMap termNames (universe e))
   Data _ _ _ cs -> S.unions [tyNames f | (_, fs) <- cs, f <- fs]
   Codata _ _ os -> S.unions (map (tyNames . snd) os)
   Effect _ ops -> S.unions [tyNames a <> tyNames r | (_, a, r) <- ops]
   Bitdata {} -> S.empty
   where
     termNames tm = case tm of
-      Var x -> [x]
       Con c _ _ -> [c]
       Case _ alts -> [c | (c, _, _) <- alts]
       _ -> []

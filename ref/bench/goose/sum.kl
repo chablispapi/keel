@@ -1,0 +1,24 @@
+-- Goose's bench/goose/sum.goose, ported: fill a flat array with N numbers below 1000, then
+-- scan it eight times. The array is updated in place (it is never shared).
+
+import rng
+import std.array
+
+def n : i64 = 4000000 -- BENCH_N
+
+def fill : i64 -> u64 -> Array i64 ->{Panic, Diverge} Array i64 =
+  \i r xs. if i == n then xs
+           else let r2 = rng.next r in fill (i + 1) r2 (array.push xs (rng.below r2 1000))
+
+def scan : Array i64 -> i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs p i acc. if i == array.length xs then acc
+               else scan xs p (i + 1) (acc + (array.get xs i lxor p))
+
+def passes : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs p acc. if p == 8 then acc else passes xs (p + 1) (scan xs p 0 acc)
+
+main =
+  let xs = fill 0 12345 array.empty in
+  rng.emit (array.length xs);
+  rng.emit (passes xs 0 0);
+  0

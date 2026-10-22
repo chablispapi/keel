@@ -1,0 +1,8 @@
+-- xorshift64, as Goose's bench/goose/rng.goose and bench/cpp/bench.h.
+def next : u64 -> u64 =
+  \x. let a = x lxor (x lsl 13) in let b = a lxor (a lsr 7) in b lxor (b lsl 17)
+
+-- x mod k, as a number in [0, k).
+def below : u64 -> u64 ->{Panic} i64 = \x k. (x % k) as i64
+
+def emit : i64 ->{IO, Diverge, Panic} Unit = \n. printInt n; putc('\n')

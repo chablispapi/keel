@@ -16,7 +16,7 @@
 -- Inference only fills in annotations; the result is then checked by the core pipeline
 -- ("Keel.Mono".compile), which gives the authoritative errors. Types are solved by
 -- unification; an effect variable is solved by the union of the effects flowing into it.
-module Keel.Infer (inferProgram) where
+module Keel.Infer (inferProgram, freeVars) where
 
 import Control.Monad (forM, forM_, unless, when, zipWithM, zipWithM_)
 import Control.Monad.Trans.Class (lift)
