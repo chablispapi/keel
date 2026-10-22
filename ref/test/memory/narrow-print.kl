@@ -1,0 +1,5 @@
+-- The result printer reads narrow fields from the header word.
+
+data R = R(i32, i64, Bool, u16) | E
+
+main = Cons(R(-12, -5000000000, true, 65535), box Cons(E, box Nil))

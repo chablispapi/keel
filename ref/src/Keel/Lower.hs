@@ -8,18 +8,20 @@
 -- Representation: every value is one 64-bit word. Integers are sign- or zero-extended to
 -- 64 bits by their type; Bool and Unit are 0/1 and 0. Data values, pairs, closures and codata
 -- values are pointers to heap blocks: @[fields…]@, @[code, captured…]@ and
--- @[code₁, …, codeₙ, captured…]@, each preceded by a header word (reference count, size, the
--- constructor's tag, pointer map). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs, subExprs) where
+-- @[code₁, …, codeₙ, captured…]@, each preceded by a header word: the reference count and the
+-- block's layout (which constructor, how many words, which are pointers) in its low half, and
+-- a data block's first narrow field (an integer of at most 32 bits, or a Bool) in its high
+-- half (spec/memory.md). @Box@ is the identity, since data is already behind a pointer.
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (foldM, forM, forM_)
+import Control.Monad (foldM, forM, forM_, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (State, StateT, evalState, get, gets, modify, put, runStateT)
 import Data.Bits (setBit)
 import Data.List (elemIndex, nub, sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Set qualified as S
 import Keel.Syntax
 
@@ -27,7 +29,7 @@ data Atom
   = AInt Integer -- ^ integers (canonical 64-bit form), and Bool / Unit as 0 or 1
   | AVar String  -- ^ a local variable (stack slot)
   | AGlobal Int  -- ^ the static block of top-level definition i (immortal)
-  | ANullary Integer -- ^ a constructor without fields: the shared static block holding its tag
+  | ANullary Integer -- ^ a constructor without fields: the shared static block of its layout
   deriving (Eq, Show)
 
 -- | Bitmaps mark which payload words hold pointers (bit i = word i); the runtime uses them to
@@ -37,13 +39,14 @@ data Rhs
   | RPrim Prim IntTy Atom Atom          -- ^ arithmetic or comparison at an integer type
   | RCall Atom Atom                     -- ^ call an unknown closure (consumes both)
   | RCallKnown Int [Atom]               -- ^ direct call to function i with all its arguments
-  | RClosure Int [String] Integer       -- ^ allocate a closure for function i
+  | RClosure Int [String] Integer       -- ^ allocate a closure for function i (of this layout)
   | RCodata [Int] [String] Integer      -- ^ allocate a codata value: one function per observation
   | RProj Atom Int                      -- ^ observe: call the i-th function of a codata value
-  | RAlloc Integer Integer [Atom]       -- ^ allocate a data block: tag, bitmap, fields
-  | RAllocAt String Integer Integer [Atom] -- ^ the same, reusing a token's block if it has one
-  | RField Atom Int                     -- ^ read field i of a data block (borrowed)
-  | RPushHandler [(Int, Atom)] Integer  -- ^ push a handler frame: (operation number, clause closure)
+  | RAlloc Integer (Maybe Atom) [Atom]  -- ^ allocate a block: layout, the header's field, the words
+  | RAllocAt String Integer (Maybe Atom) [Atom] -- ^ the same, reusing a token's block if it has one
+  | RField Atom Int                     -- ^ read word i of a block (borrowed)
+  | RHeader Atom Bool                   -- ^ read the field in a block's header (signed or not)
+  | RPushHandler [(Int, Atom)] Integer  -- ^ push a handler frame (of this layout): (operation number, clause closure)
   | RPopHandler Atom                    -- ^ pop (and drop) the frame
   | RPerform Int Atom                   -- ^ perform operation n: innermost handler, else the machine
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
@@ -56,7 +59,7 @@ data Expr
   = Ret Atom                                  -- ^ the value of this expression
   | Bind String Rhs Expr                      -- ^ let x = rhs in e
   | BindIf String Atom Expr Expr Expr         -- ^ let x = (if a then e₁ else e₂) in e
-  | BindCase String Atom [(Integer, Int, Expr)] Expr -- ^ case on a tag; each branch knows its block size
+  | BindCase String Atom [(Integer, Int, Expr)] Expr -- ^ case on the layout; each branch knows its block's words
   | Dup String Expr                           -- ^ increment a reference count
   | Drop String Expr                          -- ^ decrement it, freeing the block at zero
   | DropReuse String String Expr              -- ^ drop, keeping the block as a reuse token if unique
@@ -83,8 +86,9 @@ data Fun = Fun
 -- @lStatics@ with the functions it points to. @main@ is a separate function.
 --
 -- @lLocs@ is the source position of each bound variable's computation, where the program
--- still had one (only debug builds keep positions through optimization).
-data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos}
+-- still had one (only debug builds keep positions through optimization). @lLayouts@ numbers
+-- the block layouts, (constructor or -1, words, pointer map) ↦ id.
+data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos, lLayouts :: M.Map (Integer, Int, Integer) Integer}
   deriving (Show)
 
 -- | What lowering needs to know about declarations.
@@ -92,7 +96,7 @@ data Info = Info
   { iGlobals :: M.Map String (Int, Ty)
   , iKnown :: S.Set String                        -- ^ top-level λs: callable directly
   , iUncurried :: M.Map String (Int, Int)         -- ^ multi-parameter definitions: (function, arity)
-  , iCons :: M.Map String (Integer, String, [Ty]) -- ^ constructor ↦ (tag, data name, field types)
+  , iCons :: M.Map String (Integer, String, [Ty]) -- ^ constructor ↦ (number in the program, data name, field types)
   , iParams :: M.Map String [String]              -- ^ data / codata name ↦ parameters
   , iObs :: M.Map String [(String, Ty)]           -- ^ codata name ↦ observations in order
   , iOps :: M.Map String (Int, Ty, Ty)            -- ^ operation ↦ (number, argument, result)
@@ -109,7 +113,7 @@ isPtr t = case t of
   _ -> False
 
 -- | lsPos is the innermost source position around the term being lowered.
-data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos}
+data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer}
 
 type M = StateT LS (Either String)
 
@@ -144,6 +148,67 @@ bitmap offset ptrs = do
     then unsupported "a heap block with a pointer beyond word 16"
     else pure (foldl setBit 0 bits)
 
+-- | A block's layout id, for its constructor (-1 for blocks that aren't data), words and
+-- pointer map. Layouts whose blocks keep a field in the header get ids from 'fieldLayouts'
+-- up (the runtime finds their words and pointer map in a table); the others below
+-- 'arrayLayout' (their header holds them).
+layoutId :: Bool -> Integer -> Int -> Integer -> M Integer
+layoutId field tag n bm = do
+  s <- get
+  case M.lookup (tag, n, bm) (lsLayouts s) of
+    Just i -> pure i
+    Nothing -> do
+      let (base, limit) = if field then (fieldLayouts, 1024) else (0, arrayLayout)
+          i = base + toInteger (length (filter (\j -> (j >= fieldLayouts) == field) (M.elems (lsLayouts s))))
+      if i >= limit
+        then unsupported "too many block layouts"
+        else put s {lsLayouts = M.insert (tag, n, bm) i (lsLayouts s)} >> pure i
+
+-- | Arrays' layouts: this one, and the next for arrays of pointers. From 'fieldLayouts' on,
+-- layouts whose header holds a field.
+arrayLayout, fieldLayouts :: Integer
+arrayLayout = 510
+fieldLayouts = 512
+
+-- | Where a constructor's fields go: the first narrow one (an integer of at most 32 bits, or a
+-- Bool) in the header word's upper half, the others one word each, in order.
+fieldSlots :: [Ty] -> (Maybe Int, [Int])
+fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, narrow t] of
+  h : _ -> (Just h, filter (/= h) [0 .. length ts - 1])
+  [] -> (Nothing, [0 .. length ts - 1])
+  where
+    narrow t = case t of
+      TInt it -> bits it <= 32
+      TBool -> True
+      _ -> False
+
+-- | A data block's layout at these (instantiated) field types: its id, its header field and
+-- its words.
+dataLayout :: Integer -> [Ty] -> M (Integer, Maybe Int, [Int])
+dataLayout tag fts = do
+  let ((_, n, bm), h, ws) = dataLayoutKey tag fts
+  _ <- bitmap 0 [isPtr (fts !! i) | i <- ws] -- rejects maps beyond 16 words
+  lid <- layoutId (isJust h) tag n bm
+  pure (lid, h, ws)
+
+-- | The key of a constructor's layout ('lLayouts') at these field types, its header field and
+-- its words.
+dataLayoutKey :: Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
+dataLayoutKey tag fts = ((tag, length ws, foldl setBit 0 [j | (j, i) <- zip [0 ..] ws, isPtr (fts !! i)]), h, ws)
+  where
+    (h, ws) = fieldSlots fts
+
+-- | Every constructor's number in the program: in declaration order, across data types.
+conNumbers :: [Decl] -> M.Map String Integer
+conNumbers decls = M.fromList (zip [c | Data _ _ _ cs <- decls, (c, _) <- cs] [0 ..])
+
+-- | None's and Some's layouts at an integer type (@+?@ builds them in the back ends). Option is
+-- the first data type, so None is constructor 0 and Some 1.
+optionLayouts :: M.Map (Integer, Int, Integer) Integer -> IntTy -> (Integer, Integer)
+optionLayouts layouts it = (look 0 0, look 1 (if bits it <= 32 then 0 else 1))
+  where
+    look tag n = M.findWithDefault (-1) (tag, n, 0) layouts
+
 -- | Lower a monomorphic core program (the output of "Keel.Mono".compile).
 lower :: Program -> Either String LProg
 lower (Program userDecls main) = do
@@ -154,7 +219,7 @@ lower (Program userDecls main) = do
           { iGlobals = M.fromList [(f, (i, t)) | (i, (f, t, _)) <- zip [0 ..] defs]
           , iKnown = S.fromList [f | (f, _, e) <- defs, isLam e]
           , iUncurried = M.fromList [(f, (i, length ps)) | (i, (f, ps, _)) <- uncurried]
-          , iCons = M.fromList [(c, (tag, d, fs)) | Data _ d _ cs <- decls, (tag, (c, fs)) <- zip [0 ..] cs]
+          , iCons = M.fromList [(c, (conNumbers decls M.! c, d, fs)) | Data _ d _ cs <- decls, (c, fs) <- cs]
           , iParams = M.fromList ([(d, ps) | Data _ d ps _ <- decls] ++ [(d, ps) | Codata d ps _ <- decls])
           , iObs = M.fromList [(d, os) | Codata d _ os <- decls]
           , iOps = M.fromList [(op, (n, a, r)) | (n, (op, a, r)) <- zip [0 ..] allOps]
@@ -187,10 +252,10 @@ lower (Program userDecls main) = do
           m <- expr info M.empty main (pure . Ret)
           pure (statics, Fun "main" [] 1 [] [] False m)
       )
-      (LS 0 M.empty S.empty Nothing M.empty)
+      (LS 0 M.empty S.empty Nothing M.empty M.empty)
   let ptrs = lsPtrs s
       sigs = borrowSigs ptrs (lsFuns s) statics mainF
-  pure (LProg (M.mapWithKey (\i -> refcount ptrs sigs (M.lookup i sigs)) (lsFuns s)) statics (refcount ptrs sigs Nothing mainF) (lsLocs s))
+  pure (LProg (M.mapWithKey (\i -> refcount ptrs sigs (M.lookup i sigs)) (lsFuns s)) statics (refcount ptrs sigs Nothing mainF) (lsLocs s) (lsLayouts s))
   where
     isLam e = case e of
       Lam {} -> True
@@ -238,7 +303,12 @@ expr info env tm k = case tm of
   BoolLit b -> k (AInt (if b then 1 else 0))
   IntLit _ n -> k (AInt n)
   Prim op a b -> case typeOf info env a of
-    TInt it -> sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
+    TInt it -> do
+      -- @+?@'s None and Some, which the back ends build
+      case op of
+        Arith Optional _ -> mapM_ (\(tag, fts) -> dataLayout tag fts) [(0, []), (1, [TInt it])]
+        _ -> pure ()
+      sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
   Convert to e -> sub e $ \v -> bindRhs (RConv to v)
   -- arena f: f () between opening and closing an arena, which frees everything allocated in
@@ -292,11 +362,11 @@ expr info env tm k = case tm of
     , not (M.member g env) ->
         sub a $ \va -> bindRhs (RCallKnown i [va])
   App f a -> sub f $ \vf -> sub a $ \va -> bindRhs (RCall vf va)
-  Con c _ [] -> con c >>= \(tag, _, _) -> k (ANullary tag)
+  Con c _ [] -> con c >>= \(tag, _, _) -> layoutId False tag 0 0 >>= k . ANullary
   Con c _ args -> do
     (tag, _, _) <- con c
-    bm <- bitmap 0 (map (isPtr . typeOf info env) args)
-    subs args $ \vs -> bindRhs (RAlloc tag bm vs)
+    (lid, h, ws) <- dataLayout tag (map (typeOf info env) args)
+    subs args $ \vs -> bindRhs (RAlloc lid ((vs !!) <$> h) (map (vs !!) ws))
   Case e alts -> sub e $ \ve -> do
     x <- newVar "case" ty
     let tys = case typeOf info env e of
@@ -304,18 +374,26 @@ expr info env tm k = case tm of
           _ -> []
     bs <- forM alts $ \(c, xs, b) -> do
       (tag, d, fields) <- con c
-      let inst = substTy (M.fromList (zip (M.findWithDefault [] d (iParams info)) tys)) M.empty
+      let ps = M.findWithDefault [] d (iParams info)
+          inst = substTy (M.fromList (zip ps tys)) M.empty
           fts = map inst fields
+      when (length ps /= length tys) $ unsupported ("case on " ++ prettyTy (typeOf info env e))
+      (lid, h, ws) <- dataLayout tag fts
       xs' <- mapM (uncurry newVar) (zip xs fts)
       let env' = M.union (M.fromList (zip xs (zip xs' fts))) env
+          read' i = case (h, elemIndex i ws) of
+            (Just j, _) | j == i -> RHeader ve (case fts !! i of TInt it -> signed it; _ -> False)
+            (_, Just w) -> RField ve w
+            _ -> RField ve i
       body <- expr info env' b (pure . Ret)
-      pure (tag, max 1 (length fields), foldr (\(i, y) rest -> Bind y (RField ve i) rest) body (zip [0 ..] xs'))
+      pure (lid, length ws, foldr (\(i, y) rest -> Bind y (read' i) rest) body (zip [0 ..] xs'))
     BindCase x ve (sortOn (\(t, _, _) -> t) bs) <$> k (AVar x)
   Box e -> expr info env e k
   Unbox e -> expr info env e k
   Pair a b -> do
     bm <- bitmap 0 (map (isPtr . typeOf info env) [a, b])
-    subs [a, b] $ \vs -> bindRhs (RAlloc 0 bm vs)
+    lid <- layoutId False (-1) 2 bm
+    subs [a, b] $ \vs -> bindRhs (RAlloc lid Nothing vs)
   LetPair x y e b -> sub e $ \ve -> do
     let (tx, tyy) = case typeOf info env e of
           TPair p q -> (p, q)
@@ -334,8 +412,8 @@ expr info env tm k = case tm of
     is <- forM (zip obs ordered) $ \((o, _), e) -> do
       body <- expr info envB e (pure . Ret)
       liftFun info (Fun (d ++ "." ++ o) ["%self"] base fvs (ptrsOf captured) True body)
-    bm <- bitmap base [isPtr t | (_, _, t) <- captured]
-    bindRhs (RCodata is fvs bm)
+    lid <- bitmap base [isPtr t | (_, _, t) <- captured] >>= layoutId False (-1) (base + length fvs)
+    bindRhs (RCodata is fvs lid)
   Proj e o -> sub e $ \ve -> case typeOf info env e of
     TData d _ | Just i <- elemIndex o (map fst (M.findWithDefault [] d (iObs info))) -> bindRhs (RProj ve i)
     t -> lift (Left ("observation " ++ o ++ " on " ++ prettyTy t))
@@ -346,12 +424,12 @@ expr info env tm k = case tm of
   Handle _ body cs -> clauses cs []
     where
       clauses [] acc = do
-        bm <- bitmap 0 (False : False : concat [[False, True] | _ <- acc])
+        lid <- bitmap 0 (False : False : concat [[False, True] | _ <- acc]) >>= layoutId False (-1) (2 + 2 * length acc)
         fr <- newVar "frame" (TData "%frame" [])
         rest <- expr info env body $ \v -> do
           u <- newVar "pop" TUnit
           Bind u (RPopHandler (AVar fr)) <$> k v
-        pure (Bind fr (RPushHandler (reverse acc) bm) rest)
+        pure (Bind fr (RPushHandler (reverse acc) lid) rest)
       clauses ((op, x, e) : more) acc = case M.lookup op (iOps info) of
         Just (n, ta, _) -> closure x ta e $ \cv -> clauses more ((n, cv) : acc)
         Nothing -> lift (Left ("unknown operation " ++ op))
@@ -383,9 +461,9 @@ expr info env tm k = case tm of
       let env' = M.insert x (x', t) (M.fromList [(v, (ir, vt)) | (v, ir, vt) <- captured])
       body <- expr info env' b (pure . Ret)
       i <- liftFun info (Fun ("λ" ++ x) [x'] 1 fvs (ptrsOf captured) True body)
-      bm <- bitmap 1 [isPtr vt | (_, _, vt) <- captured]
+      lid <- bitmap 1 [isPtr vt | (_, _, vt) <- captured] >>= layoutId False (-1) (1 + length fvs)
       c <- newVar "clo" (TFun t S.empty TUnit)
-      Bind c (RClosure i fvs bm) <$> kk (AVar c)
+      Bind c (RClosure i fvs lid) <$> kk (AVar c)
 
 -- | The type of a well-typed term (effects omitted: lowering doesn't need them).
 typeOf :: Info -> Env -> Term -> Ty
@@ -536,7 +614,7 @@ refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funB
 -- use the token.
 useToken :: String -> Int -> Expr -> Maybe Expr
 useToken tok w e = case e of
-  Bind x (RAlloc tag bm as) rest | max 1 (length as) == w -> Just (Bind x (RAllocAt tok tag bm as) rest)
+  Bind x (RAlloc lid h as) rest | length as == w -> Just (Bind x (RAllocAt tok lid h as) rest)
   Bind x rhs rest -> Bind x rhs <$> useToken tok w rest
   Dup v rest -> Dup v <$> useToken tok w rest
   Drop v rest -> Drop v <$> useToken tok w rest
@@ -633,9 +711,10 @@ exprAtoms e = case e of
       RCall f a -> [f, a]
       RCallKnown _ as -> as
       RProj a _ -> [a]
-      RAlloc _ _ as -> as
-      RAllocAt _ _ _ as -> as
+      RAlloc _ h as -> maybe [] pure h ++ as
+      RAllocAt _ _ h as -> maybe [] pure h ++ as
       RField a _ -> [a]
+      RHeader a _ -> [a]
       RPushHandler cs _ -> map snd cs
       RPopHandler a -> [a]
       RPerform _ a -> [a]
@@ -659,7 +738,7 @@ rets e = case e of
 reusedScrutinees :: Expr -> S.Set String
 reusedScrutinees e = S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> any (allocs w) (rhss b)) bs]
   where
-    allocs w (RAlloc _ _ as) = max 1 (length as) == w
+    allocs w (RAlloc _ _ as) = length as == w
     allocs _ _ = False
 
 subExprs :: Expr -> [Expr]
@@ -685,8 +764,8 @@ consumedIn sigs rhs = case rhs of
   RClosure _ fvs _ -> fvs
   RCodata _ fvs _ -> fvs
   RProj a _ -> atomVars a
-  RAlloc _ _ as -> concatMap atomVars as
-  RAllocAt _ _ _ as -> concatMap atomVars as
+  RAlloc _ h as -> concatMap atomVars (maybe [] pure h ++ as)
+  RAllocAt _ _ h as -> concatMap atomVars (maybe [] pure h ++ as)
   RPushHandler cs _ -> concatMap (atomVars . snd) cs
   RPopHandler a -> atomVars a
   RPerform _ a -> atomVars a
@@ -696,6 +775,7 @@ consumedIn sigs rhs = case rhs of
 -- | Variables a right-hand side only reads.
 borrowedIn :: Sigs -> Rhs -> [String]
 borrowedIn _ (RField a _) = atomVars a
+borrowedIn _ (RHeader a _) = atomVars a
 borrowedIn _ (RArray op _ (a : _)) | op `elem` [ALength, AGet] = atomVars a
 borrowedIn sigs (RCallKnown i as) = concat [atomVars a | (a, True) <- zip as (M.findWithDefault [] i sigs)]
 borrowedIn _ _ = []

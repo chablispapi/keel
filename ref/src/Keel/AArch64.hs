@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate) where
+module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
@@ -66,7 +66,7 @@ maxSmall = 64
 
 -- | gsLocs: the line-table row (file number, line, column) for variables bound by a
 -- positioned computation; empty unless the program kept positions (debug builds).
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int), gsNullary :: S.Set Integer}
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int), gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer}
 
 type G = State GS
 
@@ -102,7 +102,7 @@ printStr s = do
 
 -- | Emit a program whose @main@ has type @mainTy@.
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty))))
+emitProgram decls mainTy (LProg funs statics mainF locs layouts) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -125,9 +125,9 @@ emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsL
         forM_ fs $ \f -> ins (".quad _kf_" ++ show f)
       tags <- gets gsNullary
       forM_ (S.toList tags) $ \t -> do
-        ins (".quad " ++ show (0x80000000 + t * 2 ^ (40 :: Int)) ++ "\t\t// header: immortal, tag " ++ show t)
-        line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with this tag")
-        ins ".quad 0"
+        ins (".quad " ++ show (header layouts t .|. 0x80000000) ++ "\t\t// header: immortal, layout " ++ show t)
+        line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with this layout")
+      layoutTable layouts
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
       ins (".quad _keel_heap+" ++ show nativeHeapSize)
@@ -241,7 +241,7 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   ins "stp x29, x30, [sp, #-16]!"
   ins "mov x29, sp"
   when (frame > 0) $ subSp frame
-  forM_ saved $ \(r, off) -> ins ("str " ++ r ++ ", [sp, #" ++ show off ++ "]")
+  saveRegs ("str", "stp") saved
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ldr x9, [x0, #" ++ show (8 * j) ++ "]")
     store slots "x9" v
@@ -265,8 +265,17 @@ epilogue = ins "mov sp, x29" >> ins "ldp x29, x30, [sp], #16"
 -- | Leave a Keel function: restore its callee-saved registers, then the frame.
 leave :: Slots -> G ()
 leave slots = do
-  forM_ (fSaved slots) $ \(r, off) -> ins ("ldr " ++ r ++ ", [sp, #" ++ show off ++ "]")
+  saveRegs ("ldr", "ldp") (fSaved slots)
   epilogue
+
+-- | Store or load callee-saved registers at their save offsets, two at a time where adjacent.
+saveRegs :: (String, String) -> [(String, Int)] -> G ()
+saveRegs (one, two) rs = case rs of
+  (r1, o1) : (r2, o2) : more | o2 == o1 + 8, o1 <= 504 -> do
+    ins (two ++ " " ++ r1 ++ ", " ++ r2 ++ ", [sp, #" ++ show o1 ++ "]")
+    saveRegs (one, two) more
+  (r, o) : more -> ins (one ++ " " ++ r ++ ", [sp, #" ++ show o ++ "]") >> saveRegs (one, two) more
+  [] -> pure ()
 
 -- | Every occurrence of a variable in a body (for ranking variables by use).
 uses :: Expr -> [String]
@@ -289,9 +298,10 @@ uses e = case e of
       RClosure _ fvs _ -> fvs
       RCodata _ fvs _ -> fvs
       RProj a _ -> av a
-      RAlloc _ _ as -> concatMap av as
-      RAllocAt t _ _ as -> t : concatMap av as
+      RAlloc _ h as -> concatMap av (maybe [] pure h ++ as)
+      RAllocAt t _ h as -> t : concatMap av (maybe [] pure h ++ as)
       RField a _ -> av a
+      RHeader a _ -> av a
       RPushHandler cs _ -> concatMap (av . snd) cs
       RPopHandler a -> av a
       RPerform _ a -> av a
@@ -437,8 +447,9 @@ dup slots v = do
   load' slots "x16" v
   ins "ldr w17, [x16, #-8]"
   ins ("tbnz w17, #31, " ++ lSkip)
-  ins "cbz w17, _keel_panic_rc"
-  ins "add w17, w17, #1"
+  ins "tst w17, #0x7ffffc00"
+  ins "b.eq _keel_panic_rc"
+  ins "add w17, w17, #1024"
   ins "str w17, [x16, #-8]"
   line (lSkip ++ ":")
 
@@ -473,13 +484,13 @@ expr slots join e = case e of
     lJoin <- newLabel
     labels <- mapM (const newLabel) bs
     rs <- operand slots "x9" s
-    ins ("ldrb w9, [" ++ rs ++ ", #-3]") -- the tag, in the header
-    -- Compare against every tag but the last, which falls through.
+    ins ("ldr w9, [" ++ rs ++ ", #-8]")
+    ins "and w9, w9, #0x3ff" -- the layout, in the header
+    -- Compare against every layout but the last, whose branch comes first and falls through.
     forM_ (zip (init bs) labels) $ \((tag, _, _), l) -> do
       ins ("cmp x9, #" ++ show tag)
       ins ("b.eq " ++ l)
-    ins ("b " ++ last labels)
-    forM_ (zip bs labels) $ \((_, _, body), l) -> do
+    forM_ (zip (last bs : init bs) (last labels : init labels)) $ \((_, _, body), l) -> do
       line (l ++ ":")
       expr slots (target tailPos x lJoin) body
     unless tailPos $ do
@@ -697,17 +708,40 @@ moves slots ms0 = go [(d, src a) | (d, a) <- ms0, src a /= Left d] ["x10", "x11"
       InReg x -> unless (x == r) $ ins ("mov " ++ r ++ ", " ++ x)
       InSlot i -> ins ("ldr " ++ r ++ ", [sp, #" ++ show (8 * i) ++ "]")
 
--- | Allocate a block of @n@ payload words with a pointer map into x0 (header written).
+-- | Allocate a block of @n@ payload words of a layout into x0 (header written).
 -- The runtime allocator clobbers only x0, x1 and x13–x16.
 alloc :: Int -> Integer -> G ()
-alloc n bm = do
-  movImm "x0" (toInteger (max 1 n))
-  movImm "x1" bm
+alloc n lid = do
+  t <- gets (\st -> template (gsLayouts st) lid)
+  movImm "x0" (toInteger n)
+  movImm "x1" t
   ins "bl _keel_alloc"
 
--- | Header word of a fresh block: count 1, size, pointer map.
-header :: Integer -> Int -> Integer -> Integer
-header tag n bm = 1 .|. (toInteger (max 1 n) `shiftL` 32) .|. (tag `shiftL` 40) .|. (bm `shiftL` 48)
+-- | The words (bits 0–7) and pointer map (8–23) of each layout whose header holds a field,
+-- from fieldLayouts on: what the runtime needs to free such a block.
+layoutTable :: M.Map (Integer, Int, Integer) Integer -> G ()
+layoutTable layouts = do
+  line "\t.p2align 2"
+  line "_keel_layouts:"
+  let byId = M.fromList [(i, (n, bm)) | ((_, n, bm), i) <- M.toList layouts]
+  forM_ [fieldLayouts .. maybe (fieldLayouts - 1) fst (M.lookupMax byId)] $ \i ->
+    ins (".word " ++ show (maybe 0 (\(n, bm) -> toInteger n .|. (bm `shiftL` 8)) (M.lookup i byId)))
+  line "\t.p2align 3"
+
+-- | Header word of a fresh block: count 1 and its layout.
+-- The low half: the layout in bits 0–9, the count in bits 10–30 (so it moves by 1024), bit 31
+-- immortal. A count that overflows carries into bit 31: the block becomes immortal (it leaks).
+-- The high half is the block's field, for layouts from fieldLayouts on (the runtime finds their
+-- words and pointer map in _keel_layouts); otherwise their words (bits 32–39) and pointer map
+-- (40–55). A free block of no words keeps its free-list link there.
+header :: M.Map (Integer, Int, Integer) Integer -> Integer -> Integer
+header layouts lid = 1024 .|. template layouts lid
+
+-- | A header without its count.
+template :: M.Map (Integer, Int, Integer) Integer -> Integer -> Integer
+template layouts lid = case [(n, bm) | ((_, n, bm), i) <- M.toList layouts, i == lid, lid < fieldLayouts] of
+  (n, bm) : _ -> lid .|. (toInteger n `shiftL` 32) .|. (bm `shiftL` 40)
+  [] -> lid
 
 -- | The common right-hand sides, computed straight into register @d@ from their operands'
 -- registers; False for the rest (rhsCode computes those into x0).
@@ -745,6 +779,12 @@ rhsInto slots d rhs = case rhs of
     ra <- operand slots "x9" a
     ins ("ldr " ++ d ++ ", [" ++ ra ++ ", #" ++ show (8 * i) ++ "]")
     pure True
+  RHeader a sgn -> do
+    ra <- operand slots "x9" a
+    ins (headerRead sgn d ++ ", [" ++ ra ++ ", #-4]")
+    pure True
+  -- To a 64-bit type the canonical form doesn't change: a move.
+  RConv to a | bits to == 64 -> atom slots d a >> pure True
   RArray ALength _ [a] -> do
     ra <- operand slots "x9" a
     ins ("ldr " ++ d ++ ", [" ++ ra ++ "]")
@@ -772,6 +812,10 @@ rhsInto slots d rhs = case rhs of
       ins ("cset " ++ d ++ ", " ++ cond)
       pure True
 
+-- | Load the header field into register x…: sign- or zero-extended to the canonical form.
+headerRead :: Bool -> String -> String
+headerRead sgn d = if sgn then "ldrsw " ++ d else "ldr w" ++ drop 1 d
+
 -- | Compute a right-hand side into x0.
 rhsCode :: Slots -> Rhs -> G ()
 rhsCode slots rhs = case rhs of
@@ -793,13 +837,13 @@ rhsCode slots rhs = case rhs of
   RCallKnown i as -> do
     forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
     ins ("bl _kf_" ++ show i)
-  RClosure i fvs bm -> do
-    alloc (1 + length fvs) bm
+  RClosure i fvs lid -> do
+    alloc (1 + length fvs) lid
     address "x11" ("_kf_" ++ show i)
     ins "str x11, [x0]"
     storeAll 1 fvs
-  RCodata is fvs bm -> do
-    alloc (length is + length fvs) bm
+  RCodata is fvs lid -> do
+    alloc (length is + length fvs) lid
     forM_ (zip [0 :: Int ..] is) $ \(j, i) -> do
       address "x11" ("_kf_" ++ show i)
       ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
@@ -809,16 +853,16 @@ rhsCode slots rhs = case rhs of
     ins "mov x1, #0"
     ins ("ldr x16, [x0, #" ++ show (8 * i) ++ "]")
     ins "blr x16"
-  RAlloc tag bm as -> do
-    alloc (length as) bm
-    fields tag as
-  RAllocAt tok tag bm as -> do
+  RAlloc lid h as -> do
+    alloc (length as) lid
+    fields h as
+  RAllocAt tok lid h as -> do
     -- In place if the token holds a block (it was unique); otherwise allocate.
     lFresh <- newLabel
     lDone <- newLabel
     load' slots "x0" tok
     ins ("cbz x0, " ++ lFresh)
-    movImm "x15" (header tag (length as) bm)
+    gets (\st -> header (gsLayouts st) lid) >>= movImm "x15"
     ins "str x15, [x0, #-8]"
     address "x13" "_keel_stats"
     ins "ldr x14, [x13, #16]"
@@ -826,14 +870,15 @@ rhsCode slots rhs = case rhs of
     ins "str x14, [x13, #16]"
     ins ("b " ++ lDone)
     line (lFresh ++ ":")
-    alloc (length as) bm
+    alloc (length as) lid
     line (lDone ++ ":")
-    fields tag as
+    fields h as
   RField a i -> do
     atom slots "x9" a
     ins ("ldr x0, [x9, #" ++ show (8 * i) ++ "]")
-  RPushHandler cs bm -> do
-    alloc (2 + 2 * length cs) bm
+  RHeader a sgn -> atom slots "x9" a >> ins (headerRead sgn "x0" ++ ", [x9, #-4]")
+  RPushHandler cs lid -> do
+    alloc (2 + 2 * length cs) lid
     address "x12" "_keel_handlers"
     ins "ldr x11, [x12]"
     ins "str x11, [x0]" -- the enclosing frame
@@ -887,6 +932,7 @@ rhsCode slots rhs = case rhs of
         ins "cmp x9, x10"
         ins ("b.hs " ++ lSlow)
         ins "ldr w11, [x0, #-8]"
+        ins "lsr w11, w11, #10"
         ins "cmp w11, #1"
         ins ("b.ne " ++ lSlow)
         ins "add x11, x0, x9, lsl #3"
@@ -905,9 +951,9 @@ rhsCode slots rhs = case rhs of
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
       load' slots "x11" v
       ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
-    fields :: Integer -> [Atom] -> G ()
-    fields tag as = do
-      when (tag /= 0) $ movImm "x11" tag >> ins "strb w11, [x0, #-3]"
+    fields :: Maybe Atom -> [Atom] -> G ()
+    fields h as = do
+      forM_ h $ \a -> atom slots "x11" a >> ins "str w11, [x0, #-4]"
       forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "x11" a
         ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
@@ -931,14 +977,14 @@ arith it@(IntTy sgn n) ov aop
           line (lDone ++ ":")
         Optional -> do
           lDone <- newLabel
+          (none, some) <- gets (\st -> optionLayouts (gsLayouts st) it)
           ins "mov x12, x0" -- the allocator leaves x9–x12 alone
-          alloc 1 0
-          ins "mov x11, #1" -- Some
-          ins "strb w11, [x0, #-3]"
-          ins "str x12, [x0]"
+          if narrow
+            then alloc 0 some >> ins "str w12, [x0, #-4]"
+            else alloc 1 some >> ins "str x12, [x0]"
           ins ("b " ++ lDone)
           line (lOvf ++ ":")
-          atom (Slots M.empty [] Nothing M.empty []) "x0" (ANullary 0) -- None
+          atom (Slots M.empty [] Nothing M.empty []) "x0" (ANullary none)
           line (lDone ++ ":")
         _ -> pure ()
   where
@@ -1099,30 +1145,36 @@ emitPrinter decls printers lbl t = do
       printStr "false"
       line (lDone ++ ":")
     TUnit -> printStr "()"
-    TBox a -> printStr "box " >> field Nothing a
+    TBox a -> printStr "box " >> field (Right (-1)) a
     TPair a b -> do
       printStr "("
-      field (Just 0) a
+      field (Right 0) a
       printStr ", "
-      field (Just 1) b
+      field (Right 1) b
       printStr ")"
     TData d tys | Just (ps, cs) <- dataOf decls d -> do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
+      layouts <- gets gsLayouts
+      -- Constructors never built at this type have no layout, and no block to print.
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
-      labels <- mapM (const newLabel) cs
+      labels <- mapM (const newLabel) built
       ins "ldr x9, [sp, #16]"
-      ins "ldrb w9, [x9, #-3]"
-      forM_ (zip [0 :: Int ..] labels) $ \(tag, l) -> do
-        ins ("cmp x9, #" ++ show tag)
+      ins "ldr w9, [x9, #-8]"
+      ins "and w9, w9, #0x3ff"
+      forM_ (zip built labels) $ \((_, _, lid, _, _), l) -> do
+        movImm "x10" lid
+        ins "cmp x9, x10"
         ins ("b.eq " ++ l)
-      forM_ (zip cs labels) $ \((c, fs), l) -> do
+      ins ("b " ++ lDone)
+      forM_ (zip built labels) $ \((c, fts, _, h, ws), l) -> do
         line (l ++ ":")
         printStr c
-        unless (null fs) $ do
+        unless (null fts) $ do
           printStr "("
-          forM_ (zip [0 :: Int ..] fs) $ \(i, ft) -> do
+          forM_ (zip [0 :: Int ..] fts) $ \(i, ft) -> do
             when (i > 0) $ printStr ", "
-            field (Just i) (inst ft)
+            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (fromMaybe i (elemIndex i ws))) ft
           printStr ")"
         ins ("b " ++ lDone)
       line (lDone ++ ":")
@@ -1155,11 +1207,14 @@ emitPrinter decls printers lbl t = do
   epilogue
   ins "ret"
   where
-    -- Print field i of the block (or the value itself) with its type's printer.
-    field :: Maybe Int -> Ty -> G ()
-    field mi ft = do
+    -- Print word i of the block (-1: the value itself), or its header field (Left: whether
+    -- signed), with its type's printer.
+    field :: Either Bool Int -> Ty -> G ()
+    field place ft = do
       ins "ldr x0, [sp, #16]"
-      forM_ mi $ \i -> ins ("ldr x0, [x0, #" ++ show (8 * i) ++ "]")
+      case place of
+        Left sgn -> ins (headerRead sgn "x0" ++ ", [x0, #-4]")
+        Right i -> when (i >= 0) $ ins ("ldr x0, [x0, #" ++ show (8 * i) ++ "]")
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("bl " ++ l)
         Nothing -> printStr "..."
@@ -1213,7 +1268,8 @@ emitEntry printers t = do
 -- map. Statistics at @_keel_stats@: fresh allocations, recycled, in place, freed.
 emitRuntime :: G ()
 emitRuntime = do
-  -- _keel_alloc: x0 = payload words, x1 = pointer map → x0 = payload. Clobbers x13–x16 only.
+  -- _keel_alloc: x0 = payload words, x1 = header without its count → x0 = payload. Clobbers
+  -- x13–x16 only.
   fn "_keel_alloc"
   ins ("cmp x0, #" ++ show maxSmall)
   ins "b.hi L_alloc_bump"
@@ -1223,7 +1279,9 @@ emitRuntime = do
   ins "ldr x13, [x13, _keel_fl@PAGEOFF]"
   ins "ldr x14, [x13, x0, lsl #3]"
   ins "cbz x14, L_alloc_bump"
-  ins "ldr x15, [x14]" -- next free block
+  ins "cbz x0, L_alloc_link0"
+  ins "ldr x15, [x14]" -- the next free block
+  line "L_alloc_pop:"
   ins "str x15, [x13, x0, lsl #3]"
   stat 8 "x15" "x16"
   ins "b L_alloc_header"
@@ -1239,12 +1297,17 @@ emitRuntime = do
   ins "add x14, x14, #8"
   stat 0 "x15" "x16"
   line "L_alloc_header:"
-  ins "lsl x15, x0, #32"
-  ins "orr x15, x15, x1, lsl #48"
-  ins "orr x15, x15, #1"
+  ins "orr x15, x1, #1024" -- count 1
   ins "str x15, [x14, #-8]"
   ins "mov x0, x14"
   ins "ret"
+  -- A block of no words links to the next in its header's high half, in words from it.
+  line "L_alloc_link0:"
+  ins "ldrsw x15, [x14, #-4]"
+  ins "add x16, x14, x15, lsl #3"
+  ins "cmp x15, #0"
+  ins "csel x15, xzr, x16, eq"
+  ins "b L_alloc_pop"
 
   -- Arenas (spec/memory.md). Opening one takes a record [base before, enclosing record, bump
   -- allocations so far] from the bump pointer; while any is open, _keel_drop leaves blocks at
@@ -1315,21 +1378,23 @@ emitRuntime = do
   line "L_drop_top:"
   ins "ldr w9, [x0, #-8]"
   ins "tbnz w9, #31, L_drop_ret"
-  ins "cbz w9, _keel_panic_rc"
-  ins "sub w9, w9, #1"
+  ins "tst w9, #0x7ffffc00"
+  ins "b.eq _keel_panic_rc"
+  ins "sub w9, w9, #1024"
   ins "str w9, [x0, #-8]"
-  ins "cbnz w9, L_drop_ret"
+  ins "tst w9, #0x7ffffc00"
+  ins "b.ne L_drop_ret"
   address "x12" "_keel_arena_base"
   ins "ldr x12, [x12]"
   ins "cmp x0, x12"
   ins "b.hs L_drop_ret" -- in an open arena: freed when it closes
   stat 24 "x12" "x13"
   ins "str x0, [sp, #16]"
+  ins "and w12, w9, #0x3ff"
+  ins ("cmp w12, #" ++ show arrayLayout)
+  ins "b.hs L_drop_special"
   ins "ldr x11, [x0, #-8]"
-  ins "ubfx x12, x11, #40, #8"
-  ins "lsr x11, x11, #48"
-  ins "cmp x12, #255"
-  ins "b.eq L_drop_array"
+  ins "ubfx x11, x11, #40, #16" -- the pointer map
   line "L_drop_loop:"
   ins "cbz x11, L_drop_free"
   ins "sub x13, x11, #1"
@@ -1361,9 +1426,19 @@ emitRuntime = do
   line "L_drop_ret:"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
-  -- An array: drop its elements if they are pointers (bit 1), last first, then free it.
+  -- A block with a field in its header: its pointer map is in the table.
+  line "L_drop_special:"
+  ins ("cmp w12, #" ++ show fieldLayouts)
+  ins "b.lo L_drop_array"
+  address "x11" "_keel_layouts"
+  ins ("sub w12, w12, #" ++ show fieldLayouts)
+  ins "ldr w11, [x11, x12, lsl #2]"
+  ins "lsr w11, w11, #8"
+  ins "b L_drop_loop"
+  -- An array: drop its elements if they are pointers, last first, then free it.
   line "L_drop_array:"
-  ins "tbz x11, #1, L_drop_free"
+  ins ("cmp w12, #" ++ show (arrayLayout + 1))
+  ins "b.ne L_drop_free"
   ins "ldr x12, [x0]"
   line "L_drop_elems:"
   ins "cbz x12, L_drop_free"
@@ -1379,14 +1454,30 @@ emitRuntime = do
   -- _keel_free_block: x0 = block with count 0 → push it on its size's free list.
   fn "_keel_free_block"
   ins "ldr x10, [x0, #-8]"
-  ins "ubfx x11, x10, #32, #8"
+  ins "ubfx x11, x10, #32, #8" -- its words (an array's: capped at 255)
+  ins "tbz w10, #9, L_free_size" -- fieldLayouts = 512: the header holds a field
+  ins "and w10, w10, #0x1ff"
+  address "x11" "_keel_layouts"
+  ins "ldr w11, [x11, x10, lsl #2]"
+  ins "and w11, w11, #0xff"
+  line "L_free_size:"
   ins ("cmp x11, #" ++ show maxSmall)
   ins "b.hi L_free_ret" -- ponytail: large blocks are not recycled
   address "x12" "_keel_freelists"
   ins "ldr x13, [x12, x11, lsl #3]"
-  ins "str x13, [x0]"
+  ins "cbz x11, L_free_link0"
+  ins "str x13, [x0]" -- the link, in the first word
   ins "str x0, [x12, x11, lsl #3]"
   line "L_free_ret:"
+  ins "ret"
+  -- A block of no words: the link in its header's high half, in words from it (0: none).
+  line "L_free_link0:"
+  ins "sub x14, x13, x0"
+  ins "asr x14, x14, #3"
+  ins "cmp x13, #0"
+  ins "csel x14, xzr, x14, eq"
+  ins "str w14, [x0, #-4]"
+  ins "str x0, [x12, x11, lsl #3]"
   ins "ret"
 
   -- _keel_drop_reuse: x0 = block → x0 = the block, if it was unique (its children dropped,
@@ -1396,13 +1487,20 @@ emitRuntime = do
   ins "mov x29, sp"
   ins "ldr w9, [x0, #-8]"
   ins "tbnz w9, #31, L_reuse_none"
-  ins "cbz w9, _keel_panic_rc"
-  ins "cmp w9, #1"
+  ins "tst w9, #0x7ffffc00"
+  ins "b.eq _keel_panic_rc"
+  ins "lsr w10, w9, #10"
+  ins "cmp w10, #1"
   ins "b.ne L_reuse_shared"
   stat 24 "x12" "x13"
   ins "str x0, [sp, #16]"
   ins "ldr x11, [x0, #-8]"
-  ins "lsr x11, x11, #48"
+  ins "ubfx x11, x11, #40, #16" -- the pointer map
+  ins "tbz w9, #9, L_reuse_loop"
+  ins "and w12, w9, #0x1ff" -- a field in the header: the map is in the table
+  address "x11" "_keel_layouts"
+  ins "ldr w11, [x11, x12, lsl #2]"
+  ins "lsr w11, w11, #8"
   line "L_reuse_loop:"
   ins "cbz x11, L_reuse_done"
   ins "rbit x13, x11"
@@ -1418,10 +1516,12 @@ emitRuntime = do
   ins "b L_reuse_loop"
   line "L_reuse_done:"
   ins "ldr x0, [sp, #16]"
-  ins "str wzr, [x0, #-8]"
+  ins "ldr w9, [x0, #-8]"
+  ins "and w9, w9, #0x3ff" -- count 0 until reused
+  ins "str w9, [x0, #-8]"
   ins "b L_reuse_ret"
   line "L_reuse_shared:"
-  ins "sub w9, w9, #1"
+  ins "sub w9, w9, #1024"
   ins "str w9, [x0, #-8]"
   line "L_reuse_none:"
   ins "mov x0, #0"
@@ -1444,14 +1544,13 @@ emitRuntime = do
   ins "mov x1, #0"
   ins "bl _keel_alloc"
   ins "ldp x9, x10, [sp, #16]"
-  ins "add x11, x9, #2"
-  ins "mov x12, #0xFF"
-  ins "cmp x11, x12"
-  ins "csel x11, x11, x12, lo"
-  ins "lsl x11, x11, #32"
-  ins "orr x11, x11, #1" -- count 1
-  ins "orr x11, x11, #0xFF0000000000" -- tag 255: an array
-  ins "orr x11, x11, x10, lsl #49"
+  movImm "x11" (1024 + arrayLayout) -- count 1, an array's layout; the next for pointers
+  ins "add x11, x11, x10"
+  ins "add x12, x9, #2" -- its words, capped at 255
+  ins "mov x13, #0xFF"
+  ins "cmp x12, x13"
+  ins "csel x12, x12, x13, lo"
+  ins "orr x11, x11, x12, lsl #32"
   ins "str x11, [x0, #-8]"
   ins "stp xzr, x9, [x0]"
   ins "ldp x29, x30, [sp], #32"
@@ -1483,8 +1582,14 @@ emitRuntime = do
   ins "cbz x9, L_anew_drop"
   ins "ldr w13, [x10, #-8]"
   ins "tbnz w13, #31, L_anew_ret"
-  ins "add w13, w13, w9"
-  ins "sub w13, w13, #1"
+  ins "ubfx x14, x13, #10, #21"
+  ins "add x14, x14, x9"
+  ins "sub x14, x14, #1"
+  ins "bfi w13, w14, #10, #21"
+  ins "lsr x14, x14, #21" -- the count overflowed: immortal
+  ins "cbz x14, L_anew_store"
+  ins "orr w13, w13, #0x80000000"
+  line "L_anew_store:"
   ins "str w13, [x10, #-8]"
   ins "b L_anew_ret"
   line "L_anew_drop:"
@@ -1503,9 +1608,10 @@ emitRuntime = do
   ins "stp x29, x30, [sp, #-48]!"
   ins "mov x29, sp"
   ins "str x0, [sp, #16]"
-  ins "ldr x9, [x0, #-8]"
+  ins "ldr w9, [x0, #-8]"
   ins "mov x0, x1"
-  ins "ubfx x1, x9, #49, #1"
+  ins "and w1, w9, #0x3ff"
+  ins ("sub w1, w1, #" ++ show arrayLayout) -- 1 for pointers
   ins "bl _keel_array_alloc"
   ins "ldr x9, [sp, #16]"
   ins "ldr x10, [x9]"
@@ -1522,9 +1628,11 @@ emitRuntime = do
   ins "b L_aclone_copy"
   line "L_aclone_copied:"
   ins "ldr w12, [x9, #-8]"
-  ins "cmp w12, #1"
+  ins "lsr w13, w12, #10"
+  ins "cmp w13, #1"
   ins "b.ne L_aclone_shared"
-  ins "str wzr, [x9, #-8]"
+  ins "and w13, w12, #0x3ff" -- count 0
+  ins "str w13, [x9, #-8]"
   address "x12" "_keel_arena_base"
   ins "ldr x12, [x12]"
   ins "cmp x9, x12"
@@ -1536,8 +1644,9 @@ emitRuntime = do
   ins "ldr x0, [sp, #32]"
   ins "b L_aclone_ret"
   line "L_aclone_shared:"
-  ins "ldr x13, [x9, #-8]"
-  ins "tbz x13, #49, L_aclone_dec"
+  ins "and w13, w12, #0x3ff"
+  ins ("cmp w13, #" ++ show (arrayLayout + 1))
+  ins "b.ne L_aclone_dec"
   ins "mov x11, #0"
   line "L_aclone_dup:"
   ins "cmp x11, x10"
@@ -1546,13 +1655,13 @@ emitRuntime = do
   ins "ldr x14, [x14, #16]"
   ins "ldr w15, [x14, #-8]"
   ins "tbnz w15, #31, L_aclone_next"
-  ins "add w15, w15, #1"
+  ins "add w15, w15, #1024"
   ins "str w15, [x14, #-8]"
   line "L_aclone_next:"
   ins "add x11, x11, #1"
   ins "b L_aclone_dup"
   line "L_aclone_dec:"
-  ins "sub w12, w12, #1"
+  ins "sub w12, w12, #1024"
   ins "str w12, [x9, #-8]"
   line "L_aclone_ret:"
   ins "ldp x29, x30, [sp], #48"
@@ -1566,6 +1675,7 @@ emitRuntime = do
   ins "cmp x1, x9"
   ins "b.hs _keel_panic_bounds"
   ins "ldr w10, [x0, #-8]"
+  ins "lsr w10, w10, #10"
   ins "cmp w10, #1"
   ins "b.eq L_aset_store"
   ins "stp x1, x2, [sp, #16]"
@@ -1576,8 +1686,10 @@ emitRuntime = do
   ins "add x9, x0, x1, lsl #3"
   ins "ldr x10, [x9, #16]"
   ins "str x2, [x9, #16]"
-  ins "ldr x11, [x0, #-8]"
-  ins "tbz x11, #49, L_aset_ret"
+  ins "ldr w11, [x0, #-8]"
+  ins "and w11, w11, #0x3ff"
+  ins ("cmp w11, #" ++ show (arrayLayout + 1))
+  ins "b.ne L_aset_ret"
   ins "str x0, [sp, #16]"
   ins "mov x0, x10"
   ins "bl _keel_drop" -- the element it replaced
@@ -1597,6 +1709,7 @@ emitRuntime = do
   ins "cmp x9, x10"
   ins "b.hs L_apush_grow"
   ins "ldr w11, [x0, #-8]"
+  ins "lsr w11, w11, #10"
   ins "cmp w11, #1"
   ins "b.eq L_apush_store"
   ins "mov x1, x10"
@@ -1608,6 +1721,7 @@ emitRuntime = do
   ins "cmp x1, x12"
   ins "csel x1, x1, x12, hs"
   ins "ldr w11, [x0, #-8]"
+  ins "lsr w11, w11, #10"
   ins "cmp w11, #1"
   ins "b.ne L_apush_copy"
   ins "add x12, x0, #16"
@@ -1623,7 +1737,7 @@ emitRuntime = do
   ins "b.hi _keel_panic_oom"
   ins "str x12, [x13]"
   ins "str x1, [x0, #8]"
-  -- The header's size (capped at 255, as in _keel_array_alloc).
+  -- The header's words (capped at 255, as in _keel_array_alloc).
   ins "add x12, x1, #2"
   ins "mov x13, #0xFF"
   ins "cmp x12, x13"
@@ -1651,6 +1765,7 @@ emitRuntime = do
   ins "ldr x9, [x0]"
   ins "cbz x9, _keel_panic_bounds"
   ins "ldr w11, [x0, #-8]"
+  ins "lsr w11, w11, #10"
   ins "cmp w11, #1"
   ins "b.eq L_apop_take"
   ins "ldr x1, [x0, #8]"
@@ -1659,8 +1774,10 @@ emitRuntime = do
   ins "ldr x9, [x0]"
   ins "sub x9, x9, #1"
   ins "str x9, [x0]"
-  ins "ldr x11, [x0, #-8]"
-  ins "tbz x11, #49, L_apop_ret"
+  ins "ldr w11, [x0, #-8]"
+  ins "and w11, w11, #0x3ff"
+  ins ("cmp w11, #" ++ show (arrayLayout + 1))
+  ins "b.ne L_apop_ret"
   ins "add x10, x0, x9, lsl #3"
   ins "str x0, [sp, #16]"
   ins "ldr x0, [x10, #16]"
@@ -1701,7 +1818,7 @@ emitRuntime = do
   -- the call consumes the closure, but the frame keeps it: duplicate first
   ins "ldr w15, [x0, #-8]"
   ins "tbnz w15, #31, L_perform_call"
-  ins "add w15, w15, #1"
+  ins "add w15, w15, #1024"
   ins "str w15, [x0, #-8]"
   line "L_perform_call:"
   ins "ldr x16, [x0]"

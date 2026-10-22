@@ -209,6 +209,8 @@ exampleFiles =
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
+  , ("test/memory/narrow.kl", (Just "6148567732", ""))
+  , ("test/memory/narrow-print.kl", (Just "Cons(R(-12, -5000000000, true, 65535), box Cons(E, box Nil))", ""))
   , ("test/memory/arena.kl", (Just "13840", "1031\n"))
   , ("test/std/borrow.kl", (Just "745", ""))
   , ("test/std/ranges.kl", (Just "285070", ""))

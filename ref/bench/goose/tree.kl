@@ -1,27 +1,29 @@
 -- Goose's bench/goose/tree.goose, ported: build a complete binary tree of the given depth,
 -- sum it eight times. The tree is shared between the passes (reference counts, no copying).
+-- The values are i32, as in the other versions: a leaf is then just its header word.
 
 import rng
 
-data T = Leaf(i64) | Node(i64, Box T, Box T)
+data T = Leaf(i32) | Node(i32, Box T, Box T)
 
 def depth : i64 = 20 -- BENCH_N
 
 def build : i64 -> u64 ->{Panic, Diverge} T =
-  \d seed. if d == 0 then Leaf(rng.below seed 1000)
-           else Node(rng.below seed 1000, box (build (d - 1) (rng.next seed)),
+  \d seed. if d == 0 then Leaf(rng.below seed 1000 as i32)
+           else Node(rng.below seed 1000 as i32, box (build (d - 1) (rng.next seed)),
                                          box (build (d - 1) (rng.next (seed +% 1))))
 
 def sumTree : T -> i64 ->{Panic, Diverge} i64 =
   \t p. case t of
-    { Leaf(v) -> v lxor p
-    | Node(v, l, r) -> (v lxor p) + sumTree (unbox l) p + sumTree (unbox r) p }
+    { Leaf(v) -> (v as i64) lxor p
+    | Node(v, l, r) -> ((v as i64) lxor p) + sumTree (unbox l) p + sumTree (unbox r) p }
 
 def passes : T -> i64 -> i64 ->{Panic, Diverge} i64 =
   \t p acc. if p == 8 then acc else passes t (p + 1) (acc + sumTree t p)
 
+-- The tree lives in an arena, as Goose's nodes live in one pool: freed at once at the end
+-- instead of block by block.
 main =
-  let root = build depth 12345 in
   rng.emit ((1 lsl (depth + 1)) - 1);
-  rng.emit (passes root 0 0);
+  rng.emit (arena (\u. passes (build depth 12345) 0 0));
   0

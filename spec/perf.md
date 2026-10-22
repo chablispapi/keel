@@ -71,6 +71,15 @@ one twice the size, which also leaves no old copy behind; a push with room in a 
 stores without calling the runtime. `sum` 0.73× and half the memory; at 128M elements 4× faster.
 RISC-V still copies.
 
+**Narrow fields in the header** (both back ends, `spec/memory.md`). The header keeps the count and
+a layout id in its low half; a data block's first field of at most 32 bits goes in the high
+half, so `Leaf(i32)` is 8 bytes and `Node(i32, Box T, Box T)` 24 (was 16 and 32). `tree` at
+depth 24 needs 513 MB instead of 768. That alone didn't change its time: the time was in calls
+and in freeing 32M blocks one by one. Saving callee-saved registers in pairs (`stp`/`ldp`),
+widening conversions as moves and letting a `case`'s last branch fall through gave 0.91×; the
+port now keeps its tree in an `arena` (as Goose keeps its in one pool), 0.79× more. Reading the
+layout costs one instruction more per `case` than the old tag byte (`map` 1.03×).
+
 Both back ends (ARM64 and RISC-V) share the allocation (`allocate` in `ref/src/Keel/AArch64.hs`),
 and the full test suite passes on both after each step.
 

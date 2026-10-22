@@ -1,0 +1,39 @@
+-- Narrow fields (spec/memory.md): a data block's first field of at most 32 bits lives in its
+-- header word, so Leaf(i32) is a header and nothing else. Signed values must come back
+-- sign-extended, unsigned ones zero-extended; the same constructor at i32 and at i64 has two
+-- layouts; +? builds Some at either; a case that rebuilds a header-only block reuses it; freed
+-- blocks are recycled.
+
+data T = Leaf(i32) | Node(i32, Box T, Box T)
+data Rec = Rec(i64, u32, Bool, u8)
+data Pair2 a = P(a, a)
+
+def build : i32 -> i32 ->{Panic, Diverge} T =
+  \d v. if d == 0 then Leaf(v) else Node(v, box (build (d - 1) (v * 3 - 7)), box (build (d - 1) (0 - v)))
+
+def total : T ->{Panic, Diverge} i64 =
+  \t. case t of { Leaf(v) -> v as i64 | Node(v, l, r) -> (v as i64) + total (unbox l) + total (unbox r) }
+
+-- Every leaf is rebuilt from its own block (same size: just the header).
+def bump : T ->{Panic, Diverge} T =
+  \t. case t of { Leaf(v) -> Leaf(v + 1) | Node(v, l, r) -> Node(v, box (bump (unbox l)), box (bump (unbox r))) }
+
+-- Trees built and freed over and over: blocks come back off the free lists (the link is in the
+-- header word, as a header-only leaf has nothing else).
+def churn : i32 -> i64 ->{Panic, Diverge} i64 =
+  \n acc. if n == 0 then acc else churn (n - 1) (acc + total (build 5 n))
+
+def recSum : Rec ->{Panic} i64 =
+  \r. case r of { Rec(a, b, c, d) -> a + (b as i64) + (if c then 1000 else 0) + (d as i64) }
+
+def first : Pair2 i32 ->{Panic} i64 = \p. case p of { P(a, _) -> a as i64 }
+def second : Pair2 i64 -> i64 = \p. case p of { P(_, b) -> b }
+
+def opt : Option i32 ->{Panic} i64 = \o. case o of { None -> -1 | Some(x) -> x as i64 }
+def opt64 : Option i64 -> i64 = \o. case o of { None -> -1 | Some(x) -> x }
+
+main =
+  let t = build 6 (0 - 5) in
+  let r = Rec(-3, 4000000000, true, 200) in
+  total (bump t) + churn 200 0 + recSum r + first (P(-7, 9)) + second (P(-7, 9))
+    + opt (2147483647 +? 1) + opt (2147483646 +? 1) + opt64 (9223372036854775807 +? 1) + opt64 (5 +? 1)

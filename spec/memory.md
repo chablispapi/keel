@@ -22,10 +22,11 @@ pairs, closures and codata values are pointers to heap blocks. `Box` is the iden
 
 ```
         ┌──────────────────────────────────────────┐
-  p-8   │ header: count (bits 0–31)                 │   bit 31 set: immortal (static block)
-        │         size in words (32–39)            │   count 0: freed
-        │         tag (40–47)                       │   the constructor; 255: an array
-        │         pointer map (48–63)              │   bit i: payload word i is a pointer
+  p-8   │ header: layout (bits 0–9)                 │   which constructor, words, pointer map
+        │         count (10–30)                     │   moves by 1024; 0: freed
+        │         immortal (31)                     │   static blocks, and overflowed counts
+        │         the field, or words (32–39)       │   layouts from 512: a narrow field
+        │         and pointer map (40–55)           │   below: bit i = payload word i
         ├──────────────────────────────────────────┤
   p     │ fields | code pointer                     │
   p+8   │ … | captured values                       │
@@ -34,17 +35,31 @@ pairs, closures and codata values are pointers to heap blocks. `Box` is the iden
 
 | Block | Payload |
 |---|---|
-| data value, pair | `[field₁, …, fieldₙ]` (the tag is in the header) |
+| data value | its fields, one word each, but the first narrow one: that one is in the header |
+| pair | `[first, second]` |
 | closure | `[code, captured₁, …]` |
 | codata value | `[code₁, …, codeₙ, captured₁, …]` (one function per observation) |
 | array | `[length, capacity, element₀, …]` |
 
-An **array** has tag 255, and its pointer map is not a map: bit 1 says whether the elements are
-pointers. Its size field is capacity + 2, capped at 255 (blocks that large are never recycled).
+**Layouts.** Lowering numbers every shape of block in the program: each constructor at each
+field layout (`Some` at `i64` and at `i32` are two), and each size and pointer map of the other
+blocks. A `case` compares layout ids. The runtime needs a block's words and pointer map to free
+it: for most layouts the header's high half holds them; a data block whose layout puts its
+first **narrow field** (an integer of at most 32 bits, or a `Bool`) in the high half instead
+gets a layout id from 512 up, and the runtime looks those up in a table. So `Leaf(i32)` is 8
+bytes, the header alone, and `Node(i32, Box T, Box T)` 24. A program may have 510 layouts of
+each kind.
+
+An **array** has layout 510, or 511 when its elements are pointers. Its words field is
+capacity + 2, capped at 255 (blocks that large are never recycled).
+
+The **count** has 21 bits. One that overflows (2 million references to one block) carries into
+the immortal bit: the block is never freed. A free block keeps its free-list link in its first
+word, or, with no words, in the header's high half (in words from itself).
 
 Top-level definitions are static blocks in the data section with an immortal header: counting
 skips them. So is each constructor without fields (`Nil`, `None`, `Leaf`): one static block
-per tag, shared by every use.
+per layout, shared by every use.
 
 ## Ownership
 
@@ -157,6 +172,9 @@ call); known-arity calls (M4) remove them.
   standard Perceus refinements that remove counting work; none changes the model.
 - A block may have at most 16 payload words before its last pointer (the pointer map is
   16 bits); larger blocks are rejected at compile time. Arrays have no such limit.
+- Only a block's first narrow field moves into the header; the others take a word each
+  (packing two `i32` fields into one word is the next step). Counts have 21 bits: a block with
+  more than 2 million references becomes immortal and leaks.
 - Blocks over 64 words, so arrays of more than 62 elements, are not recycled: a growing array
   that isn't the last block (or on RISC-V) leaves its smaller copies behind in the bump region. A free list for large blocks (first fit,
   or size classes by powers of two) is the fix when a program runs out of heap.
