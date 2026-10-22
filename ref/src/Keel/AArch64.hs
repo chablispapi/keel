@@ -165,13 +165,14 @@ data Loc = InReg String | InSlot Int
 -- | A function's frame: where each variable lives and which registers to restore.
 -- fLoop: the function's own label, when a call to itself in tail position can jump back to
 -- where the arguments are stored instead of leaving and re-entering the frame.
-data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String}
+-- fUses: how often each variable occurs (a comparison used once, by an if, becomes a branch).
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String, fUses :: M.Map String Int}
 
 emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   when (length params > 7) $ error "more than 7 parameters"
   let (locs, saved, frame) = allocate ["x" ++ show r | r <- [19 .. 28 :: Int]] f (params ++ env ++ bound body)
-      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing)
+      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing) (M.fromListWith (+) [(v, 1) | v <- uses body])
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t// " ++ name)
   line ("L" ++ lbl ++ "_begin:")
@@ -264,6 +265,29 @@ atom slots r a = case a of
   AVar v -> load' slots r v
   AGlobal i -> address r ("_kc_" ++ show i)
   ANullary t -> modify (\s -> s {gsNullary = S.insert t (gsNullary s)}) >> address r ("_kn_" ++ show t)
+
+-- | The register holding an atom: its own, if it lives in one; otherwise it is loaded into @r@.
+operand :: Slots -> String -> Atom -> G String
+operand slots r a = case a of
+  AVar v | InReg x <- fLocs slots M.! v -> pure x
+  AInt 0 -> pure "xzr"
+  _ -> atom slots r a >> pure r
+
+-- | The two operands of add, sub or cmp: the second may be a 12-bit immediate, and then the
+-- first can't be xzr (that encoding means sp there).
+operands :: Slots -> Atom -> Atom -> G (String, String)
+operands slots a b = case b of
+  AInt n | n >= 0, n < 4096 -> do
+    ra <- operand slots "x9" a
+    ra' <- if ra == "xzr" then ins "mov x9, #0" >> pure "x9" else pure ra
+    pure (ra', "#" ++ show n)
+  _ -> (,) <$> operand slots "x9" a <*> operand slots "x10" b
+
+-- | Where a variable is computed: its own register, or x0 when it lives in a slot.
+destOf :: Slots -> String -> String
+destOf slots x = case fLocs slots M.! x of
+  InReg r -> r
+  InSlot _ -> "x0"
 
 address :: String -> String -> G ()
 address r sym = do
@@ -367,29 +391,29 @@ expr slots join e = case e of
       Nothing -> leave slots >> ins "ret"
       Just (v, lbl) -> store slots "x0" v >> ins ("b " ++ lbl)
   Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> loc x >> tc
+  -- A comparison used only by the if after it: compare and branch, no 0/1 value.
+  Bind c (RPrim op it a b) (BindIf x (AVar c') ea eb rest)
+    | c == c', op `elem` [Eq, Lt], M.lookup c (fUses slots) == Just 2 -> do
+        (ra, rb) <- operands slots a b
+        ins ("cmp " ++ ra ++ ", " ++ rb)
+        let otherwise' = if op == Eq then "ne" else if signed it then "ge" else "hs"
+        ifThen x (\l -> ins ("b." ++ otherwise' ++ " " ++ l)) ea eb rest
   Bind x rhs rest -> do
     loc x
-    rhsCode slots rhs
-    store slots "x0" x
+    let d = destOf slots x
+    direct <- rhsInto slots d rhs
+    unless direct (rhsCode slots rhs)
+    when (not direct || d == "x0") $ store slots "x0" x
     expr slots join rest
   BindIf x c a b rest -> do
-    let tailPos = isNothingJ && returns x rest
-    lElse <- newLabel
-    lJoin <- newLabel
-    atom slots "x9" c
-    ins ("cbz x9, " ++ lElse)
-    expr slots (target tailPos x lJoin) a
-    line (lElse ++ ":")
-    expr slots (target tailPos x lJoin) b
-    unless tailPos $ do
-      line (lJoin ++ ":")
-      expr slots join rest
+    rc <- operand slots "x9" c
+    ifThen x (\l -> ins ("cbz " ++ rc ++ ", " ++ l)) a b rest
   BindCase x s bs rest -> do
     let tailPos = isNothingJ && returns x rest
     lJoin <- newLabel
     labels <- mapM (const newLabel) bs
-    atom slots "x9" s
-    ins "ldrb w9, [x9, #-3]" -- the tag, in the header
+    rs <- operand slots "x9" s
+    ins ("ldrb w9, [" ++ rs ++ ", #-3]") -- the tag, in the header
     -- Compare against every tag but the last, which falls through.
     forM_ (zip (init bs) labels) $ \((tag, _, _), l) -> do
       ins ("cmp x9, #" ++ show tag)
@@ -418,6 +442,20 @@ expr slots join e = case e of
     returns x (Ret (AVar y)) = x == y
     returns _ _ = False
     target tailPos x lJoin = if tailPos then Nothing else Just (x, lJoin)
+
+    -- let x = (if … then a else b) in rest, with @jumpElse l@ branching to the else part.
+    ifThen :: String -> (String -> G ()) -> Expr -> Expr -> Expr -> G ()
+    ifThen x jumpElse a b rest = do
+      let tailPos = isNothingJ && returns x rest
+      lElse <- newLabel
+      lJoin <- newLabel
+      jumpElse lElse
+      expr slots (target tailPos x lJoin) a
+      line (lElse ++ ":")
+      expr slots (target tailPos x lJoin) b
+      unless tailPos $ do
+        line (lJoin ++ ":")
+        expr slots join rest
 
     -- A call in tail position: load the arguments, drop the frame, jump.
     tailCall rhs = case rhs of
@@ -456,6 +494,61 @@ alloc n bm = do
 -- | Header word of a fresh block: count 1, size, pointer map.
 header :: Integer -> Int -> Integer -> Integer
 header tag n bm = 1 .|. (toInteger (max 1 n) `shiftL` 32) .|. (tag `shiftL` 40) .|. (bm `shiftL` 48)
+
+-- | The common right-hand sides, computed straight into register @d@ from their operands'
+-- registers; False for the rest (rhsCode computes those into x0).
+rhsInto :: Slots -> String -> Rhs -> G Bool
+rhsInto slots d rhs = case rhs of
+  RAtom a -> atom slots d a >> pure True
+  RPrim Eq _ a b -> compare' a b "eq"
+  RPrim Lt it a b -> compare' a b (if signed it then "lt" else "lo")
+  RPrim (Arith ov aop) (IntTy sgn 64) a b
+    | ov `elem` [Wrap, Checked], aop `elem` [Add, Sub] -> do
+        (ra, rb) <- operands slots a b
+        let op = (if aop == Add then "add" else "sub") ++ (if ov == Checked then "s" else "")
+        ins (op ++ " " ++ d ++ ", " ++ ra ++ ", " ++ rb)
+        when (ov == Checked) $
+          ins ("b." ++ (if sgn then "vs" else if aop == Add then "cs" else "lo") ++ " _keel_panic_overflow")
+        pure True
+    | ov `elem` [Wrap, Checked], aop == Mul -> do
+        ra <- operand slots "x9" a
+        rb <- operand slots "x10" b
+        ins ("mul " ++ d ++ ", " ++ ra ++ ", " ++ rb)
+        when (ov == Checked) $
+          if sgn
+            then ins ("smulh x11, " ++ ra ++ ", " ++ rb) >> ins ("cmp x11, " ++ d ++ ", asr #63") >> ins "b.ne _keel_panic_overflow"
+            else ins ("umulh x11, " ++ ra ++ ", " ++ rb) >> ins "cbnz x11, _keel_panic_overflow"
+        pure True
+  -- Canonical (sign- or zero-extended) operands give a canonical result: any width.
+  RPrim (Bits bop) _ a b | bop `elem` [And, Or, Xor] -> do
+    ra <- operand slots "x9" a
+    rb <- operand slots "x10" b
+    ins ((case bop of And -> "and"; Or -> "orr"; _ -> "eor") ++ " " ++ d ++ ", " ++ ra ++ ", " ++ rb)
+    pure True
+  RField a i -> do
+    ra <- operand slots "x9" a
+    ins ("ldr " ++ d ++ ", [" ++ ra ++ ", #" ++ show (8 * i) ++ "]")
+    pure True
+  RArray ALength _ [a] -> do
+    ra <- operand slots "x9" a
+    ins ("ldr " ++ d ++ ", [" ++ ra ++ "]")
+    pure True
+  RArray AGet _ [a, i] -> do
+    ra <- operand slots "x9" a
+    ri <- operand slots "x10" i
+    ins ("ldr x11, [" ++ ra ++ "]")
+    ins ("cmp " ++ ri ++ ", x11")
+    ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
+    ins ("add x11, " ++ ra ++ ", " ++ ri ++ ", lsl #3")
+    ins ("ldr " ++ d ++ ", [x11, #16]")
+    pure True
+  _ -> pure False
+  where
+    compare' a b cond = do
+      (ra, rb) <- operands slots a b
+      ins ("cmp " ++ ra ++ ", " ++ rb)
+      ins ("cset " ++ d ++ ", " ++ cond)
+      pure True
 
 -- | Compute a right-hand side into x0.
 rhsCode :: Slots -> Rhs -> G ()
@@ -603,7 +696,7 @@ arith it@(IntTy sgn n) ov aop
           ins "str x12, [x0]"
           ins ("b " ++ lDone)
           line (lOvf ++ ":")
-          atom (Slots M.empty [] Nothing) "x0" (ANullary 0) -- None
+          atom (Slots M.empty [] Nothing M.empty) "x0" (ANullary 0) -- None
           line (lDone ++ ":")
         _ -> pure ()
   where

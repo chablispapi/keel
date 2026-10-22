@@ -187,7 +187,7 @@ lower (Program userDecls main) = do
       )
       (LS 0 M.empty S.empty Nothing M.empty)
   let ptrs = lsPtrs s
-      sigs = borrowSigs ptrs (lsFuns s) mainF
+      sigs = borrowSigs ptrs (lsFuns s) statics mainF
   pure (LProg (M.mapWithKey (\i -> refcount ptrs sigs (M.lookup i sigs)) (lsFuns s)) statics (refcount ptrs sigs Nothing mainF) (lsLocs s))
   where
     isLam e = case e of
@@ -529,11 +529,23 @@ type Sigs = M.Map Int [Bool]
 -- function consumes it, could reuse its block (it is a case scrutinee and a branch allocates),
 -- or some caller passes an owned value for it in a tail call (borrowing would put a drop after
 -- the call and turn the jump into a call). Only functions that are never closure code, so
--- every call to them is a direct one. Starts from all-borrowed and marks owned to a fixpoint.
-borrowSigs :: S.Set String -> M.Map Int Fun -> Fun -> Sigs
-borrowSigs ptrs funs mainF = fixpoint start
+-- every call to them is a direct one, and only callers the program can reach (every
+-- definition's curried closures exist, used or not). Starts from all-borrowed and marks owned
+-- to a fixpoint.
+borrowSigs :: S.Set String -> M.Map Int Fun -> [(Int, String, [Int])] -> Fun -> Sigs
+borrowSigs ptrs funs statics mainF = fixpoint start
   where
     referenced = S.fromList (concatMap (closureRefs . funBody) (mainF : M.elems funs))
+    staticFuns = M.fromList [(i, fs) | (i, _, fs) <- statics]
+    reachable = go S.empty (calls mainF)
+      where
+        go seen [] = seen
+        go seen (i : is)
+          | i `S.member` seen = go seen is
+          | otherwise = go (S.insert i seen) (maybe [] calls (M.lookup i funs) ++ is)
+        calls f =
+          [j | RCallKnown j _ <- rhss (funBody f)]
+            ++ concat [[j] ++ M.findWithDefault [] j staticFuns | j <- closureRefs (funBody f)]
     start =
       M.fromList
         [ (i, map (`S.member` ptrs) (funParams f))
@@ -545,7 +557,7 @@ borrowSigs ptrs funs mainF = fixpoint start
     fixpoint sigs = let sigs' = step sigs in if sigs' == sigs then sigs else fixpoint sigs'
     step sigs = M.mapWithKey (\i bs -> [b && (i, k) `S.notMember` owned | (k, b) <- zip [0 :: Int ..] bs]) sigs
       where
-        owned = S.fromList (concat [ownedHere i f | (i, f) <- M.toList funs, M.member i sigs] ++ tailOwned Nothing mainF ++ concat [tailOwned (Just i) f | (i, f) <- M.toList funs])
+        owned = S.fromList (concat [ownedHere i f | (i, f) <- M.toList funs, M.member i sigs] ++ tailOwned Nothing mainF ++ concat [tailOwned (Just i) f | (i, f) <- M.toList funs, i `S.member` reachable])
         ownedHere i f =
           let body = funBody f
               used = S.fromList (concatMap (consumedIn sigs) (rhss body) ++ rets body) <> reusedScrutinees body
