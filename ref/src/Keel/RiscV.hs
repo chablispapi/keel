@@ -129,9 +129,9 @@ emitProgram decls mainTy (LProg funs statics mainF _) = Right (unlines (reverse 
         forM_ fs $ \f -> ins (".dword _kf_" ++ show f)
       tags <- gets gsNullary
       forM_ (S.toList tags) $ \t -> do
-        ins ".dword 0x80000000\t\t# header: immortal"
-        line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with tag " ++ show t)
-        ins (".dword " ++ show t)
+        ins (".dword " ++ show (0x80000000 + t * 2 ^ (40 :: Int)) ++ "\t\t# header: immortal, tag " ++ show t)
+        line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with this tag")
+        ins ".dword 0"
       line "_keel_heap_ptr:"
       ins ".dword _keel_heap"
       ins (".dword _keel_heap+" ++ show heapSize)
@@ -258,7 +258,7 @@ expr slots join e = case e of
     lJoin <- newLabel
     labels <- mapM (const newLabel) bs
     atom slots "t0" s
-    ins "ld t0, 0(t0)"
+    ins "lbu t0, -3(t0)" -- the tag, in the header
     forM_ (zip (init bs) labels) $ \((tag, _, _), l) -> do
       li "t1" tag
       jumpIf "beq" ["t0", "t1"] l
@@ -351,14 +351,14 @@ rhsCode slots rhs = case rhs of
     ins ("ld t6, " ++ show (8 * i) ++ "(a0)")
     ins "jalr t6"
   RAlloc tag bm as -> do
-    alloc (1 + length as) bm
+    alloc (length as) bm
     fields tag as
   RAllocAt tok tag bm as -> do
     lFresh <- newLabel
     lDone <- newLabel
     load' slots "a0" tok
     jumpIf "beqz" ["a0"] lFresh
-    li "t6" (header (1 + length as) bm)
+    li "t6" (header tag (length as) bm)
     ins "sd t6, -8(a0)"
     ins "la t4, _keel_stats"
     ins "ld t5, 16(t4)"
@@ -366,12 +366,12 @@ rhsCode slots rhs = case rhs of
     ins "sd t5, 16(t4)"
     ins ("j " ++ lDone)
     line (lFresh ++ ":")
-    alloc (1 + length as) bm
+    alloc (length as) bm
     line (lDone ++ ":")
     fields tag as
   RField a i -> do
     atom slots "t0" a
-    ins ("ld a0, " ++ show (8 * (i + 1)) ++ "(t0)")
+    ins ("ld a0, " ++ show (8 * i) ++ "(t0)")
   RPushHandler cs bm -> do
     alloc (2 + 2 * length cs) bm
     ins "la t3, _keel_handlers"
@@ -425,9 +425,8 @@ rhsCode slots rhs = case rhs of
       ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
     fields :: Integer -> [Atom] -> G ()
     fields tag as = do
-      li "t2" tag
-      ins "sd t2, 0(a0)"
-      forM_ (zip [1 :: Int ..] as) $ \(j, a) -> do
+      when (tag /= 0) $ li "t2" tag >> ins "sb t2, -3(a0)"
+      forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "t2" a
         ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
 
@@ -474,14 +473,13 @@ arith it@(IntTy sgn n) ov aop
         Optional -> do
           lDone <- newLabel
           ins "mv t3, a0"
-          alloc 2 0
+          alloc 1 0
           ins "li t2, 1" -- Some
-          ins "sd t2, 0(a0)"
-          ins "sd t3, 8(a0)"
+          ins "sb t2, -3(a0)"
+          ins "sd t3, 0(a0)"
           ins ("j " ++ lDone)
           line (lOvf ++ ":")
-          alloc 1 0
-          ins "sd zero, 0(a0)" -- None
+          atom (Slots M.empty [] Nothing) "a0" (ANullary 0) -- None
           line (lDone ++ ":")
         _ -> pure ()
   where
@@ -608,7 +606,7 @@ emitPrinter decls printers lbl t = do
       lDone <- newLabel
       labels <- mapM (const newLabel) cs
       ins "ld t0, 0(sp)"
-      ins "ld t0, 0(t0)"
+      ins "lbu t0, -3(t0)"
       forM_ (zip [0 :: Int ..] labels) $ \(tag, l) -> do
         li "t1" (toInteger tag)
         jumpIf "beq" ["t0", "t1"] l
@@ -657,7 +655,7 @@ emitPrinter decls printers lbl t = do
     field :: Maybe Int -> Ty -> G ()
     field mi ft = do
       ins "ld a0, 0(sp)"
-      forM_ mi $ \i -> ins ("ld a0, " ++ show (8 * (i + 1)) ++ "(a0)")
+      forM_ mi $ \i -> ins ("ld a0, " ++ show (8 * i) ++ "(a0)")
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("call " ++ l)
         Nothing -> printStr "..."
@@ -751,8 +749,9 @@ emitRuntime = do
   ins "sd a0, 0(sp)"
   ins "ld t2, -8(a0)"
   ins "srli t2, t2, 48"
-  ins "andi t3, t2, 1"
-  ins "bnez t3, .L_drop_array"
+  ins "lbu t3, -3(a0)"
+  ins "addi t3, t3, -255"
+  ins "beqz t3, .L_drop_array"
   line ".L_drop_loop:"
   ins "beqz t2, .L_drop_free"
   ins "addi t3, t2, -1"
@@ -807,8 +806,7 @@ emitRuntime = do
   fn "_keel_free_block"
   ins "ld t0, -8(a0)"
   ins "srli t0, t0, 32"
-  ins "slli t0, t0, 48"
-  ins "srli t0, t0, 48" -- size in words
+  ins "andi t0, t0, 0xFF" -- size in words
   li "t1" (toInteger maxSmall)
   ins "bgtu t0, t1, .L_free_ret"
   ins "la t1, _keel_freelists"
@@ -820,8 +818,8 @@ emitRuntime = do
   line ".L_free_ret:"
   ins "ret"
 
-  -- Arrays: as in "Keel.AArch64" (payload [length, capacity, elements…]; pointer map bit 0
-  -- marks an array, bit 1 pointer elements).
+  -- Arrays: as in "Keel.AArch64" (payload [length, capacity, elements…]; tag 255 marks an
+  -- array, pointer map bit 1 pointer elements).
 
   -- _keel_array_alloc: a0 = capacity, a1 = pointer flag → a0 = an empty array.
   fn "_keel_array_alloc"
@@ -835,14 +833,14 @@ emitRuntime = do
   ins "ld t0, 0(sp)"
   ins "ld t1, 8(sp)"
   ins "addi t2, t0, 2"
-  ins "li t3, 0xFFFF"
+  ins "li t3, 0xFF"
   ins "bltu t2, t3, .L_aalloc_size"
   ins "mv t2, t3"
   line ".L_aalloc_size:"
   ins "slli t2, t2, 32"
   ins "ori t2, t2, 1" -- count 1
-  ins "li t3, 1"
-  ins "slli t3, t3, 48" -- pointer map bit 0: an array
+  ins "li t3, 0xFF"
+  ins "slli t3, t3, 40" -- tag 255: an array
   ins "or t2, t2, t3"
   ins "slli t1, t1, 49"
   ins "or t2, t2, t1"
@@ -1190,13 +1188,13 @@ emitRuntime = do
   ins "lwu a0, 0(a1)"
   ins "j .L_machine_ret"
   line ".L_write8:"
-  ins "ld t0, 8(a1)"
-  ins "ld t1, 16(a1)"
+  ins "ld t0, 0(a1)" -- the pair's fields
+  ins "ld t1, 8(a1)"
   ins "sb t1, 0(t0)"
   ins "j .L_write_done"
   line ".L_write32:"
-  ins "ld t0, 8(a1)"
-  ins "ld t1, 16(a1)"
+  ins "ld t0, 0(a1)" -- the pair's fields
+  ins "ld t1, 8(a1)"
   ins "sw t1, 0(t0)"
   line ".L_write_done:"
   ins "mv a0, a1" -- the (address, value) pair was passed owned

@@ -7,9 +7,9 @@
 --
 -- Representation: every value is one 64-bit word. Integers are sign- or zero-extended to
 -- 64 bits by their type; Bool and Unit are 0/1 and 0. Data values, pairs, closures and codata
--- values are pointers to heap blocks: @[tag, fields…]@, @[code, captured…]@ and
--- @[code₁, …, codeₙ, captured…]@, each preceded by a header word (reference count, size,
--- pointer map). @Box@ is the identity, since data is already behind a pointer.
+-- values are pointers to heap blocks: @[fields…]@, @[code, captured…]@ and
+-- @[code₁, …, codeₙ, captured…]@, each preceded by a header word (reference count, size, the
+-- constructor's tag, pointer map). @Box@ is the identity, since data is already behind a pointer.
 module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr) where
 
 import Control.Applicative ((<|>))
@@ -270,7 +270,7 @@ expr info env tm k = case tm of
   Con c _ [] -> con c >>= \(tag, _, _) -> k (ANullary tag)
   Con c _ args -> do
     (tag, _, _) <- con c
-    bm <- bitmap 1 (map (isPtr . typeOf info env) args)
+    bm <- bitmap 0 (map (isPtr . typeOf info env) args)
     subs args $ \vs -> bindRhs (RAlloc tag bm vs)
   Case e alts -> sub e $ \ve -> do
     x <- newVar "case" ty
@@ -284,12 +284,12 @@ expr info env tm k = case tm of
       xs' <- mapM (uncurry newVar) (zip xs fts)
       let env' = M.union (M.fromList (zip xs (zip xs' fts))) env
       body <- expr info env' b (pure . Ret)
-      pure (tag, 1 + length fields, foldr (\(i, y) rest -> Bind y (RField ve i) rest) body (zip [0 ..] xs'))
+      pure (tag, max 1 (length fields), foldr (\(i, y) rest -> Bind y (RField ve i) rest) body (zip [0 ..] xs'))
     BindCase x ve (sortOn (\(t, _, _) -> t) bs) <$> k (AVar x)
   Box e -> expr info env e k
   Unbox e -> expr info env e k
   Pair a b -> do
-    bm <- bitmap 1 (map (isPtr . typeOf info env) [a, b])
+    bm <- bitmap 0 (map (isPtr . typeOf info env) [a, b])
     subs [a, b] $ \vs -> bindRhs (RAlloc 0 bm vs)
   LetPair x y e b -> sub e $ \ve -> do
     let (tx, tyy) = case typeOf info env e of
@@ -511,7 +511,7 @@ refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funB
 -- use the token.
 useToken :: String -> Int -> Expr -> Maybe Expr
 useToken tok w e = case e of
-  Bind x (RAlloc tag bm as) rest | 1 + length as == w -> Just (Bind x (RAllocAt tok tag bm as) rest)
+  Bind x (RAlloc tag bm as) rest | max 1 (length as) == w -> Just (Bind x (RAllocAt tok tag bm as) rest)
   Bind x rhs rest -> Bind x rhs <$> useToken tok w rest
   Dup v rest -> Dup v <$> useToken tok w rest
   Drop v rest -> Drop v <$> useToken tok w rest
@@ -617,7 +617,7 @@ rets e = case e of
 reusedScrutinees :: Expr -> S.Set String
 reusedScrutinees e = S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> any (allocs w) (rhss b)) bs]
   where
-    allocs w (RAlloc _ _ as) = 1 + length as == w
+    allocs w (RAlloc _ _ as) = max 1 (length as) == w
     allocs _ _ = False
 
 subExprs :: Expr -> [Expr]

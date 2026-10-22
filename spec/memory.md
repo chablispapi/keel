@@ -23,27 +23,28 @@ pairs, closures and codata values are pointers to heap blocks. `Box` is the iden
 ```
         ┌──────────────────────────────────────────┐
   p-8   │ header: count (bits 0–31)                 │   bit 31 set: immortal (static block)
-        │         size in words (32–47)            │   count 0: freed
+        │         size in words (32–39)            │   count 0: freed
+        │         tag (40–47)                       │   the constructor; 255: an array
         │         pointer map (48–63)              │   bit i: payload word i is a pointer
         ├──────────────────────────────────────────┤
-  p     │ tag | code pointer                        │
-  p+8   │ fields | captured values                  │
+  p     │ fields | code pointer                     │
+  p+8   │ … | captured values                       │
         └──────────────────────────────────────────┘
 ```
 
 | Block | Payload |
 |---|---|
-| data value, pair | `[tag, field₁, …, fieldₙ]` |
+| data value, pair | `[field₁, …, fieldₙ]` (the tag is in the header) |
 | closure | `[code, captured₁, …]` |
 | codata value | `[code₁, …, codeₙ, captured₁, …]` (one function per observation) |
 | array | `[length, capacity, element₀, …]` |
 
-An **array**'s pointer map is not a map: bit 0 marks the block as an array (word 0 of any other
-block is a tag or a code pointer, never a counted pointer, so the bit is free) and bit 1 says
-whether the elements are pointers. Its size field is capacity + 2, capped at `0xFFFF`.
+An **array** has tag 255, and its pointer map is not a map: bit 1 says whether the elements are
+pointers. Its size field is capacity + 2, capped at 255 (blocks that large are never recycled).
 
 Top-level definitions are static blocks in the data section with an immortal header: counting
-skips them.
+skips them. So is each constructor without fields (`Nil`, `None`, `Leaf`): one static block
+per tag, shared by every use.
 
 ## Ownership
 
@@ -55,6 +56,16 @@ Every pointer variable **owns** one reference. The calling convention is all-own
 - storing a value in a block, passing it, or returning it **consumes** that reference;
 - reading a field (`case`, `let (x, y)`) **borrows** the block; the field is then duplicated
   so the variable owns it.
+
+Two exceptions, both inferred by the compiler (`Lower.borrowSigs`, after Lean):
+
+- a function that is only ever called directly (never as a closure) **borrows** a pointer
+  parameter it only reads: the caller keeps the value alive across the call, and nothing is
+  counted. A parameter stays owned if the function consumes it, could reuse its block, or
+  receives an owned value for it in a tail call (which would otherwise stop being a jump);
+- a field read from a borrowed value is borrowed too, not duplicated.
+
+`let y = x` makes `y` another name for the same reference.
 
 Owning the closure keeps calls in tail position: nothing is left to drop after the call, so
 `loop (i - 1) (acc + i)` still compiles to a jump (constant stack).

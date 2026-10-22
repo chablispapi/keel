@@ -8,7 +8,7 @@
 --
 -- Conventions: every function is called with its closure (or codata block) in x0 and its
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
--- word at offset -8 (reference count, size, pointer map) and are recycled through free lists
+-- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
 module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate) where
 
@@ -124,9 +124,9 @@ emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsL
         forM_ fs $ \f -> ins (".quad _kf_" ++ show f)
       tags <- gets gsNullary
       forM_ (S.toList tags) $ \t -> do
-        ins ".quad 0x80000000\t\t// header: immortal"
-        line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with tag " ++ show t)
-        ins (".quad " ++ show t)
+        ins (".quad " ++ show (0x80000000 + t * 2 ^ (40 :: Int)) ++ "\t\t// header: immortal, tag " ++ show t)
+        line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with this tag")
+        ins ".quad 0"
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
       ins (".quad _keel_heap+" ++ show nativeHeapSize)
@@ -389,7 +389,7 @@ expr slots join e = case e of
     lJoin <- newLabel
     labels <- mapM (const newLabel) bs
     atom slots "x9" s
-    ins "ldr x9, [x9]"
+    ins "ldrb w9, [x9, #-3]" -- the tag, in the header
     -- Compare against every tag but the last, which falls through.
     forM_ (zip (init bs) labels) $ \((tag, _, _), l) -> do
       ins ("cmp x9, #" ++ show tag)
@@ -454,8 +454,8 @@ alloc n bm = do
   ins "bl _keel_alloc"
 
 -- | Header word of a fresh block: count 1, size, pointer map.
-header :: Int -> Integer -> Integer
-header n bm = 1 .|. (toInteger (max 1 n) `shiftL` 32) .|. (bm `shiftL` 48)
+header :: Integer -> Int -> Integer -> Integer
+header tag n bm = 1 .|. (toInteger (max 1 n) `shiftL` 32) .|. (tag `shiftL` 40) .|. (bm `shiftL` 48)
 
 -- | Compute a right-hand side into x0.
 rhsCode :: Slots -> Rhs -> G ()
@@ -495,7 +495,7 @@ rhsCode slots rhs = case rhs of
     ins ("ldr x16, [x0, #" ++ show (8 * i) ++ "]")
     ins "blr x16"
   RAlloc tag bm as -> do
-    alloc (1 + length as) bm
+    alloc (length as) bm
     fields tag as
   RAllocAt tok tag bm as -> do
     -- In place if the token holds a block (it was unique); otherwise allocate.
@@ -503,7 +503,7 @@ rhsCode slots rhs = case rhs of
     lDone <- newLabel
     load' slots "x0" tok
     ins ("cbz x0, " ++ lFresh)
-    movImm "x15" (header (1 + length as) bm)
+    movImm "x15" (header tag (length as) bm)
     ins "str x15, [x0, #-8]"
     address "x13" "_keel_stats"
     ins "ldr x14, [x13, #16]"
@@ -511,12 +511,12 @@ rhsCode slots rhs = case rhs of
     ins "str x14, [x13, #16]"
     ins ("b " ++ lDone)
     line (lFresh ++ ":")
-    alloc (1 + length as) bm
+    alloc (length as) bm
     line (lDone ++ ":")
     fields tag as
   RField a i -> do
     atom slots "x9" a
-    ins ("ldr x0, [x9, #" ++ show (8 * (i + 1)) ++ "]")
+    ins ("ldr x0, [x9, #" ++ show (8 * i) ++ "]")
   RPushHandler cs bm -> do
     alloc (2 + 2 * length cs) bm
     address "x12" "_keel_handlers"
@@ -572,9 +572,8 @@ rhsCode slots rhs = case rhs of
       ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
     fields :: Integer -> [Atom] -> G ()
     fields tag as = do
-      movImm "x11" tag
-      ins "str x11, [x0]"
-      forM_ (zip [1 :: Int ..] as) $ \(j, a) -> do
+      when (tag /= 0) $ movImm "x11" tag >> ins "strb w11, [x0, #-3]"
+      forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "x11" a
         ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
 
@@ -598,14 +597,13 @@ arith it@(IntTy sgn n) ov aop
         Optional -> do
           lDone <- newLabel
           ins "mov x12, x0" -- the allocator leaves x9–x12 alone
-          alloc 2 0
+          alloc 1 0
           ins "mov x11, #1" -- Some
-          ins "str x11, [x0]"
-          ins "str x12, [x0, #8]"
+          ins "strb w11, [x0, #-3]"
+          ins "str x12, [x0]"
           ins ("b " ++ lDone)
           line (lOvf ++ ":")
-          alloc 1 0
-          ins "str xzr, [x0]" -- None
+          atom (Slots M.empty [] Nothing) "x0" (ANullary 0) -- None
           line (lDone ++ ":")
         _ -> pure ()
   where
@@ -778,7 +776,7 @@ emitPrinter decls printers lbl t = do
       lDone <- newLabel
       labels <- mapM (const newLabel) cs
       ins "ldr x9, [sp, #16]"
-      ins "ldr x9, [x9]"
+      ins "ldrb w9, [x9, #-3]"
       forM_ (zip [0 :: Int ..] labels) $ \(tag, l) -> do
         ins ("cmp x9, #" ++ show tag)
         ins ("b.eq " ++ l)
@@ -826,7 +824,7 @@ emitPrinter decls printers lbl t = do
     field :: Maybe Int -> Ty -> G ()
     field mi ft = do
       ins "ldr x0, [sp, #16]"
-      forM_ mi $ \i -> ins ("ldr x0, [x0, #" ++ show (8 * (i + 1)) ++ "]")
+      forM_ mi $ \i -> ins ("ldr x0, [x0, #" ++ show (8 * i) ++ "]")
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("bl " ++ l)
         Nothing -> printStr "..."
@@ -925,8 +923,10 @@ emitRuntime = do
   stat 24 "x12" "x13"
   ins "str x0, [sp, #16]"
   ins "ldr x11, [x0, #-8]"
+  ins "ubfx x12, x11, #40, #8"
   ins "lsr x11, x11, #48"
-  ins "tbnz x11, #0, L_drop_array"
+  ins "cmp x12, #255"
+  ins "b.eq L_drop_array"
   line "L_drop_loop:"
   ins "cbz x11, L_drop_free"
   ins "sub x13, x11, #1"
@@ -976,7 +976,7 @@ emitRuntime = do
   -- _keel_free_block: x0 = block with count 0 → push it on its size's free list.
   fn "_keel_free_block"
   ins "ldr x10, [x0, #-8]"
-  ins "ubfx x11, x10, #32, #16"
+  ins "ubfx x11, x10, #32, #8"
   ins ("cmp x11, #" ++ show maxSmall)
   ins "b.hi L_free_ret" -- ponytail: large blocks are not recycled
   address "x12" "_keel_freelists"
@@ -1026,9 +1026,9 @@ emitRuntime = do
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 
-  -- Arrays: payload [length, capacity, elements…]. The header's pointer map has bit 0 set (an
-  -- array: word 0 of other blocks is never a pointer) and bit 1 if the elements are pointers;
-  -- its size field is capacity + 2, at most 0xFFFF (larger blocks are never recycled anyway).
+  -- Arrays: payload [length, capacity, elements…]. The header's tag is 255 (an array) and its
+  -- pointer map has bit 1 set if the elements are pointers; its size field is capacity + 2, at
+  -- most 0xFF (larger blocks are never recycled anyway).
   -- An update to an array nothing else references happens in place; otherwise the array is
   -- copied first.
 
@@ -1042,12 +1042,12 @@ emitRuntime = do
   ins "bl _keel_alloc"
   ins "ldp x9, x10, [sp, #16]"
   ins "add x11, x9, #2"
-  ins "mov x12, #0xFFFF"
+  ins "mov x12, #0xFF"
   ins "cmp x11, x12"
   ins "csel x11, x11, x12, lo"
   ins "lsl x11, x11, #32"
   ins "orr x11, x11, #1" -- count 1
-  ins "orr x11, x11, #0x1000000000000" -- pointer map bit 0: an array
+  ins "orr x11, x11, #0xFF0000000000" -- tag 255: an array
   ins "orr x11, x11, x10, lsl #49"
   ins "str x11, [x0, #-8]"
   ins "stp xzr, x9, [x0]"
