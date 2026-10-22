@@ -169,9 +169,12 @@ call); known-arity calls (M4) remove them.
 
 ## Limits and next steps
 
-- **Not yet:** fusing a field's dup with the parent's drop when
-  the parent is unique, reuse across branches, and specialized drop functions. All of these are
-  standard Perceus refinements that remove counting work; none changes the model.
+- **Done since:** reuse across branches (a token goes into an if's or a case's branches when
+  each of them allocates a block its size) and fusing a field's dup with the parent's drop when
+  the parent is unique (the fields' duplicates become a mask the runtime only acts on for a
+  shared parent): insertion sort 0.63×, `map` 0.76×. **Not yet:** specialized drop functions,
+  and dropping a unique parent whose fields are taken over without a reuse (a plain drop).
+  These are standard Perceus refinements that remove counting work; none changes the model.
 - A block may have at most 16 payload words before its last pointer (the pointer map is
   16 bits); larger blocks are rejected at compile time. Arrays have no such limit.
 - Only a block's first narrow field moves into the header; the others take a word each

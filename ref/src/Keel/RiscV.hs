@@ -294,8 +294,9 @@ expr slots join e = case e of
     load' slots "a0" v
     ins "call _keel_drop"
     expr slots join rest
-  DropReuse v tok rest -> do
+  DropReuse v mask tok rest -> do
     load' slots "a0" v
+    li "a1" mask
     ins "call _keel_drop_reuse"
     store slots "a0" tok
     expr slots join rest
@@ -1226,7 +1227,8 @@ emitRuntime = do
   ins "addi sp, sp, 32"
   ins "ret"
 
-  -- _keel_drop_reuse: a0 = block → the block if it was unique (children dropped), else 0.
+  -- _keel_drop_reuse: a0 = block, a1 = the fields taken over (a mask of words) → the block if
+  -- it was unique (its other children dropped), else 0 (the fields taken over duplicated).
   fn "_keel_drop_reuse"
   ins "addi sp, sp, -32"
   ins "sd ra, 24(sp)"
@@ -1242,9 +1244,12 @@ emitRuntime = do
   ins "slli t2, t2, 8"
   ins "srli t2, t2, 48" -- the pointer map
   ins "andi t3, t0, 0x200"
-  ins "beqz t3, .L_reuse_loop"
+  ins "beqz t3, .L_reuse_map"
   ins "andi t3, t0, 0x3ff" -- a field in the header: the map is in the table
   pointerMap
+  line ".L_reuse_map:"
+  ins "not t4, a1" -- the fields taken over stay alive: they are the caller's now
+  ins "and t2, t2, t4"
   line ".L_reuse_loop:"
   ins "beqz t2, .L_reuse_done"
   ins "neg t3, t2"
@@ -1267,7 +1272,21 @@ emitRuntime = do
   line ".L_reuse_shared:"
   ins "addiw t0, t0, -1024"
   ins "sw t0, -8(a0)"
+  -- The block keeps its references: duplicate the fields taken over.
   line ".L_reuse_none:"
+  ins "beqz a1, .L_reuse_zero"
+  ins "neg t3, a1"
+  ins "and t3, a1, t3" -- lowest set bit
+  ins "xor a1, a1, t3"
+  lowIndex
+  ins "add t4, t4, a0"
+  ins "ld t4, 0(t4)"
+  ins "lw t5, -8(t4)"
+  ins "bltz t5, .L_reuse_none"
+  ins "addiw t5, t5, 1024"
+  ins "sw t5, -8(t4)"
+  ins "j .L_reuse_none"
+  line ".L_reuse_zero:"
   ins "li a0, 0"
   line ".L_reuse_ret:"
   ins "ld ra, 24(sp)"

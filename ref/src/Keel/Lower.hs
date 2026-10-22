@@ -19,9 +19,9 @@ import Control.Monad (foldM, forM, forM_, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (State, StateT, evalState, get, gets, modify, put, runStateT)
 import Data.Bits (setBit)
-import Data.List (elemIndex, nub, sortOn)
+import Data.List (delete, elemIndex, nub, sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as S
 import Keel.Syntax
 
@@ -86,7 +86,8 @@ data Expr
   | BindCase String Atom [(Integer, Int, Expr)] Expr -- ^ case on the layout; each branch knows its block's words
   | Dup String Expr                           -- ^ increment a reference count
   | Drop String Expr                          -- ^ decrement it, freeing the block at zero
-  | DropReuse String String Expr              -- ^ drop, keeping the block as a reuse token if unique
+  | DropReuse String Integer String Expr      -- ^ drop, keeping the block as a reuse token if unique;
+                                              -- the fields in the mask (by word) are taken over
   deriving (Show)
 
 -- | A closure-converted function, called with its block in x0 and its arguments (owned) in
@@ -274,7 +275,8 @@ lower (Program userDecls main) = do
       (LS 0 M.empty S.empty Nothing M.empty M.empty)
   let ptrs = lsPtrs s
       sigs = borrowSigs ptrs (lsFuns s) statics mainF
-  pure (LProg (M.mapWithKey (\i -> refcount ptrs sigs (M.lookup i sigs)) (lsFuns s)) statics (refcount ptrs sigs Nothing mainF) (lsLocs s) (lsLayouts s))
+  let counted sig f = let f' = refcount ptrs sigs sig f in f' {funBody = fuseFields (funBody f')}
+  pure (LProg (M.mapWithKey (\i -> counted (M.lookup i sigs)) (lsFuns s)) statics (counted Nothing mainF) (lsLocs s) (lsLayouts s))
   where
     isLam e = case e of
       Lam {} -> True
@@ -617,27 +619,64 @@ refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funB
 
     pointer x = if isP x then S.singleton x else S.empty
 
-    -- Drop v before @e@, or turn it into a reuse token for the first same-size allocation in
-    -- @e@'s straight-line code.
+    -- Drop v before @e@, or turn it into a reuse token for the first same-size allocation on
+    -- every path through @e@ (see useToken).
     dropOrReuse reuse v e = case M.lookup v reuse of
       Just w -> do
         n <- get
         put (n + 1)
         let tok = "%tok" ++ show n
         pure $ case useToken tok w e of
-          Just e' -> DropReuse v tok e'
+          Just e' -> DropReuse v 0 tok e'
           Nothing -> Drop v e
       Nothing -> pure (Drop v e)
 
--- | Rewrite the first allocation of @w@ words in the straight-line part of an expression to
--- use the token.
+-- | Fields read from a block and duplicated just before the block is dropped for reuse: when
+-- the block turns out to be unique, its references to them become ours, so the duplicate and
+-- the drop of those children cancel (Perceus' drop specialization). The fields' duplicates
+-- move into the DropReuse as a mask of their words; the runtime duplicates them only when the
+-- block is shared. Only across field reads and duplicates, which the moved duplicates can pass.
+fuseFields :: Expr -> Expr
+fuseFields = go M.empty []
+  where
+    -- fs: variables holding a field (block, word) in this straight-line run; dups: the
+    -- duplicates of such fields not yet emitted, in order.
+    go fs dups e = case e of
+      Bind x rhs@(RField (AVar v) i) rest -> Bind x rhs (go (M.insert x (v, i) fs) dups rest)
+      Dup f rest | f `M.member` fs -> go fs (dups ++ [f]) rest
+      DropReuse v m tok rest ->
+        let own = nub [f | f <- dups, Just (v', _) <- [M.lookup f fs], v' == v]
+            others = foldl (flip delete) dups own
+            mask = foldl setBit m [i | f <- own, Just (_, i) <- [M.lookup f fs]]
+         in foldr Dup (DropReuse v mask tok (go M.empty [] rest)) others
+      _ -> foldr Dup (inside e) dups
+    inside e = case e of
+      Ret _ -> e
+      Bind x rhs rest -> Bind x rhs (go M.empty [] rest)
+      BindIf x c a b rest -> BindIf x c (go M.empty [] a) (go M.empty [] b) (go M.empty [] rest)
+      BindCase x s bs rest -> BindCase x s [(t, n, go M.empty [] b) | (t, n, b) <- bs] (go M.empty [] rest)
+      Dup v rest -> Dup v (go M.empty [] rest)
+      Drop v rest -> Drop v (go M.empty [] rest)
+      DropReuse v m t rest -> DropReuse v m t (go M.empty [] rest)
+
+-- | Rewrite the first allocation of @w@ words on every path through an expression to use the
+-- token: into an if's or a case's branches when each of them has one (so no path is left
+-- holding an unused token), or else past them.
 useToken :: String -> Int -> Expr -> Maybe Expr
 useToken tok w e = case e of
   Bind x (RAlloc lid h as) rest | length as == w -> Just (Bind x (RAllocAt tok lid h as) rest)
   Bind x rhs rest -> Bind x rhs <$> useToken tok w rest
+  BindIf x c a b rest -> case (useToken tok w a, useToken tok w b) of
+    (Just a', Just b') -> Just (BindIf x c a' b' rest)
+    (Nothing, Nothing) -> BindIf x c a b <$> useToken tok w rest
+    _ -> Nothing
+  BindCase x s bs rest -> case [(t, n,) <$> useToken tok w b | (t, n, b) <- bs] of
+    used | Just bs' <- sequence used -> Just (BindCase x s bs' rest)
+         | all isNothing used -> BindCase x s bs <$> useToken tok w rest
+         | otherwise -> Nothing
   Dup v rest -> Dup v <$> useToken tok w rest
   Drop v rest -> Drop v <$> useToken tok w rest
-  DropReuse v t rest -> DropReuse v t <$> useToken tok w rest
+  DropReuse v m t rest -> DropReuse v m t <$> useToken tok w rest
   _ -> Nothing
 
 atomVars :: Atom -> [String]
@@ -711,7 +750,7 @@ rhss e = case e of
   BindCase _ _ bs rest -> concat [rhss b | (_, _, b) <- bs] ++ rhss rest
   Dup _ rest -> rhss rest
   Drop _ rest -> rhss rest
-  DropReuse _ _ rest -> rhss rest
+  DropReuse _ _ _ rest -> rhss rest
 
 -- | Every atom in an expression.
 exprAtoms :: Expr -> [Atom]
@@ -722,7 +761,7 @@ exprAtoms e = case e of
   BindCase _ s bs rest -> s : concat [exprAtoms b | (_, _, b) <- bs] ++ exprAtoms rest
   Dup _ rest -> exprAtoms rest
   Drop _ rest -> exprAtoms rest
-  DropReuse _ _ rest -> exprAtoms rest
+  DropReuse _ _ _ rest -> exprAtoms rest
   where
     rhsAtoms rhs = case rhs of
       RAtom a -> [a]
@@ -751,7 +790,7 @@ rets e = case e of
   BindCase _ _ bs rest -> concat [rets b | (_, _, b) <- bs] ++ rets rest
   Dup _ rest -> rets rest
   Drop _ rest -> rets rest
-  DropReuse _ _ rest -> rets rest
+  DropReuse _ _ _ rest -> rets rest
 
 -- | Case scrutinees whose block a branch could reuse (a branch allocates a block its size).
 reusedScrutinees :: Expr -> S.Set String
@@ -768,7 +807,7 @@ subExprs e = e : case e of
   BindCase _ _ bs rest -> concat [subExprs b | (_, _, b) <- bs] ++ subExprs rest
   Dup _ rest -> subExprs rest
   Drop _ rest -> subExprs rest
-  DropReuse _ _ rest -> subExprs rest
+  DropReuse _ _ _ rest -> subExprs rest
 
 -- | Direct calls in tail position (let x = f as in x), with their arguments.
 tailCalls :: Expr -> [(Int, [Atom])]
@@ -808,4 +847,4 @@ fv e = case e of
   BindCase _ s brs rest -> S.fromList (atomVars s) <> S.unions [fv b | (_, _, b) <- brs] <> fv rest
   Dup v rest -> S.insert v (fv rest)
   Drop v rest -> S.insert v (fv rest)
-  DropReuse v _ rest -> S.insert v (fv rest)
+  DropReuse v _ _ rest -> S.insert v (fv rest)

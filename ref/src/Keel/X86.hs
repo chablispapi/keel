@@ -287,8 +287,9 @@ expr slots join e = case e of
     load' slots "rax" v
     ins "call _keel_drop"
     expr slots join rest
-  DropReuse v tok rest -> do
+  DropReuse v mask tok rest -> do
     load' slots "rax" v
+    li "rdi" mask
     ins "call _keel_drop_reuse"
     store slots "rax" tok
     expr slots join rest
@@ -1194,8 +1195,9 @@ emitRuntime = do
   ins "mov qword ptr [rsi], rax"
   ins "ret"
 
-  -- _keel_drop_reuse: rax = block → rax = the block if it was unique (its children dropped,
-  -- count 0 until reused), or 0 after an ordinary decrement.
+  -- _keel_drop_reuse: rax = block, rdi = the fields taken over (a mask of words) → rax = the
+  -- block if it was unique (its other children dropped, count 0 until reused), or 0 after an
+  -- ordinary decrement and duplicating the fields taken over.
   fn "_keel_drop_reuse"
   ins "push rbx"
   ins "push r12"
@@ -1214,11 +1216,15 @@ emitRuntime = do
   ins "shl r12, 8"
   ins "shr r12, 48" -- the pointer map
   ins ("test ecx, " ++ show fieldLayouts)
-  ins "jz .L_reuse_loop"
+  ins "jz .L_reuse_map"
   ins "and ecx, 0x3ff" -- a field in the header: the map is in the table
   address "rdx" "_keel_layouts"
   ins ("mov r12d, dword ptr [rdx + rcx*4 - " ++ show (4 * fieldLayouts) ++ "]")
   ins "shr r12d, 8"
+  line ".L_reuse_map:"
+  ins "mov rdx, rdi" -- the fields taken over stay alive: they are the caller's now
+  ins "not rdx"
+  ins "and r12, rdx"
   line ".L_reuse_loop:"
   ins "test r12, r12"
   ins "jz .L_reuse_done"
@@ -1234,7 +1240,20 @@ emitRuntime = do
   line ".L_reuse_shared:"
   ins "sub ecx, 1024"
   ins "mov dword ptr [rax - 8], ecx"
+  -- The block keeps its references: duplicate the fields taken over.
   line ".L_reuse_none:"
+  ins "test rdi, rdi"
+  ins "jz .L_reuse_zero"
+  ins "bsf rcx, rdi"
+  ins "btr rdi, rcx"
+  ins "mov rdx, qword ptr [rax + rcx*8]"
+  ins "mov esi, dword ptr [rdx - 8]"
+  ins "test esi, esi"
+  ins "js .L_reuse_none"
+  ins "add esi, 1024"
+  ins "mov dword ptr [rdx - 8], esi"
+  ins "jmp .L_reuse_none"
+  line ".L_reuse_zero:"
   ins "xor eax, eax"
   line ".L_reuse_ret:"
   ins "add rsp, 8"

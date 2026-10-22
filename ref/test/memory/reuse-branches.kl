@@ -1,0 +1,51 @@
+-- Reuse across branches and fields taken over (Keel.Lower: useToken, fuseFields). A cell taken
+-- apart is reused by an allocation on every path after it, and its fields' duplicates cancel
+-- its drop when it is unique. Here: lists sorted while unique and while shared (then the
+-- runtime duplicates the fields instead), a branch that allocates nothing (no reuse), a
+-- pointer field the pattern ignores (dropped with the cell), fields read in either order.
+
+data List a = Nil | Cons(a, Box (List a))
+data Two = Two(Box (List i64), Box (List i64))
+
+def insert : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \x xs. case xs of
+    { Nil -> Cons(x, box Nil)
+    | Cons(y, rest) -> if x < y then Cons(x, box Cons(y, rest)) else Cons(y, box (insert x (unbox rest))) }
+
+def sort : List i64 ->{Panic, Diverge} List i64 =
+  \xs. case xs of { Nil -> Nil | Cons(y, rest) -> insert y (sort (unbox rest)) }
+
+def range : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \n acc. if n < 1 then acc else range (n - 1) (Cons((n * 7) % 13, box acc))
+
+def total : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> x + total (unbox rest) }
+
+-- Rebuilds each cell: in place when unique; for a shared list the fields are duplicated.
+def incr : List i64 ->{Panic, Diverge} List i64 =
+  \xs. case xs of { Nil -> Nil | Cons(y, rest) -> Cons(y + 1, box (incr (unbox rest))) }
+
+-- Only the else branch allocates: the cell is dropped, not reused.
+def headOr : List i64 ->{Panic, Diverge} List i64 =
+  \xs. case xs of { Nil -> Nil | Cons(y, rest) -> if y < 3 then unbox rest else Cons(y + 1, rest) }
+
+-- The second field is never read: it goes with the cell.
+def firsts : Two ->{Panic, Diverge} Two =
+  \t. case t of { Two(a, _) -> Two(a, box Nil) }
+
+-- Fields read and used in the other order.
+def swap : Two ->{Panic, Diverge} Two =
+  \t. case t of { Two(a, b) -> Two(b, a) }
+
+def both : Two ->{Panic, Diverge} i64 =
+  \t. case t of { Two(a, b) -> total (unbox a) * 1000 + total (unbox b) }
+
+main =
+  let xs = range 40 Nil in
+  let s1 = sort xs in
+  let s2 = sort xs in
+  let t = Two(box (range 5 Nil), box (range 9 Nil)) in
+  let ys = range 12 Nil in
+  let shared = total (incr ys) * 3 + total ys in
+  total s1 + total s2 * 100 + total (sort (range 30 Nil)) * 10000 + total xs
+    + total (headOr (range 6 Nil)) + both (swap t) * 1000000 + both (firsts (swap t)) * 7 + shared * 100000000

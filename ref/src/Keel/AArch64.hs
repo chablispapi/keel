@@ -212,7 +212,7 @@ interference entry body = M.fromListWith S.union (concat [(x, ys) : [(y, S.singl
         pure (atomSet sc <> mconcat ls)
       Dup v rest -> S.insert v <$> live join rest
       Drop v rest -> S.insert v <$> live join rest
-      DropReuse v t rest -> live join rest >>= def t . S.insert v >>= pure . S.insert v
+      DropReuse v _ t rest -> live join rest >>= def t . S.insert v >>= pure . S.insert v
     atomSet a = S.fromList [v | AVar v <- [a]]
     rhsUses rhs = drop 1 (uses (Bind "" rhs (Ret (AInt 0))))
 
@@ -296,7 +296,7 @@ uses e = case e of
   BindCase x s bs rest -> x : av s ++ concat [uses b | (_, _, b) <- bs] ++ uses rest
   Dup v rest -> v : uses rest
   Drop v rest -> v : uses rest
-  DropReuse v t rest -> v : t : uses rest
+  DropReuse v _ t rest -> v : t : uses rest
   where
     av (AVar v) = [v]
     av _ = []
@@ -329,7 +329,7 @@ bound e = case e of
   BindCase x _ bs rest -> x : concat [bound b | (_, _, b) <- bs] ++ bound rest
   Dup _ rest -> bound rest
   Drop _ rest -> bound rest
-  DropReuse _ tok rest -> tok : bound rest
+  DropReuse _ _ tok rest -> tok : bound rest
 
 store, load' :: Slots -> String -> String -> G ()
 store slots r v = case fLocs slots M.! v of
@@ -511,8 +511,9 @@ expr slots join e = case e of
     load' slots "x0" v
     ins "bl _keel_drop"
     expr slots join rest
-  DropReuse v tok rest -> do
+  DropReuse v mask tok rest -> do
     load' slots "x0" v
+    movImm "x1" mask
     ins "bl _keel_drop_reuse"
     store slots "x0" tok
     expr slots join rest
@@ -1548,8 +1549,9 @@ emitRuntime = do
   ins "str x0, [x12, x11, lsl #3]"
   ins "ret"
 
-  -- _keel_drop_reuse: x0 = block → x0 = the block, if it was unique (its children dropped,
-  -- count 0 until reused), or 0 after an ordinary decrement.
+  -- _keel_drop_reuse: x0 = block, x1 = the fields taken over (a mask of words) → x0 = the
+  -- block, if it was unique (its other children dropped, count 0 until reused), or 0 after an
+  -- ordinary decrement and duplicating the fields taken over.
   fn "_keel_drop_reuse"
   ins "stp x29, x30, [sp, #-32]!"
   ins "mov x29, sp"
@@ -1564,11 +1566,13 @@ emitRuntime = do
   ins "str x0, [sp, #16]"
   ins "ldr x11, [x0, #-8]"
   ins "ubfx x11, x11, #40, #16" -- the pointer map
-  ins "tbz w9, #9, L_reuse_loop"
+  ins "tbz w9, #9, L_reuse_map"
   ins "and w12, w9, #0x1ff" -- a field in the header: the map is in the table
   address "x11" "_keel_layouts"
   ins "ldr w11, [x11, x12, lsl #2]"
   ins "lsr w11, w11, #8"
+  line "L_reuse_map:"
+  ins "bic x11, x11, x1" -- the fields taken over stay alive: they are the caller's now
   line "L_reuse_loop:"
   ins "cbz x11, L_reuse_done"
   ins "rbit x13, x11"
@@ -1591,7 +1595,21 @@ emitRuntime = do
   line "L_reuse_shared:"
   ins "sub w9, w9, #1024"
   ins "str w9, [x0, #-8]"
+  -- The block keeps its references: duplicate the fields taken over.
   line "L_reuse_none:"
+  ins "cbz x1, L_reuse_zero"
+  ins "rbit x13, x1"
+  ins "clz x13, x13"
+  ins "mov x14, #1"
+  ins "lsl x14, x14, x13"
+  ins "bic x1, x1, x14"
+  ins "ldr x15, [x0, x13, lsl #3]"
+  ins "ldr w16, [x15, #-8]"
+  ins "tbnz w16, #31, L_reuse_none"
+  ins "add w16, w16, #1024"
+  ins "str w16, [x15, #-8]"
+  ins "b L_reuse_none"
+  line "L_reuse_zero:"
   ins "mov x0, #0"
   line "L_reuse_ret:"
   ins "ldp x29, x30, [sp], #32"
