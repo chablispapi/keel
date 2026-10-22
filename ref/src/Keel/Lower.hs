@@ -27,6 +27,7 @@ data Atom
   = AInt Integer -- ^ integers (canonical 64-bit form), and Bool / Unit as 0 or 1
   | AVar String  -- ^ a local variable (stack slot)
   | AGlobal Int  -- ^ the static block of top-level definition i (immortal)
+  | ANullary Integer -- ^ a constructor without fields: the shared static block holding its tag
   deriving (Show)
 
 -- | Bitmaps mark which payload words hold pointers (bit i = word i); the runtime uses them to
@@ -266,6 +267,7 @@ expr info env tm k = case tm of
     , not (M.member g env) ->
         sub a $ \va -> bindRhs (RCallKnown i [va])
   App f a -> sub f $ \vf -> sub a $ \va -> bindRhs (RCall vf va)
+  Con c _ [] -> con c >>= \(tag, _, _) -> k (ANullary tag)
   Con c _ args -> do
     (tag, _, _) <- con c
     bm <- bitmap 1 (map (isPtr . typeOf info env) args)

@@ -18,6 +18,7 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.List (elemIndex, nub, sortOn)
 import Data.ByteString qualified as B
 import Data.Map.Strict qualified as M
+import Data.Set qualified as S
 import Data.Maybe (listToMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -64,7 +65,7 @@ maxSmall = 64
 
 -- | gsLocs: the line-table row (file number, line, column) for variables bound by a
 -- positioned computation; empty unless the program kept positions (debug builds).
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int)}
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int), gsNullary :: S.Set Integer}
 
 type G = State GS
 
@@ -100,7 +101,7 @@ printStr s = do
 
 -- | Emit a program whose @main@ has type @mainTy@.
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows))))
+emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -121,6 +122,11 @@ emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsL
         ins ".quad 0x80000000\t\t// header: immortal"
         line ("_kc_" ++ show i ++ ":\t\t\t// static block of " ++ name)
         forM_ fs $ \f -> ins (".quad _kf_" ++ show f)
+      tags <- gets gsNullary
+      forM_ (S.toList tags) $ \t -> do
+        ins ".quad 0x80000000\t\t// header: immortal"
+        line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with tag " ++ show t)
+        ins (".quad " ++ show t)
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
       ins (".quad _keel_heap+" ++ show nativeHeapSize)
@@ -257,6 +263,7 @@ atom slots r a = case a of
   AInt n -> movImm r n
   AVar v -> load' slots r v
   AGlobal i -> address r ("_kc_" ++ show i)
+  ANullary t -> modify (\s -> s {gsNullary = S.insert t (gsNullary s)}) >> address r ("_kn_" ++ show t)
 
 address :: String -> String -> G ()
 address r sym = do

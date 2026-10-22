@@ -15,6 +15,7 @@ module Keel.RiscV (compileRiscV, linkerScript) where
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Map.Strict qualified as M
+import Data.Set qualified as S
 import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, maxSmall, prepare, printerTypes)
 import Keel.Lower
 import Keel.Syntax
@@ -42,7 +43,7 @@ linkerScript =
     , "}"
     ]
 
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String}
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsNullary :: S.Set Integer}
 
 type G = State GS
 
@@ -110,7 +111,7 @@ jumpIf cond operands target = do
 emitProgram :: [Decl] -> Ty -> LProg -> Either String String
 emitProgram decls mainTy (LProg funs statics mainF _) = Right (unlines (reverse (gsLines final)))
   where
-    final = execState gen (GS 0 [] M.empty)
+    final = execState gen (GS 0 [] M.empty S.empty)
     printers = printerTypes decls mainTy
     gen = do
       line "\t.section .text.start, \"ax\""
@@ -126,6 +127,11 @@ emitProgram decls mainTy (LProg funs statics mainF _) = Right (unlines (reverse 
         ins ".dword 0x80000000\t\t# header: immortal"
         line ("_kc_" ++ show i ++ ":\t\t\t# static block of " ++ name)
         forM_ fs $ \f -> ins (".dword _kf_" ++ show f)
+      tags <- gets gsNullary
+      forM_ (S.toList tags) $ \t -> do
+        ins ".dword 0x80000000\t\t# header: immortal"
+        line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with tag " ++ show t)
+        ins (".dword " ++ show t)
       line "_keel_heap_ptr:"
       ins ".dword _keel_heap"
       ins (".dword _keel_heap+" ++ show heapSize)
@@ -208,6 +214,7 @@ atom slots r a = case a of
   AInt n -> li r n
   AVar v -> load' slots r v
   AGlobal i -> ins ("la " ++ r ++ ", _kc_" ++ show i)
+  ANullary t -> modify (\s -> s {gsNullary = S.insert t (gsNullary s)}) >> ins ("la " ++ r ++ ", _kn_" ++ show t)
 
 -- | Increment a reference count inline (a6, a7). The count is the low 32 bits of the header:
 -- loaded sign-extended, an immortal block (bit 31) is negative.
