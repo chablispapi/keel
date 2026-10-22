@@ -1,0 +1,45 @@
+-- Packed layouts (AArch64): constructors with two or more pointer fields keep them in 4-byte
+-- slots relative to the block. A word field before them, a narrow one in the header, an odd
+-- number of pointers, static children (Leaf, below the heap), in-place reuse of unique and
+-- shared trees, a partial transfer, an arena, and printing a packed value.
+data T = Leaf | Node(i64, Box T, Box T)
+data N = Tip(i32) | Bin(i32, Box N, Box N)
+data Tri = Nil3 | Tri(Box Tri, Box Tri, Box Tri)
+
+def make : i64 ->{Panic, Diverge} T =
+  \d. if d == 0 then Leaf else Node(d, box (make (d - 1)), box (make (d - 1)))
+
+def total : T ->{Panic, Diverge} i64 =
+  \t. case t of { Leaf -> 0 | Node(v, l, r) -> v + total (unbox l) + total (unbox r) }
+
+-- Rebuilds every node in place when the tree is unique.
+def bump : T ->{Panic, Diverge} T =
+  \t. case t of { Leaf -> Leaf | Node(v, l, r) -> Node(v + 1, box (bump (unbox l)), box (bump (unbox r))) }
+
+def mirror : T -> T =
+  \t. case t of { Leaf -> Leaf | Node(v, l, r) -> Node(v, r, l) }
+
+-- Keeps only the left child: the right one is dropped with its cell.
+def left : T -> T =
+  \t. case t of { Leaf -> Leaf | Node(v, l, _) -> Node(v, l, box Leaf) }
+
+def nmake : i32 ->{Panic, Diverge} N =
+  \d. if d == 0 then Tip(7) else Bin(d, box (nmake (d - 1)), box (nmake (d - 1)))
+
+def nsum : N ->{Panic, Diverge} i64 =
+  \t. case t of { Tip(v) -> v as i64 | Bin(v, l, r) -> (v as i64) + nsum (unbox l) + nsum (unbox r) }
+
+def tmake : i64 ->{Panic, Diverge} Tri =
+  \d. if d == 0 then Nil3 else Tri(box (tmake (d - 1)), box Nil3, box (tmake (d - 1)))
+
+def tcount : Tri ->{Panic, Diverge} i64 =
+  \t. case t of { Nil3 -> 1 | Tri(a, b, c) -> tcount (unbox a) + tcount (unbox b) + tcount (unbox c) }
+
+def work : i64 ->{Panic, Diverge} i64 =
+  \d. let t = make d in
+      let unique = total (bump (make d)) in
+      let shared = total (bump t) + total t in
+      let m = total (mirror (mirror t)) + total (left t) in
+      unique + shared + m + nsum (nmake 6) + tcount (tmake 5)
+
+main = (work 10 + arena (\u. work 6), mirror (Node(1, box Node(2, box Leaf, box Leaf), box Leaf)))

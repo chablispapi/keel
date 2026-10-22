@@ -394,6 +394,7 @@ rhsCode slots rhs = case rhs of
   RField a i -> do
     atom slots "t0" a
     ins ("ld a0, " ++ show (8 * i) ++ "(t0)")
+  RRel {} -> error "packed layouts are AArch64 only" -- this back end lowers without packing
   RHeader a sgn -> atom slots "t0" a >> ins ((if sgn then "lw" else "lwu") ++ " a0, -4(t0)")
   RPushHandler cs lid -> do
     alloc (2 + 2 * length cs) lid
@@ -634,7 +635,7 @@ emitPrinter decls printers lbl t = do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- As in "Keel.AArch64": constructors never built at this type have no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey False (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins "ld t0, 0(sp)"

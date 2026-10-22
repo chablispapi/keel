@@ -12,13 +12,13 @@
 -- block's layout (which constructor, how many words, which are pointers) in its low half, and
 -- a data block's first narrow field (an integer of at most 32 bits, or a Bool) in its high
 -- half (spec/memory.md). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, lowerWith, isPtr, packedBit, packedFrom, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (foldM, forM, forM_, when)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (State, StateT, evalState, get, gets, modify, put, runStateT)
-import Data.Bits (setBit)
+import Data.Bits (popCount, setBit, testBit, (.&.))
 import Data.List (delete, elemIndex, nub, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing)
@@ -69,6 +69,7 @@ data Rhs
   | RAlloc Integer (Maybe Atom) [Atom]  -- ^ allocate a block: layout, the header's field, the words
   | RAllocAt String Integer (Maybe Atom) [Atom] -- ^ the same, reusing a token's block if it has one
   | RField Atom Int                     -- ^ read word i of a block (borrowed)
+  | RRel Atom Int                       -- ^ read the pointer in 4-byte slot i of a packed block (borrowed)
   | RHeader Atom Bool                   -- ^ read the field in a block's header (signed or not)
   | RPushHandler [(Int, Atom)] Integer  -- ^ push a handler frame (of this layout): (operation number, clause closure)
   | RPopHandler Atom                    -- ^ pop (and drop) the frame
@@ -138,7 +139,8 @@ isPtr t = case t of
   _ -> False
 
 -- | lsPos is the innermost source position around the term being lowered.
-data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer}
+-- lsPack: data blocks with several pointer fields are packed (the back end supports it).
+data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer, lsPack :: Bool}
 
 type M = StateT LS (Either String)
 
@@ -203,20 +205,43 @@ fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, isJust (narrowTy t)] of
   [] -> (Nothing, [0 .. length ts - 1])
 
 -- | A data block's layout at these (instantiated) field types: its id, its header field and
--- its words.
+-- its fields in payload order.
 dataLayout :: Integer -> [Ty] -> M (Integer, Maybe Int, [Int])
 dataLayout tag fts = do
-  let ((_, n, bm), h, ws) = dataLayoutKey tag fts
-  _ <- bitmap 0 [isPtr (fts !! i) | i <- ws] -- rejects maps beyond 16 words
+  pack <- gets lsPack
+  let ((_, n, bm), h, ws) = dataLayoutKey pack tag fts
+      packed = pack && (tag, n, bm) /= fst3 (dataLayoutKey False tag fts)
+      fst3 (k, _, _) = k
+  -- Unpacked, rejects maps beyond 16 words (so bit 16 marks only packed layouts).
+  unless packed $ () <$ bitmap 0 [isPtr (fts !! i) | i <- ws]
   lid <- layoutId (isJust h) tag n bm
   pure (lid, h, ws)
 
+-- | Pointer map bit marking a packed layout: its pointer fields are 4-byte slots after its
+-- word fields, each holding (child - block) / 8, and the map's bits are 4-byte slots.
+packedBit :: Int
+packedBit = 16
+
+-- | A packed layout's number of word fields (its pointer slots follow them), from its map
+-- and the number of fields in its payload.
+packedFrom :: Integer -> Int -> Maybe Int
+packedFrom bm nfields
+  | bm `testBit` packedBit = Just (nfields - popCount (bm .&. 0xffff))
+  | otherwise = Nothing
+
 -- | The key of a constructor's layout ('lLayouts') at these field types, its header field and
--- its words.
-dataLayoutKey :: Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
-dataLayoutKey tag fts = ((tag, length ws, foldl setBit 0 [j | (j, i) <- zip [0 ..] ws, isPtr (fts !! i)]), h, ws)
+-- its fields in payload order. With @pack@, a constructor with two or more pointer fields
+-- (all within 16 slots) keeps its word fields first and its pointers in 4-byte slots.
+dataLayoutKey :: Bool -> Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
+dataLayoutKey pack tag fts
+  | pack, length ptrs >= 2, 2 * nw + length ptrs <= 16 =
+      ((tag, nw + (length ptrs + 1) `div` 2, foldl setBit 0 (packedBit : [2 * nw + k | k <- [0 .. length ptrs - 1]])), h, wordFields ++ ptrs)
+  | otherwise = ((tag, length ws, foldl setBit 0 [j | (j, i) <- zip [0 ..] ws, isPtr (fts !! i)]), h, ws)
   where
     (h, ws) = fieldSlots fts
+    ptrs = filter (isPtr . (fts !!)) ws
+    wordFields = filter (not . isPtr . (fts !!)) ws
+    nw = length wordFields
 
 -- | Every constructor's number in the program: in declaration order, across data types.
 conNumbers :: [Decl] -> M.Map String Integer
@@ -231,7 +256,11 @@ optionLayouts layouts it = (look 0 0, look 1 (if bits it <= 32 then 0 else 1))
 
 -- | Lower a monomorphic core program (the output of "Keel.Mono".compile).
 lower :: Program -> Either String LProg
-lower (Program userDecls main) = do
+lower = lowerWith False
+
+-- | With @pack@, data blocks with several pointer fields are packed ('dataLayoutKey').
+lowerWith :: Bool -> Program -> Either String LProg
+lowerWith pack (Program userDecls main) = do
   let decls = optionDecl : arrayDecl : userDecls
       defs = [(f, t, e) | Def f t e <- decls]
       info =
@@ -272,10 +301,13 @@ lower (Program userDecls main) = do
           m <- expr info M.empty main (pure . Ret)
           pure (statics, Fun "main" [] 1 [] [] False m)
       )
-      (LS 0 M.empty S.empty Nothing M.empty M.empty)
+      (LS 0 M.empty S.empty Nothing M.empty M.empty pack)
   let ptrs = lsPtrs s
-      sigs = borrowSigs ptrs (lsFuns s) statics mainF
-  let counted sig f = let f' = refcount ptrs sigs sig f in f' {funBody = fuseFields (funBody f')}
+      -- A block's words, by its layout (packed layouts have fewer than fields).
+      wordsOf = M.fromList [(lid, n) | ((_, n, _), lid) <- M.toList (lsLayouts s)]
+      blockWords lid as = M.findWithDefault (length as) lid wordsOf
+      sigs = borrowSigs blockWords ptrs (lsFuns s) statics mainF
+  let counted sig f = let f' = refcount blockWords ptrs sigs sig f in f' {funBody = fuseFields (funBody f')}
   pure (LProg (M.mapWithKey (\i -> counted (M.lookup i sigs)) (lsFuns s)) statics (counted Nothing mainF) (lsLocs s) (lsLayouts s))
   where
     isLam e = case e of
@@ -400,14 +432,17 @@ expr info env tm k = case tm of
           fts = map inst fields
       when (length ps /= length tys) $ unsupported ("case on " ++ prettyTy (typeOf info env e))
       (lid, h, ws) <- dataLayout tag fts
+      pack <- gets lsPack
+      let ((_, n, bm), _, _) = dataLayoutKey pack tag fts
       xs' <- mapM (uncurry newVar) (zip xs fts)
       let env' = M.union (M.fromList (zip xs (zip xs' fts))) env
           read' i = case (h, elemIndex i ws) of
             (Just j, _) | j == i -> RHeader ve (case fts !! i of TInt it -> signed it; _ -> False)
+            (_, Just w) | Just nw <- packedFrom bm (length ws), w >= nw -> RRel ve (nw + w)
             (_, Just w) -> RField ve w
             _ -> RField ve i
       body <- expr info env' b (pure . Ret)
-      pure (lid, length ws, foldr (\(i, y) rest -> Bind y (read' i) rest) body (zip [0 ..] xs'))
+      pure (lid, n, foldr (\(i, y) rest -> Bind y (read' i) rest) body (zip [0 ..] xs'))
     BindCase x ve (sortOn (\(t, _, _) -> t) bs) <$> k (AVar x)
   Box e -> expr info env e k
   Unbox e -> expr info env e k
@@ -558,8 +593,8 @@ freeVars tm = case tm of
 -- A function in @sigs@ borrows the parameters marked True: its caller keeps them alive across
 -- the call, and inside it they are like variables live after a branch (@keep@): never dropped,
 -- duplicated if consumed. A field read from such a variable is borrowed the same way.
-refcount :: S.Set String -> Sigs -> Maybe [Bool] -> Fun -> Fun
-refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funBody f)) 0}
+refcount :: (Integer -> [Atom] -> Int) -> S.Set String -> Sigs -> Maybe [Bool] -> Fun -> Fun
+refcount blockWords ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funBody f)) 0}
   where
     isP v = v `S.member` ptrs
     borrowedPs = [p | (p, True) <- zip (funParams f) (fromMaybe [] sig)]
@@ -590,6 +625,7 @@ refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funB
             -- A field of a kept variable is kept too: it can't die before its block.
             fieldOfKept = case rhs of
               RField (AVar a) _ -> isP x && a `S.member` keep
+              RRel (AVar a) _ -> isP x && a `S.member` keep
               _ -> False
             scope' = (scope S.\\ gone) <> (if fieldOfKept then S.empty else pointer x)
             keep' = if fieldOfKept then S.insert x keep else keep
@@ -597,6 +633,7 @@ refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funB
         afterDrops <- foldM (flip (dropOrReuse reuse)) rest' (reverse dyingBorrowed)
         let after = case rhs of
               RField _ _ | isP x, not fieldOfKept -> Dup x afterDrops -- a field read is borrowed: own it
+              RRel _ _ | not fieldOfKept -> Dup x afterDrops
               RArray AGet _ _ | isP x -> Dup x afterDrops
               _ -> afterDrops
         stmt <- foldM (flip (dropOrReuse reuse)) (Bind x rhs after) (reverse dyingUnused)
@@ -626,7 +663,7 @@ refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funB
         n <- get
         put (n + 1)
         let tok = "%tok" ++ show n
-        pure $ case useToken tok w e of
+        pure $ case useToken blockWords tok w e of
           Just e' -> DropReuse v 0 tok e'
           Nothing -> Drop v e
       Nothing -> pure (Drop v e)
@@ -643,6 +680,7 @@ fuseFields = go M.empty []
     -- duplicates of such fields not yet emitted, in order.
     go fs dups e = case e of
       Bind x rhs@(RField (AVar v) i) rest -> Bind x rhs (go (M.insert x (v, i) fs) dups rest)
+      Bind x rhs@(RRel (AVar v) i) rest -> Bind x rhs (go (M.insert x (v, i) fs) dups rest)
       Dup f rest | f `M.member` fs -> go fs (dups ++ [f]) rest
       DropReuse v m tok rest ->
         let own = nub [f | f <- dups, Just (v', _) <- [M.lookup f fs], v' == v]
@@ -662,21 +700,21 @@ fuseFields = go M.empty []
 -- | Rewrite the first allocation of @w@ words on every path through an expression to use the
 -- token: into an if's or a case's branches when each of them has one (so no path is left
 -- holding an unused token), or else past them.
-useToken :: String -> Int -> Expr -> Maybe Expr
-useToken tok w e = case e of
-  Bind x (RAlloc lid h as) rest | length as == w -> Just (Bind x (RAllocAt tok lid h as) rest)
-  Bind x rhs rest -> Bind x rhs <$> useToken tok w rest
-  BindIf x c a b rest -> case (useToken tok w a, useToken tok w b) of
+useToken :: (Integer -> [Atom] -> Int) -> String -> Int -> Expr -> Maybe Expr
+useToken blockWords tok w e = case e of
+  Bind x (RAlloc lid h as) rest | blockWords lid as == w -> Just (Bind x (RAllocAt tok lid h as) rest)
+  Bind x rhs rest -> Bind x rhs <$> useToken blockWords tok w rest
+  BindIf x c a b rest -> case (useToken blockWords tok w a, useToken blockWords tok w b) of
     (Just a', Just b') -> Just (BindIf x c a' b' rest)
-    (Nothing, Nothing) -> BindIf x c a b <$> useToken tok w rest
+    (Nothing, Nothing) -> BindIf x c a b <$> useToken blockWords tok w rest
     _ -> Nothing
-  BindCase x s bs rest -> case [(t, n,) <$> useToken tok w b | (t, n, b) <- bs] of
+  BindCase x s bs rest -> case [(t, n,) <$> useToken blockWords tok w b | (t, n, b) <- bs] of
     used | Just bs' <- sequence used -> Just (BindCase x s bs' rest)
-         | all isNothing used -> BindCase x s bs <$> useToken tok w rest
+         | all isNothing used -> BindCase x s bs <$> useToken blockWords tok w rest
          | otherwise -> Nothing
-  Dup v rest -> Dup v <$> useToken tok w rest
-  Drop v rest -> Drop v <$> useToken tok w rest
-  DropReuse v m t rest -> DropReuse v m t <$> useToken tok w rest
+  Dup v rest -> Dup v <$> useToken blockWords tok w rest
+  Drop v rest -> Drop v <$> useToken blockWords tok w rest
+  DropReuse v m t rest -> DropReuse v m t <$> useToken blockWords tok w rest
   _ -> Nothing
 
 atomVars :: Atom -> [String]
@@ -693,8 +731,8 @@ type Sigs = M.Map Int [Bool]
 -- every call to them is a direct one, and only callers the program can reach (every
 -- definition's curried closures exist, used or not). Starts from all-borrowed and marks owned
 -- to a fixpoint.
-borrowSigs :: S.Set String -> M.Map Int Fun -> [(Int, String, [Int])] -> Fun -> Sigs
-borrowSigs ptrs funs statics mainF = fixpoint start
+borrowSigs :: (Integer -> [Atom] -> Int) -> S.Set String -> M.Map Int Fun -> [(Int, String, [Int])] -> Fun -> Sigs
+borrowSigs blockWords ptrs funs statics mainF = fixpoint start
   where
     referenced = S.fromList (concatMap (closureRefs . funBody) (mainF : M.elems funs))
     reachable = reachableFuns funs statics mainF
@@ -712,7 +750,7 @@ borrowSigs ptrs funs statics mainF = fixpoint start
         owned = S.fromList (concat [ownedHere i f | (i, f) <- M.toList funs, M.member i sigs] ++ tailOwned Nothing mainF ++ concat [tailOwned (Just i) f | (i, f) <- M.toList funs, i `S.member` reachable])
         ownedHere i f =
           let body = funBody f
-              used = S.fromList (concatMap (consumedIn sigs) (rhss body) ++ rets body) <> reusedScrutinees body
+              used = S.fromList (concatMap (consumedIn sigs) (rhss body) ++ rets body) <> reusedScrutinees blockWords body
            in [(i, k) | (k, p) <- zip [0 ..] (funParams f), p `S.member` used]
         -- The caller's own borrowed parameters may be passed on in a tail call; owned values not.
         tailOwned i f =
@@ -772,6 +810,7 @@ exprAtoms e = case e of
       RAlloc _ h as -> maybe [] pure h ++ as
       RAllocAt _ _ h as -> maybe [] pure h ++ as
       RField a _ -> [a]
+      RRel a _ -> [a]
       RHeader a _ -> [a]
       RPushHandler cs _ -> map snd cs
       RPopHandler a -> [a]
@@ -793,10 +832,10 @@ rets e = case e of
   DropReuse _ _ _ rest -> rets rest
 
 -- | Case scrutinees whose block a branch could reuse (a branch allocates a block its size).
-reusedScrutinees :: Expr -> S.Set String
-reusedScrutinees e = S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> any (allocs w) (rhss b)) bs]
+reusedScrutinees :: (Integer -> [Atom] -> Int) -> Expr -> S.Set String
+reusedScrutinees blockWords e = S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> any (allocs w) (rhss b)) bs]
   where
-    allocs w (RAlloc _ _ as) = length as == w
+    allocs w (RAlloc lid _ as) = blockWords lid as == w
     allocs _ _ = False
 
 subExprs :: Expr -> [Expr]
@@ -833,6 +872,7 @@ consumedIn sigs rhs = case rhs of
 -- | Variables a right-hand side only reads.
 borrowedIn :: Sigs -> Rhs -> [String]
 borrowedIn _ (RField a _) = atomVars a
+borrowedIn _ (RRel a _) = atomVars a
 borrowedIn _ (RHeader a _) = atomVars a
 borrowedIn _ (RArray op _ (a : _)) | op `elem` [ALength, AGet] = atomVars a
 borrowedIn sigs (RCallKnown i as) = concat [atomVars a | (a, True) <- zip as (M.findWithDefault [] i sigs)]

@@ -41,19 +41,20 @@ compileNativeWith debug = compileNativeWithReuse debug True
 -- reuse specialization retains the same lowering, ownership decisions and runtime helper.
 compileNativeWithReuse :: Bool -> Bool -> Program -> Either String String
 compileNativeWithReuse debug reuse p = do
-  (decls, t, lp) <- prepareWith debug p
+  (decls, t, lp) <- prepareWith debug True p
   pure (emitProgramWithReuse reuse decls t lp)
 
 -- | The target-independent part of every back end: the core pipeline and lowering. Returns
 -- the declarations (with built-ins), @main@'s type, and the lowered program.
 prepare :: Program -> Either String ([Decl], Ty, LProg)
-prepare = prepareWith False
+prepare = prepareWith False False
 
-prepareWith :: Bool -> Program -> Either String ([Decl], Ty, LProg)
-prepareWith debug p = do
+-- | With @pack@, data blocks with several pointer fields are packed (this back end only).
+prepareWith :: Bool -> Bool -> Program -> Either String ([Decl], Ty, LProg)
+prepareWith debug pack p = do
   mono <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram mono)
-  lp <- ranges <$> lower mono
+  lp <- ranges <$> lowerWith pack mono
   let Program decls _ = mono
   pure (optionDecl : decls, t, lp)
 
@@ -61,9 +62,11 @@ heapSize :: Integer
 heapSize = 64 * 1024 * 1024
 
 -- | The native heap: address space only (zero-fill pages are mapped when first touched), so
--- it can be far larger than heapSize, which sizes the freestanding targets' RAM.
+-- it can be far larger than heapSize, which sizes the freestanding targets' RAM. Under 16 GB:
+-- a packed slot ((child - block) / 8 in 32 bits) reaches ±16 GB, from any heap block to any
+-- other and to the static blocks just below the heap.
 nativeHeapSize :: Integer
-nativeHeapSize = 16 * 1024 * 1024 * 1024
+nativeHeapSize = 15 * 1024 * 1024 * 1024
 
 -- | Blocks of up to this many payload words are recycled through free lists.
 maxSmall :: Int
@@ -239,7 +242,7 @@ data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop 
 fullFieldReuse :: M.Map (Integer, Int, Integer) Integer -> Expr -> S.Set String
 fullFieldReuse layouts = go M.empty
   where
-    maps = M.fromList [(lid, pointers) | ((_, _, pointers), lid) <- M.toList layouts]
+    maps = M.fromList [(lid, pointers .&. 0xffff) | ((_, _, pointers), lid) <- M.toList layouts]
     go known e = case e of
       Bind _ _ rest -> go known rest
       BindIf _ _ a b rest -> go known a <> go known b <> go known rest
@@ -342,6 +345,7 @@ uses e = case e of
       RAlloc _ h as -> concatMap av (maybe [] pure h ++ as)
       RAllocAt t _ h as -> t : concatMap av (maybe [] pure h ++ as)
       RField a _ -> av a
+      RRel a _ -> av a
       RHeader a _ -> av a
       RPushHandler cs _ -> concatMap (av . snd) cs
       RPopHandler a -> av a
@@ -802,11 +806,17 @@ moves slots ms0 = go [(d, src a) | (d, a) <- ms0, src a /= Left d] ["x10", "x11"
       InReg x -> unless (x == r) $ ins ("mov " ++ r ++ ", " ++ x)
       InSlot i -> ins ("ldr " ++ r ++ ", [sp, #" ++ show (8 * i) ++ "]")
 
+-- | A layout's key: (constructor, words, pointer map).
+keyOf :: M.Map (Integer, Int, Integer) Integer -> Integer -> Maybe (Integer, Int, Integer)
+keyOf layouts lid = listToMaybe [k | (k, i) <- M.toList layouts, i == lid]
+
 -- | Allocate a block of @n@ payload words of a layout into x0 (header written).
 -- The runtime allocator clobbers only x0, x1 and x13–x16.
 alloc :: Int -> Integer -> G ()
-alloc n lid = do
+alloc fields lid = do
   t <- gets (\st -> template (gsLayouts st) lid)
+  -- A packed layout has fewer words than fields.
+  n <- gets (\st -> maybe fields (\(_, w, _) -> w) (keyOf (gsLayouts st) lid))
   movImm "x0" (toInteger n)
   movImm "x1" t
   ins "bl _keel_alloc"
@@ -872,6 +882,11 @@ rhsInto slots d rhs = case rhs of
   RField a i -> do
     ra <- operand slots "x9" a
     ins ("ldr " ++ d ++ ", [" ++ ra ++ ", #" ++ show (8 * i) ++ "]")
+    pure True
+  RRel a i -> do
+    ra <- operand slots "x9" a
+    ins ("ldrsw x10, [" ++ ra ++ ", #" ++ show (4 * i) ++ "]")
+    ins ("add " ++ d ++ ", " ++ ra ++ ", x10, lsl #3")
     pure True
   RHeader a sgn -> do
     ra <- operand slots "x9" a
@@ -976,7 +991,7 @@ rhsCode slots rhs = case rhs of
     ins "blr x16"
   RAlloc lid h as -> do
     alloc (length as) lid
-    fields h as
+    fields lid h as
   RAllocAt tok lid h as -> do
     -- In place if the token holds a block (it was unique); otherwise allocate.
     lFresh <- newLabel
@@ -993,10 +1008,14 @@ rhsCode slots rhs = case rhs of
     line (lFresh ++ ":")
     alloc (length as) lid
     line (lDone ++ ":")
-    fields h as
+    fields lid h as
   RField a i -> do
     atom slots "x9" a
     ins ("ldr x0, [x9, #" ++ show (8 * i) ++ "]")
+  RRel a i -> do
+    atom slots "x9" a
+    ins ("ldrsw x10, [x9, #" ++ show (4 * i) ++ "]")
+    ins "add x0, x9, x10, lsl #3"
   RHeader a sgn -> atom slots "x9" a >> ins (headerRead sgn "x0" ++ ", [x9, #-4]")
   RPushHandler cs lid -> do
     alloc (2 + 2 * length cs) lid
@@ -1072,12 +1091,20 @@ rhsCode slots rhs = case rhs of
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
       load' slots "x11" v
       ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
-    fields :: Maybe Atom -> [Atom] -> G ()
-    fields h as = do
+    fields :: Integer -> Maybe Atom -> [Atom] -> G ()
+    -- A packed layout's pointers go in 4-byte slots after its words, relative to the block.
+    fields lid h as = do
+      bm <- gets (\st -> maybe 0 (\(_, _, m) -> m) (keyOf (gsLayouts st) lid))
+      let nw = fromMaybe (length as) (packedFrom bm (length as))
       forM_ h $ \a -> atom slots "x11" a >> ins "str w11, [x0, #-4]"
       forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "x11" a
-        ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
+        if j < nw
+          then ins ("str x11, [x0, #" ++ show (8 * j) ++ "]")
+          else do
+            ins "sub x11, x11, x0"
+            ins "asr x11, x11, #3"
+            ins ("str w11, [x0, #" ++ show (4 * (nw + j)) ++ "]")
 
 -- | Integer arithmetic (spec §2.5) with x9, x10 as operands and the result in x0. Values are
 -- canonical: sign- or zero-extended to 64 bits by their type.
@@ -1266,18 +1293,18 @@ emitPrinter decls printers lbl t = do
       printStr "false"
       line (lDone ++ ":")
     TUnit -> printStr "()"
-    TBox a -> printStr "box " >> field (Right (-1)) a
+    TBox a -> printStr "box " >> field (Right (-1, False)) a
     TPair a b -> do
       printStr "("
-      field (Right 0) a
+      field (Right (0, False)) a
       printStr ", "
-      field (Right 1) b
+      field (Right (1, False)) b
       printStr ")"
     TData d tys | Just (ps, cs) <- dataOf decls d -> do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- Constructors never built at this type have no layout, and no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey True (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins "ldr x9, [sp, #16]"
@@ -1288,14 +1315,18 @@ emitPrinter decls printers lbl t = do
         ins "cmp x9, x10"
         ins ("b.eq " ++ l)
       ins ("b " ++ lDone)
-      forM_ (zip built labels) $ \((c, fts, _, h, ws), l) -> do
+      forM_ (zip built labels) $ \((c, fts, lid, h, ws), l) -> do
         line (l ++ ":")
         printStr c
         unless (null fts) $ do
           printStr "("
           forM_ (zip [0 :: Int ..] fts) $ \(i, ft) -> do
             when (i > 0) $ printStr ", "
-            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (fromMaybe i (elemIndex i ws))) ft
+            let w = fromMaybe i (elemIndex i ws)
+                rel = case keyOf layouts lid of
+                  Just (_, _, bm) | Just nw <- packedFrom bm (length ws), w >= nw -> Just (nw + w)
+                  _ -> Nothing
+            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (maybe (w, False) (,True) rel)) ft
           printStr ")"
         ins ("b " ++ lDone)
       line (lDone ++ ":")
@@ -1327,14 +1358,15 @@ emitPrinter decls printers lbl t = do
   epilogue
   ins "ret"
   where
-    -- Print word i of the block (-1: the value itself), or its header field (Left: whether
-    -- signed), with its type's printer.
-    field :: Either Bool Int -> Ty -> G ()
+    -- Print word i of the block (-1: the value itself; with True, packed pointer slot i), or
+    -- its header field (Left: whether signed), with its type's printer.
+    field :: Either Bool (Int, Bool) -> Ty -> G ()
     field place ft = do
       ins "ldr x0, [sp, #16]"
       case place of
         Left sgn -> ins (headerRead sgn "x0" ++ ", [x0, #-4]")
-        Right i -> when (i >= 0) $ ins ("ldr x0, [x0, #" ++ show (8 * i) ++ "]")
+        Right (i, True) -> ins ("ldrsw x9, [x0, #" ++ show (4 * i) ++ "]") >> ins "add x0, x0, x9, lsl #3"
+        Right (i, _) -> when (i >= 0) $ ins ("ldr x0, [x0, #" ++ show (8 * i) ++ "]")
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("bl " ++ l)
         Nothing -> printStr "..."
@@ -1514,28 +1546,29 @@ emitRuntime = do
   ins ("cmp w12, #" ++ show arrayLayout)
   ins "b.hs L_drop_special"
   ins "ldr x11, [x0, #-8]"
-  ins "ubfx x11, x11, #40, #16" -- the pointer map
+  ins "ubfx x11, x11, #40, #17" -- the pointer map, and whether it is packed (bit 16)
   line "L_drop_loop:"
-  ins "cbz x11, L_drop_free"
-  ins "sub x13, x11, #1"
-  ins "tst x11, x13"
+  ins "ands x13, x11, #0xffff"
+  ins "b.eq L_drop_free"
+  ins "sub x14, x13, #1"
+  ins "tst x13, x14"
   ins "b.eq L_drop_last" -- one pointer child left
-  ins "rbit x13, x11"
+  ins "rbit x13, x13"
   ins "clz x13, x13"
   ins "mov x14, #1"
   ins "lsl x14, x14, x13"
   ins "bic x11, x11, x14"
   ins "str x11, [sp, #24]"
   ins "ldr x9, [sp, #16]"
-  ins "ldr x0, [x9, x13, lsl #3]"
+  child "x0" "x9"
   ins "bl _keel_drop"
   ins "ldr x11, [sp, #24]"
   ins "b L_drop_loop"
   line "L_drop_last:"
-  ins "rbit x13, x11"
+  ins "rbit x13, x13"
   ins "clz x13, x13"
   ins "ldr x0, [sp, #16]"
-  ins "ldr x9, [x0, x13, lsl #3]"
+  child "x9" "x0"
   ins "str x9, [sp, #24]"
   ins "bl _keel_free_block"
   ins "ldr x0, [sp, #24]"
@@ -1615,25 +1648,19 @@ emitRuntime = do
   ins "b.ne L_reuse_shared"
   stat 24 "x12" "x13"
   ins "str x0, [sp, #16]"
-  ins "ldr x11, [x0, #-8]"
-  ins "ubfx x11, x11, #40, #16" -- the pointer map
-  ins "tbz w9, #9, L_reuse_map"
-  ins "and w12, w9, #0x1ff" -- a field in the header: the map is in the table
-  address "x11" "_keel_layouts"
-  ins "ldr w11, [x11, x12, lsl #2]"
-  ins "lsr w11, w11, #8"
-  line "L_reuse_map:"
+  reuseMap
   ins "bic x11, x11, x1" -- the fields taken over stay alive: they are the caller's now
   line "L_reuse_loop:"
-  ins "cbz x11, L_reuse_done"
-  ins "rbit x13, x11"
+  ins "ands x13, x11, #0xffff"
+  ins "b.eq L_reuse_done"
+  ins "rbit x13, x13"
   ins "clz x13, x13"
   ins "mov x14, #1"
   ins "lsl x14, x14, x13"
   ins "bic x11, x11, x14"
   ins "str x11, [sp, #24]"
   ins "ldr x9, [sp, #16]"
-  ins "ldr x0, [x9, x13, lsl #3]"
+  child "x0" "x9"
   ins "bl _keel_drop"
   ins "ldr x11, [sp, #24]"
   ins "b L_reuse_loop"
@@ -1649,17 +1676,21 @@ emitRuntime = do
   -- The block keeps its references: duplicate the fields taken over.
   line "L_reuse_none:"
   ins "cbz x1, L_reuse_zero"
+  ins "ldr w9, [x0, #-8]"
+  reuseMap -- only for its packed bit
+  line "L_reuse_dup:"
   ins "rbit x13, x1"
   ins "clz x13, x13"
   ins "mov x14, #1"
   ins "lsl x14, x14, x13"
   ins "bic x1, x1, x14"
-  ins "ldr x15, [x0, x13, lsl #3]"
+  child "x15" "x0"
   ins "ldr w16, [x15, #-8]"
-  ins "tbnz w16, #31, L_reuse_none"
+  ins "tbnz w16, #31, L_reuse_next"
   ins "add w16, w16, #1024"
   ins "str w16, [x15, #-8]"
-  ins "b L_reuse_none"
+  line "L_reuse_next:"
+  ins "cbnz x1, L_reuse_dup"
   line "L_reuse_zero:"
   ins "mov x0, #0"
   line "L_reuse_ret:"
@@ -2088,6 +2119,29 @@ emitRuntime = do
   panic "_keel_panic_rc" "panic: reference count error\n"
   where
     fn lbl = line "\t.p2align 2" >> line (lbl ++ ":")
+    -- Child x13 of the block in @base@ into @dst@: a word, or for a packed layout (bit 16 of
+    -- x11, the map) a 4-byte slot holding (child - block) / 8.
+    child dst base = do
+      lPacked <- newLabel
+      lDone <- newLabel
+      ins ("tbnz x11, #16, " ++ lPacked)
+      ins ("ldr " ++ dst ++ ", [" ++ base ++ ", x13, lsl #3]")
+      ins ("b " ++ lDone)
+      line (lPacked ++ ":")
+      ins ("ldrsw " ++ dst ++ ", [" ++ base ++ ", x13, lsl #2]")
+      ins ("add " ++ dst ++ ", " ++ base ++ ", " ++ dst ++ ", lsl #3")
+      line (lDone ++ ":")
+    -- The pointer map and packed bit of the block in x0 (header's low half in w9) into x11.
+    reuseMap = do
+      lMap <- newLabel
+      ins "ldr x11, [x0, #-8]"
+      ins "ubfx x11, x11, #40, #17"
+      ins ("tbz w9, #9, " ++ lMap)
+      ins "and w12, w9, #0x1ff" -- a field in the header: the map is in the table
+      address "x11" "_keel_layouts"
+      ins "ldr w11, [x11, x12, lsl #2]"
+      ins "lsr w11, w11, #8"
+      line (lMap ++ ":")
     -- Increment the statistics counter at this byte offset, using two free scratch registers.
     stat :: Int -> String -> String -> G ()
     stat off r1 r2 = do

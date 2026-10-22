@@ -214,6 +214,7 @@ exampleFiles =
   , ("test/memory/reuse-branches.kl", (Just "89829149613", ""))
   , ("test/memory/reuse-fast.kl", (Just "374", ""))
   , ("test/opt/capture.kl", (Just "10354", "10\n20\n30\n"))
+  , ("test/memory/packed.kl", (Just "(13144, Node(1, box Leaf, box Node(2, box Leaf, box Leaf)))", ""))
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
