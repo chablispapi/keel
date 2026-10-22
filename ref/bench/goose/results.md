@@ -28,6 +28,26 @@ tree 24 1508, bintrees 19 809.)
   place). The eight scans are vectorized and take ~26 ms of the 74; the rest is building the
   array, where each push stores the length the next one loads back.
 
+## On x86-64 (Intel Celeron N4020, Linux)
+
+`compare.py GOOSE_CHECKOUT --sizes medium,large --host USER@MACHINE`: the same programs built and
+run on that machine (gcc/g++ -O2, rustc -O; Goose's C output from here, compiled there), Keel
+through its x86-64 back end (`Keel.X86`). Best of 3, ms / MB; every row the same checksums.
+
+| benchmark | keel | goose | best C++ | C++ new/delete | best Rust | Rust Box |
+|---|---:|---:|---:|---:|---:|---:|
+| sum 16M | 1186 / 64 | 179 / 65 | 238 / 65 | – | 182 / 63 | – |
+| sum 128M | 9458 / 492 | 1401 / 491 | 1882 / 492 | – | 1449 / 490 | – |
+| tree 20 | 245 / 34 | 138 / 26 | 148 / 28 | 300 / 68 | 170 / 26 | 322 / 66 |
+| tree 24 | 4020 / 514 | 2263 / 386 | 2159 / 388 | 4769 / 1028 | 2715 / 386 | 5124 / 1026 |
+| bintrees 17 | 305 / 14 | 132 / 15 | 180 / 15 | 1768 / 20 | 259 / 15 | 2276 / 18 |
+| bintrees 19 | 1473 / 26 | 604 / 27 | 814 / 36 | 8515 / 68 | 1185 / 26 | 11155 / 66 |
+
+The x86 back end is the simple code generator (as for RISC-V): every value goes through rax
+and its home, no compare-and-branch, no vector loop. So it trails more than on ARM: sum 6.6×
+behind Goose (the scalar loop, where ARM's is vectorized), tree 1.8×, bintrees 2.4×; still
+ahead of per-node C++ and Rust on tree and bintrees.
+
 ## What each change did
 
 Measured A/B: the compiler before and after the change, runs alternating, best of 5. Ratios
