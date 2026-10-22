@@ -238,6 +238,9 @@ expr info env tm k = case tm of
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
   Convert to e -> sub e $ \v -> bindRhs (RConv to v)
   ArrayPrim op t args -> subs args $ \vs -> bindRhs (RArray op (isPtr t) vs)
+  -- let x = y: x is another name for y, not a second reference (which would cost a dup and a
+  -- drop around every use, e.g. an inlined array.length xs).
+  Let x e b | Var y <- stripAt e, Just y' <- M.lookup y env -> expr info (M.insert x y' env) b k
   Let x e b -> sub e $ \v -> do
     let t = typeOf info env e
     x' <- newVar x t

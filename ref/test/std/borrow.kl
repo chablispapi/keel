@@ -1,0 +1,19 @@
+-- Array reads borrow the array, and let y = x makes another name, not another reference. Each
+-- read here is the array's last use, so the array is freed after it (and, for elements that
+-- are pointers, the element read must outlive the array); the leak check and the evaluator
+-- comparison catch a free that comes too early or never.
+
+import std.array
+
+def lastRead : Array i64 ->{Panic} i64 = \xs. let ys = xs in array.get ys 2
+
+def lastLength : Array i64 -> i64 = \xs. let ys = xs in let zs = ys in array.length zs
+
+def lists : Array (List i64) ->{Panic, Diverge} List i64 = \xs. let ys = xs in array.get ys 1
+
+def total : List i64 ->{Diverge, Panic} i64 = \l. case l of { Nil -> 0 | Cons(x, rest) -> x + total (unbox rest) }
+
+main =
+  let a = array.push (array.push (array.push array.empty 5) 6) 7 in
+  let b = array.push (array.push array.empty Nil) (Cons(40, box Cons(2, box Nil))) in
+  lastRead a * 100 + lastLength a + total (lists b)
