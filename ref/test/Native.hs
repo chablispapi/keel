@@ -26,12 +26,13 @@ import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
 import Keel.Parser (parseModule)
 import Keel.RiscV (compileRiscV)
+import Keel.X86 (compileX86)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
 import Keel.Syntax
 import Sexp (sexpModule)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, listDirectory)
-import System.Environment (getEnvironment)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, listDirectory, removePathForcibly)
+import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import System.FilePath ((</>))
 import System.Process (env, proc, readCreateProcessWithExitCode, readProcessWithExitCode, shell)
@@ -386,7 +387,68 @@ main = do
         mapM_ putStrLn bad
         putStrLn (show (n - length bad) ++ "/" ++ show n ++ " RISC-V cases passed (QEMU virt)")
         pure bad
-  unless (null allFailures && null rvFailures) exitFailure
+  x86Fails <- x86Failures dir programs
+  unless (null allFailures && null rvFailures && null x86Fails) exitFailure
+
+-- | With KEEL_X86_HOST set (an ssh destination: x86-64 Linux with gcc and coreutils), every
+-- program also runs on the x86 back end there, with the same checks: all of them are copied
+-- over, built and run in one go (60 s each at most), and the results copied back.
+x86Failures :: FilePath -> [(String, Program)] -> IO [String]
+x86Failures dir programs =
+  lookupEnv "KEEL_X86_HOST" >>= \case
+    Nothing -> putStrLn "x86-64: KEEL_X86_HOST not set; skipped" >> pure []
+    Just host -> do
+      let local = dir </> "x86"
+          remote = "/tmp/keel-x86-tests"
+      removePathForcibly local
+      createDirectoryIfMissing True (local </> "examples")
+      readFile "examples/fact.kl" >>= writeFile (local </> "examples" </> "fact.kl") -- files.kl reads it
+      writeFile (local </> "run.sh") $ unlines
+        [ "cd \"$(dirname \"$0\")\""
+        , "for s in x*.s; do"
+        , "  b=${s%.s}"
+        , "  if gcc -no-pie -o $b $s 2> $b.ccerr; then"
+        , "    KEEL_STATS=1 timeout 60 ./$b < $b.in > $b.out 2> $b.err; echo $? > $b.code"
+        , "  else echo cc > $b.code; fi"
+        , "done"
+        ]
+      built <- forM (zip [0 :: Int ..] programs) $ \(i, (name, prog)) -> case (compile prog, compileX86 prog) of
+        (Left e, _) -> pure (Left ("FAIL [x86] " ++ name ++ ": does not type-check: " ++ show e))
+        (_, Left e) -> pure (Left ("FAIL [x86] " ++ name ++ ": " ++ e))
+        (Right mono, Right asm) -> do
+          writeFile (local </> ("x" ++ show i ++ ".s")) asm
+          writeFile (local </> ("x" ++ show i ++ ".in")) (exampleInput name)
+          pure (Right (i, name, mono))
+      _ <- readProcessWithExitCode "ssh" [host, "rm -rf " ++ remote] ""
+      (c1, _, e1) <- readProcessWithExitCode "scp" ["-q", "-r", local, host ++ ":" ++ remote] ""
+      (c2, _, e2) <- readProcessWithExitCode "ssh" [host, "bash " ++ remote ++ "/run.sh"] ""
+      removePathForcibly local
+      (c3, _, e3) <- readProcessWithExitCode "scp" ["-q", "-r", host ++ ":" ++ remote, local] ""
+      fails <-
+        if any (/= ExitSuccess) [c1, c2, c3]
+          then pure ["FAIL [x86] copying or running on " ++ host ++ ":\n" ++ e1 ++ e2 ++ e3]
+          else concat <$> forM built (either (pure . pure) (check local))
+      mapM_ putStrLn fails
+      let n = length programs
+      putStrLn (show (n - length fails) ++ "/" ++ show n ++ " x86-64 cases passed (" ++ host ++ ")")
+      pure fails
+  where
+    check local (i, name, mono) = do
+      let file ext = readFile (local </> ("x" ++ show i ++ ext))
+      codeText <- file ".code"
+      case reads codeText :: [(Int, String)] of
+        [(c, _)] -> do
+          out <- file ".out"
+          err <- file ".err"
+          machine <- machineFor name
+          let code = if c == 0 then ExitSuccess else ExitFailure c
+              got = parseRun code out
+              reference = reduce (evalProgramOn machine mono)
+              stats = parseStats err
+          pure $
+            ["FAIL [x86] " ++ name ++ ": x86 " ++ show got ++ ", reference " ++ show reference | got /= Just reference]
+              ++ ["FAIL [x86] " ++ name ++ ": leak: " ++ show stats | code == ExitSuccess, fmap live stats /= Just 0]
+        _ -> (\e -> ["FAIL [x86] " ++ name ++ ": gcc failed:\n" ++ take 2000 e]) <$> file ".ccerr"
 
 -- | Compile for RISC-V, boot in QEMU, and compare with the reference evaluator.
 runRiscV :: RiscVTools -> FilePath -> Int -> (String, Program) -> IO [String]

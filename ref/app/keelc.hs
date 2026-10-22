@@ -4,9 +4,10 @@
 -- > keelc check [FILE.kl]          type-check, print main's type and effects
 -- > keelc run   [FILE.kl]          run with the reference evaluator
 -- > keelc asm   [FILE.kl] [-g]     print the ARM64 assembly
--- > keelc build [FILE.kl] [-o OUT] [--target native|riscv64] [-g]
+-- > keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]
 -- >                                compile (native: via the system cc; riscv64: a freestanding
--- >                                image for QEMU's virt board); -g adds debug info (native)
+-- >                                image for QEMU's virt board; x86_64: OUT.s for x86-64 Linux,
+-- >                                linked there by gcc); -g adds debug info (native)
 -- > keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
 -- > keelc lsp                      the language server, over stdin/stdout ("Keel.Lsp")
 --
@@ -28,13 +29,15 @@ import Keel.Infer (inferProgram)
 import Keel.Lsp (serve)
 import Keel.Modules (loadModules)
 import Keel.Mono (compile)
+import Keel.X86 (compileX86, linkCommand)
+import System.Info qualified as Info
 import Keel.RiscV (compileRiscV)
 import Keel.Syntax (Program, prettyEff, prettyTy)
 import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
-import System.FilePath (dropExtension, takeDirectory, (<.>), (</>))
+import System.FilePath (dropExtension, takeDirectory, takeFileName, (<.>), (</>))
 import System.IO (hPutStr, hPutStrLn, hSetBinaryMode, stderr, stdin, stdout)
 import System.Process (readProcessWithExitCode)
 
@@ -43,12 +46,12 @@ usage =
   unlines
     [ "usage: keelc new NAME"
     , "       keelc (check | run | asm | qemu) [FILE.kl]"
-    , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64] [-g]"
+    , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]"
     , "       keelc lsp"
     , "Without FILE.kl, keelc uses keel.project in the current directory."
     ]
 
-data Target = Native | RiscV64
+data Target = Native | RiscV64 | X86_64
   deriving (Eq)
 
 -- | What to build: the entry file, the target, the output path, and whether to add debug info.
@@ -92,6 +95,7 @@ main = do
         _ -> case jobTarget job of
           Native -> build job
           RiscV64 -> () <$ buildRv (jobEntry job) (jobOut job)
+          X86_64 -> buildX86 job
     _ -> die usage
 
 -- | Arguments after the command: an optional file, -o OUT, --target T. Without a file, the
@@ -108,13 +112,17 @@ jobFor args = do
         else do
           m <- readManifest "keel.project"
           let name = M.findWithDefault "main" "name" m
-              target' = if M.lookup "target" m == Just "riscv64" then RiscV64 else Native
+              target' = case M.lookup "target" m of
+                Just "riscv64" -> RiscV64
+                Just "x86_64" -> X86_64
+                _ -> Native
           pure (Job (M.findWithDefault "src/main.kl" "main" m) target' ("build" </> name) ("-g" `elem` args))
   t <- case target of
     Nothing -> pure (jobTarget base)
     Just "native" -> pure Native
     Just "riscv64" -> pure RiscV64
-    Just other -> die ("unknown target " ++ other ++ " (native or riscv64)")
+    Just "x86_64" -> pure X86_64
+    Just other -> die ("unknown target " ++ other ++ " (native, riscv64 or x86_64)")
   let job = base {jobTarget = t, jobOut = maybe (jobOut base) id out}
   createDirectoryIfMissing True (takeDirectory (jobOut job))
   pure job
@@ -176,6 +184,23 @@ build job = do
   case code of
     ExitSuccess -> putStrLn ("built " ++ out)
     ExitFailure _ -> hPutStr stderr err >> die "cc failed"
+
+-- | x86-64 Linux: write OUT.s; on such a machine, link it with gcc as well.
+buildX86 :: Job -> IO ()
+buildX86 job = do
+  (_, core) <- load (jobEntry job)
+  asm <- orDie (compileX86 core)
+  let out = jobOut job
+      s = out <.> "s"
+      (gcc, gccArgs) = linkCommand s out
+  writeFile s asm
+  if Info.os == "linux" && Info.arch == "x86_64"
+    then do
+      (code, _, err) <- readProcessWithExitCode gcc gccArgs ""
+      case code of
+        ExitSuccess -> putStrLn ("built " ++ out)
+        ExitFailure _ -> hPutStr stderr err >> die "gcc failed"
+    else putStrLn ("wrote " ++ s ++ "; on x86-64 Linux: " ++ unwords (uncurry (:) (linkCommand (takeFileName s) (takeFileName out))))
 
 buildRv :: FilePath -> FilePath -> IO (RiscVTools, FilePath)
 buildRv f out = do
