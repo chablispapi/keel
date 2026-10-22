@@ -21,9 +21,12 @@ the call consumed it, and reference counting freed it, on every iteration of `lo
 entry point remains for partial applications and for `f` passed as a value. Evaluation order is
 unchanged: applying only some arguments has no effect besides building a closure.
 
-**Register allocation.** In each function, the most-used variables each get their own
-callee-saved register (`x19`–`x28`, `s1`–`s11`) for the whole function, saved in the prologue
-and restored before each return or tail call. The rest stay in stack slots. Every callee
+**Register allocation.** Callee-saved registers (`x19`–`x28`, `s1`–`s11`), saved in the
+prologue and restored before each return or tail call, assigned by colouring the interference
+graph: variables live at the same time get different registers, so two that never are can
+share one. Most-used variables are coloured first, and an argument of a self tail call prefers
+its parameter's register; the jump back then moves the arguments into the parameters as one
+parallel move, usually none at all. The rest stay in stack slots. Every callee
 preserves these registers (Keel functions save what they use; the runtime and the C library
 never touch them), so values survive calls without spilling around each one.
 
@@ -60,9 +63,8 @@ and the full test suite passes on both after each step.
 - **Arguments that aren't constants**: specialization only fires for top-level cocases and
   functions, and for closed λs. A λ that captures a local variable, or a dictionary built at
   run time, is still called through a closure.
-- **Register allocation is per function, not per live range**: one variable per register, so
-  functions with more than 10 hot variables spill. A liveness-based allocator (linear scan) would
-  share registers between variables that are never live at the same time.
+- **Register allocation has no live-range splitting**: a variable that doesn't get a register
+  stays in its stack slot everywhere, and values live across calls compete for the same 10.
 - **Inlining is limited** to calls of small non-recursive top-level definitions and known
   observations (including lifted λs after specialization).
 - **Reference counting is not optimized**: every field read is a dup and every case a drop.
@@ -71,6 +73,6 @@ and the full test suite passes on both after each step.
 
 ## Not done from the M4 roadmap
 
-SSA form, a liveness-based register allocator, specializing on λs that capture locals
+SSA form, specializing on λs that capture locals
 (defunctionalization), and our own Mach-O/ELF writers (`cc`, `clang` and
 `ld.lld` still assemble and link). These are the remaining M4 items.

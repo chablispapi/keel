@@ -10,7 +10,7 @@
 -- values are pointers to heap blocks: @[fields…]@, @[code, captured…]@ and
 -- @[code₁, …, codeₙ, captured…]@, each preceded by a header word (reference count, size, the
 -- constructor's tag, pointer map). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs) where
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs, subExprs) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (foldM, forM, forM_)
@@ -28,7 +28,7 @@ data Atom
   | AVar String  -- ^ a local variable (stack slot)
   | AGlobal Int  -- ^ the static block of top-level definition i (immortal)
   | ANullary Integer -- ^ a constructor without fields: the shared static block holding its tag
-  deriving (Show)
+  deriving (Eq, Show)
 
 -- | Bitmaps mark which payload words hold pointers (bit i = word i); the runtime uses them to
 -- drop children when a block is freed.

@@ -153,35 +153,83 @@ emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsL
 
 -- Functions -------------------------------------------------------------------------------
 
--- | Register allocation (M4): the most-used variables of a function each get their own
--- callee-saved register for the whole function; the rest live in 8-byte stack slots. Every
--- callee preserves these registers (Keel functions save what they use; the runtime and the C
--- library never touch them), so values survive calls. Returns the locations and the
--- (register, save offset) pairs; the save area follows the slots.
+-- | Register allocation (M4): callee-saved registers, by graph colouring. Variables that are
+-- live at the same time get different registers; most-used first, and a variable passed to a
+-- self tail call prefers its parameter's register, so the back edge moves nothing. The rest
+-- live in 8-byte stack slots. Every callee preserves these registers (Keel functions save what
+-- they use; the runtime and the C library never touch them), so values survive calls.
+-- Returns the locations, the (register, save offset) pairs and the frame size; the save area
+-- follows the slots.
+--
+-- A register is written only after the instructions computing its value have read their
+-- operands, or a variable could share one with an operand that dies there.
 allocate :: [String] -> Fun -> [String] -> (M.Map String Loc, [(String, Int)], Int)
 allocate calleeSaved (Fun _ params _ env _ _ body) vars0 =
-  (M.fromList ([(v, InReg r) | (v, r) <- inRegs] ++ zip spilled (map InSlot [0 ..])), saved, frame)
+  (M.fromList ([(v, InReg r) | (v, r) <- M.toList colours] ++ zip spilled (map InSlot [0 ..])), saved, frame)
   where
     vars = nub vars0
     counts = M.fromListWith (+) [(v, 1 :: Int) | v <- uses body ++ params ++ env]
-    inRegs = zip (sortOn (\v -> negate (M.findWithDefault 0 v counts)) vars) calleeSaved
-    spilled = [v | v <- vars, v `notElem` map fst inRegs]
-    saved = [(r, 8 * (length spilled + i)) | (i, (_, r)) <- zip [0 ..] inRegs]
-    frame = 16 * ((8 * (length spilled + length inRegs) + 15) `div` 16)
+    conflicts = interference (params ++ env) body
+    -- Arguments of self tail calls: the parameter each would like to share a register with.
+    prefs = M.fromListWith (++) (concat [[(a, [p]), (p, [a])] | Bind x (RCallKnown _ as) (Ret (AVar y)) <- subExprs body, x == y, length as == length params, (p, AVar a) <- zip params as])
+    colours = foldl colour M.empty (sortOn (\v -> negate (M.findWithDefault 0 v counts)) vars)
+    colour done v =
+      let taken = S.fromList [r | w <- S.toList (M.findWithDefault S.empty v conflicts), Just r <- [M.lookup w done]]
+          wanted = [r | p <- M.findWithDefault [] v prefs, Just r <- [M.lookup p done]]
+       in case filter (`S.notMember` taken) (wanted ++ calleeSaved) of
+            r : _ -> M.insert v r done
+            [] -> done
+    spilled = [v | v <- vars, v `M.notMember` colours]
+    used = nub (M.elems colours)
+    saved = [(r, 8 * (length spilled + i)) | (i, r) <- zip [0 ..] used]
+    frame = 16 * ((8 * (length spilled + length used) + 15) `div` 16)
+
+-- | Which variables are live at the same time: each variable defined, with the variables live
+-- just after; the parameters and captured values all with each other.
+interference :: [String] -> Expr -> M.Map String (S.Set String)
+interference entry body = M.fromListWith S.union (concat [(x, ys) : [(y, S.singleton x) | y <- S.toList ys] | (x, ys) <- edges])
+  where
+    edges = [(p, S.fromList (filter (/= p) entry)) | p <- entry] ++ execState (live Nothing body) []
+    def x after = modify ((x, S.delete x after) :) >> pure (S.delete x after)
+    -- The variables live before an expression; join: the variable a branch's result goes to
+    -- and what is live after the join.
+    live :: Maybe (String, S.Set String) -> Expr -> State [(String, S.Set String)] (S.Set String)
+    live join e = case e of
+      Ret a -> case join of
+        Nothing -> pure (atomSet a)
+        Just (x, after) -> (<> atomSet a) <$> def x after
+      Bind x rhs rest -> live join rest >>= def x >>= \s -> pure (s <> S.fromList (rhsUses rhs))
+      BindIf x c a b rest -> do
+        after <- live join rest
+        la <- live (Just (x, after)) a
+        lb <- live (Just (x, after)) b
+        _ <- def x after
+        pure (atomSet c <> la <> lb)
+      BindCase x sc bs rest -> do
+        after <- live join rest
+        ls <- mapM (\(_, _, b) -> live (Just (x, after)) b) bs
+        _ <- def x after
+        pure (atomSet sc <> mconcat ls)
+      Dup v rest -> S.insert v <$> live join rest
+      Drop v rest -> S.insert v <$> live join rest
+      DropReuse v t rest -> live join rest >>= def t . S.insert v >>= pure . S.insert v
+    atomSet a = S.fromList [v | AVar v <- [a]]
+    rhsUses rhs = drop 1 (uses (Bind "" rhs (Ret (AInt 0))))
 
 data Loc = InReg String | InSlot Int
+  deriving (Eq)
 
 -- | A function's frame: where each variable lives and which registers to restore.
 -- fLoop: the function's own label, when a call to itself in tail position can jump back to
 -- where the arguments are stored instead of leaving and re-entering the frame.
 -- fUses: how often each variable occurs (a comparison used once, by an if, becomes a branch).
-data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String, fUses :: M.Map String Int}
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String, fUses :: M.Map String Int, fParams :: [String]}
 
 emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   when (length params > 7) $ error "more than 7 parameters"
   let (locs, saved, frame) = allocate ["x" ++ show r | r <- [19 .. 28 :: Int]] f (params ++ env ++ bound body)
-      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing) (M.fromListWith (+) [(v, 1) | v <- uses body])
+      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing) (M.fromListWith (+) [(v, 1) | v <- uses body]) params
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t// " ++ name)
   line ("L" ++ lbl ++ "_begin:")
@@ -197,8 +245,8 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("ldr x9, [x0, #" ++ show (8 * j) ++ "]")
     store slots "x9" v
-  line ("L" ++ lbl ++ "_loop:")
   forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("x" ++ show r) p
+  line ("L" ++ lbl ++ "_loop:")
   -- Own the captured pointers, then release the block (x0 is still the block: dup uses x16/x17).
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "bl _keel_drop"
@@ -478,7 +526,7 @@ expr slots join e = case e of
         ins "br x16"
       RCallKnown i as
         | fLoop slots == Just ("_kf_" ++ show i) -> Just $ do
-            args as
+            moves slots [(fLocs slots M.! p, a) | (p, a) <- zip (fParams slots) as]
             ins ("b L_kf_" ++ show i ++ "_loop")
         | otherwise -> Just $ do
             args as
@@ -493,6 +541,33 @@ expr slots join e = case e of
       _ -> Nothing
 
     args as = forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
+
+-- | Move atoms into locations all at once (a self tail call's arguments into its parameters):
+-- a move waits while its destination is still to be read; a cycle goes through a scratch
+-- register (x10–x15: at most three cycles among seven parameters).
+moves :: Slots -> [(Loc, Atom)] -> G ()
+moves slots ms0 = go [(d, src a) | (d, a) <- ms0, src a /= Left d] ["x10", "x11", "x12", "x13", "x14", "x15"]
+  where
+    src a = case a of
+      AVar v -> Left (fLocs slots M.! v)
+      _ -> Right a
+    go [] _ = pure ()
+    go ms scratch = case [m | m@(d, _) <- ms, Left d `notElem` map snd ms] of
+      m : _ -> move m >> go (filter (/= m) ms) scratch
+      [] -> case (ms, scratch) of
+        ((d, _) : _, r : rs) -> do
+          move (InReg r, Left d)
+          go [(d', if s' == Left d then Left (InReg r) else s') | (d', s') <- ms] rs
+        _ -> error "moves: out of scratch registers"
+    move (d, s) = case (d, s) of
+      (InReg r, Left l) -> load r l
+      (InReg r, Right a) -> atom slots r a
+      (InSlot i, Left (InReg r)) -> ins ("str " ++ r ++ ", [sp, #" ++ show (8 * i) ++ "]")
+      (InSlot i, Left l) -> load "x9" l >> ins ("str x9, [sp, #" ++ show (8 * i) ++ "]")
+      (InSlot i, Right a) -> atom slots "x9" a >> ins ("str x9, [sp, #" ++ show (8 * i) ++ "]")
+    load r l = case l of
+      InReg x -> unless (x == r) $ ins ("mov " ++ r ++ ", " ++ x)
+      InSlot i -> ins ("ldr " ++ r ++ ", [sp, #" ++ show (8 * i) ++ "]")
 
 -- | Allocate a block of @n@ payload words with a pointer map into x0 (header written).
 -- The runtime allocator clobbers only x0, x1 and x13–x16.
@@ -524,11 +599,13 @@ rhsInto slots d rhs = case rhs of
     | ov `elem` [Wrap, Checked], aop == Mul -> do
         ra <- operand slots "x9" a
         rb <- operand slots "x10" b
+        when (ov == Checked) $ -- the high half first: d may share a register with an operand
+          ins ((if sgn then "smulh" else "umulh") ++ " x11, " ++ ra ++ ", " ++ rb)
         ins ("mul " ++ d ++ ", " ++ ra ++ ", " ++ rb)
         when (ov == Checked) $
           if sgn
-            then ins ("smulh x11, " ++ ra ++ ", " ++ rb) >> ins ("cmp x11, " ++ d ++ ", asr #63") >> ins "b.ne _keel_panic_overflow"
-            else ins ("umulh x11, " ++ ra ++ ", " ++ rb) >> ins "cbnz x11, _keel_panic_overflow"
+            then ins ("cmp x11, " ++ d ++ ", asr #63") >> ins "b.ne _keel_panic_overflow"
+            else ins "cbnz x11, _keel_panic_overflow"
         pure True
   -- Canonical (sign- or zero-extended) operands give a canonical result: any width.
   RPrim (Bits bop) _ a b | bop `elem` [And, Or, Xor] -> do
@@ -716,7 +793,7 @@ arith it@(IntTy sgn n) ov aop
           ins "str x12, [x0]"
           ins ("b " ++ lDone)
           line (lOvf ++ ":")
-          atom (Slots M.empty [] Nothing M.empty) "x0" (ANullary 0) -- None
+          atom (Slots M.empty [] Nothing M.empty []) "x0" (ANullary 0) -- None
           line (lDone ++ ":")
         _ -> pure ()
   where

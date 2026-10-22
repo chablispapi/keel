@@ -41,6 +41,7 @@ are time after / time before (sum at 16M elements, tree at depth 24, bintrees at
 | AArch64 operands in registers, compare-and-branch | 9c982d7 | sum 0.84×, loop 0.73× |
 | arenas (`arena (\u. e)`) in the bintrees port | b350761 | bintrees 0.55× |
 | range analysis: unneeded overflow and bounds checks removed | `Keel.Range` | all 1.00× |
+| registers by graph colouring, self tail calls as parallel moves | (next) | sum 0.45×, tree 0.59×, bintrees 0.71×, fib 0.71× |
 
 From the first measurement to the last: sum 16M 1329 → 366 ms, tree 24 1754 → 1508 ms,
 bintrees 19 1716 → 809 ms.
