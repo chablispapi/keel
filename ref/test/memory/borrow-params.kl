@@ -1,0 +1,24 @@
+-- Parameters a function only reads are borrowed (Lower.borrowSigs). Each case here is one way
+-- that could go wrong; the native tests' leak check and the comparison with the evaluator
+-- catch a missing or an extra reference.
+
+data T = Leaf(i64) | Node(Box T, Box T)
+
+-- Only reads t: borrowed.
+def size : T ->{Diverge, Panic} i64 =
+  \t. case t of { Leaf(v) -> 1 | Node(l, r) -> size (unbox l) + size (unbox r) }
+
+-- Returns a field of a borrowed value: the field needs its own reference.
+def left : T -> T = \t. case t of { Leaf(v) -> Leaf(v) | Node(l, r) -> unbox l }
+
+-- Passes a field on as an owned argument (to a constructor).
+def swap : T -> T = \t. case t of { Leaf(v) -> Leaf(v) | Node(l, r) -> Node(r, l) }
+
+-- An owned value passed in a tail call: count stays owned, so this stays a loop (a million
+-- iterations would overflow the stack otherwise).
+def count : T -> i64 -> i64 ->{Diverge, Panic} i64 =
+  \t n acc. if n == 0 then acc + size t else count (Node(box Leaf(n), box Leaf(0))) (n - 1) (acc + size t)
+
+main =
+  let t = Node(box Node(box Leaf(1), box Leaf(2)), box Leaf(3)) in
+  size t * 1000000000 + size (left t) * 1000000 + size (swap t) * 10000000 + count t 1000000 0

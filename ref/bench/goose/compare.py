@@ -62,6 +62,7 @@ def main():
     ap.add_argument("--sizes", default="small,medium")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--only", default=",".join(BENCHES))
+    ap.add_argument("--keel-only", action="store_true", help="skip the Goose, C++ and Rust rows")
     args = ap.parse_args()
     gb = args.goose / "bench"
     keelc = sh(["cabal", "list-bin", "keelc"], cwd=REF).strip()
@@ -80,18 +81,18 @@ def main():
             src.write_text(with_n((HERE / kl).read_text(), n))
             sh([keelc, "build", src, "-o", work / f"keel_{name}"], env=env)
             rows.append(("keel", work / f"keel_{name}"))
-            for g in gooses:
+            for g in [] if args.keel_only else gooses:
                 gs, c = work / g, work / f"{g}.c"
                 gs.write_text(with_n((gb / "goose" / g).read_text(), n))
                 sh([args.goose / "build/goose", "-O2", "--standalone", "-o", c, gs])
                 sh(["clang", "-O2", "-w", "-DGS_STACK_RESERVE=2147483648ull", c, "-o", work / g[:-6]])
                 rows.append(("goose", work / g[:-6]))
-            for label, v in cpps:
+            for label, v in [] if args.keel_only else cpps:
                 exe = work / f"{name}_cpp{v}"
                 sh(["clang++", "-O2", "-std=c++20", f"-DBENCH_N={n}", f"-DVARIANT={v}",
                     f"-I{gb / 'cpp'}", gb / "cpp" / f"{name}.cpp", "-o", exe])
                 rows.append((label, exe))
-            for r in rusts:
+            for r in [] if args.keel_only else rusts:
                 rs = work / r
                 rs.write_text(with_n((gb / "rust" / r).read_text(), n))
                 sh(["rustc", "-O", "-C", "codegen-units=1", rs, "-o", work / r[:-3]], cwd=work)

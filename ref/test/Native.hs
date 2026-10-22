@@ -207,6 +207,7 @@ exampleFiles =
   , ("test/modules/qual/main.kl", (Just "48", ""))
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
+  , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
   , ("test/std/borrow.kl", (Just "745", ""))
   , ("test/std/array.kl", (Just "(Cons(Cons(110, box Cons(105, box Cons(108, box Nil))), box Cons(Cons(111, box Cons(110, box Cons(101, box Nil))), box Nil)), 100000)", "4999950000\n9592\nzero\nnil\n"))
   , ("selfhost/lex.kl", (Just "27", "1:1 keyword def\n1:5 ident f\n1:7 sym :\n1:9 ident i64\n1:13 sym ->\n1:15 sym {\n1:16 effvar e\n1:18 sym }\n1:20 ident i64\n1:24 sym =\n1:26 sym \\\n1:27 ident x\n1:28 sym .\n1:30 ident x\n1:32 sym +?\n1:35 num 7936\n1:42 sym ;\n2:1 str \"a\\\"bA\\n\"\n2:14 char 97\n2:18 char 10\n2:23 char 65\n2:47 num 250u8\n2:53 sym ..\n2:56 ident q\n2:57 sym .\n2:58 upper Name\n3:3 error unexpected letter after a number\n"))

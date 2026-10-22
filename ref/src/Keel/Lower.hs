@@ -186,7 +186,8 @@ lower (Program userDecls main) = do
       )
       (LS 0 M.empty S.empty Nothing M.empty)
   let ptrs = lsPtrs s
-  pure (LProg (M.map (refcount ptrs) (lsFuns s)) statics (refcount ptrs mainF) (lsLocs s))
+      sigs = borrowSigs ptrs (lsFuns s) mainF
+  pure (LProg (M.mapWithKey (\i -> refcount ptrs sigs (M.lookup i sigs)) (lsFuns s)) statics (refcount ptrs sigs Nothing mainF) (lsLocs s))
   where
     isLam e = case e of
       Lam {} -> True
@@ -427,11 +428,19 @@ freeVars tm = case tm of
 -- each use that consumes it except the last, and dropped right after its last use. A case
 -- scrutinee that dies in a branch which then allocates a block of the same size becomes a
 -- reuse token: if it was unique, that allocation happens in place.
-refcount :: S.Set String -> Fun -> Fun
-refcount ptrs f = f {funBody = evalState (go owned0 S.empty M.empty (funBody f)) 0}
+--
+-- A function in @sigs@ borrows the parameters marked True: its caller keeps them alive across
+-- the call, and inside it they are like variables live after a branch (@keep@): never dropped,
+-- duplicated if consumed. A field read from such a variable is borrowed the same way.
+refcount :: S.Set String -> Sigs -> Maybe [Bool] -> Fun -> Fun
+refcount ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.empty (funBody f)) 0}
   where
     isP v = v `S.member` ptrs
-    owned0 = S.fromList (filter isP (funParams f ++ funEnvPtrs f))
+    borrowedPs = [p | (p, True) <- zip (funParams f) (fromMaybe [] sig)]
+    owned0 = S.fromList (filter isP (funParams f ++ funEnvPtrs f)) S.\\ S.fromList borrowedPs
+    keep0 = S.fromList borrowedPs
+    consumed = consumedIn sigs
+    borrowed = borrowedIn sigs
 
     go :: S.Set String -> S.Set String -> M.Map String Int -> Expr -> State Int Expr
     go scope keep reuse e = case e of
@@ -444,17 +453,24 @@ refcount ptrs f = f {funBody = evalState (go owned0 S.empty M.empty (funBody f))
         let cons = filter isP (consumed rhs)
             bor = filter isP (borrowed rhs)
             live = S.filter isP (fv rest) <> keep
+            -- Also borrowed by the same right-hand side: the callee must not free it.
+            needed v = v `S.member` live || v `elem` bor
             count v = length (filter (== v) cons)
-            dups = concat [replicate (count v - 1 + fromEnum (v `S.member` live)) v | v <- nub cons]
+            dups = concat [replicate (count v - 1 + fromEnum (needed v)) v | v <- nub cons]
             dyingUnused = [v | v <- S.toList scope, count v == 0, v `notElem` bor, v `S.notMember` live]
             dyingBorrowed = [v | v <- nub bor, v `S.member` scope, v `S.notMember` live]
-            consumedDead = [v | v <- nub cons, v `S.notMember` live]
+            consumedDead = [v | v <- nub cons, not (needed v)]
             gone = S.fromList (dyingUnused ++ dyingBorrowed ++ consumedDead)
-            scope' = (scope S.\\ gone) <> pointer x
-        rest' <- go scope' keep reuse rest
+            -- A field of a kept variable is kept too: it can't die before its block.
+            fieldOfKept = case rhs of
+              RField (AVar a) _ -> isP x && a `S.member` keep
+              _ -> False
+            scope' = (scope S.\\ gone) <> (if fieldOfKept then S.empty else pointer x)
+            keep' = if fieldOfKept then S.insert x keep else keep
+        rest' <- go scope' keep' reuse rest
         afterDrops <- foldM (flip (dropOrReuse reuse)) rest' (reverse dyingBorrowed)
         let after = case rhs of
-              RField _ _ | isP x -> Dup x afterDrops -- a field read is borrowed: own it
+              RField _ _ | isP x, not fieldOfKept -> Dup x afterDrops -- a field read is borrowed: own it
               RArray AGet _ _ | isP x -> Dup x afterDrops
               _ -> afterDrops
         stmt <- foldM (flip (dropOrReuse reuse)) (Bind x rhs after) (reverse dyingUnused)
@@ -504,12 +520,124 @@ atomVars :: Atom -> [String]
 atomVars (AVar v) = [v]
 atomVars _ = []
 
+-- | Which parameters each directly called function borrows (True) rather than owns.
+type Sigs = M.Map Int [Bool]
+
+-- | Choose borrowed parameters (as Lean does): a pointer parameter is borrowed unless the
+-- function consumes it, could reuse its block (it is a case scrutinee and a branch allocates),
+-- or some caller passes an owned value for it in a tail call (borrowing would put a drop after
+-- the call and turn the jump into a call). Only functions that are never closure code, so
+-- every call to them is a direct one. Starts from all-borrowed and marks owned to a fixpoint.
+borrowSigs :: S.Set String -> M.Map Int Fun -> Fun -> Sigs
+borrowSigs ptrs funs mainF = fixpoint start
+  where
+    referenced = S.fromList (concatMap (closureRefs . funBody) (mainF : M.elems funs))
+    start =
+      M.fromList
+        [ (i, map (`S.member` ptrs) (funParams f))
+        | (i, f) <- M.toList funs
+        , i `S.notMember` referenced
+        , null (funEnv f)
+        , not (funDropsSelf f)
+        ]
+    fixpoint sigs = let sigs' = step sigs in if sigs' == sigs then sigs else fixpoint sigs'
+    step sigs = M.mapWithKey (\i bs -> [b && (i, k) `S.notMember` owned | (k, b) <- zip [0 :: Int ..] bs]) sigs
+      where
+        owned = S.fromList (concat [ownedHere i f | (i, f) <- M.toList funs, M.member i sigs] ++ tailOwned Nothing mainF ++ concat [tailOwned (Just i) f | (i, f) <- M.toList funs])
+        ownedHere i f =
+          let body = funBody f
+              used = S.fromList (concatMap (consumedIn sigs) (rhss body) ++ rets body) <> reusedScrutinees body
+           in [(i, k) | (k, p) <- zip [0 ..] (funParams f), p `S.member` used]
+        -- The caller's own borrowed parameters may be passed on in a tail call; owned values not.
+        tailOwned i f =
+          let bor = S.fromList [p | Just bs <- [i >>= (`M.lookup` sigs)], (p, True) <- zip (funParams f) bs]
+           in [(j, k) | (j, as) <- tailCalls (funBody f), (k, AVar v) <- zip [0 ..] as, v `S.member` ptrs, v `S.notMember` bor]
+
+-- | Function indices used as values (closure code or static blocks), not only called directly.
+closureRefs :: Expr -> [Int]
+closureRefs e = concatMap fromRhs (rhss e) ++ [i | AGlobal i <- exprAtoms e]
+  where
+    fromRhs rhs = case rhs of
+      RClosure i _ _ -> [i]
+      RCodata is _ _ -> is
+      _ -> []
+
+-- | Every right-hand side in an expression.
+rhss :: Expr -> [Rhs]
+rhss e = case e of
+  Ret _ -> []
+  Bind _ rhs rest -> rhs : rhss rest
+  BindIf _ _ a b rest -> rhss a ++ rhss b ++ rhss rest
+  BindCase _ _ bs rest -> concat [rhss b | (_, _, b) <- bs] ++ rhss rest
+  Dup _ rest -> rhss rest
+  Drop _ rest -> rhss rest
+  DropReuse _ _ rest -> rhss rest
+
+-- | Every atom in an expression.
+exprAtoms :: Expr -> [Atom]
+exprAtoms e = case e of
+  Ret a -> [a]
+  Bind _ rhs rest -> rhsAtoms rhs ++ exprAtoms rest
+  BindIf _ c a b rest -> c : exprAtoms a ++ exprAtoms b ++ exprAtoms rest
+  BindCase _ s bs rest -> s : concat [exprAtoms b | (_, _, b) <- bs] ++ exprAtoms rest
+  Dup _ rest -> exprAtoms rest
+  Drop _ rest -> exprAtoms rest
+  DropReuse _ _ rest -> exprAtoms rest
+  where
+    rhsAtoms rhs = case rhs of
+      RAtom a -> [a]
+      RPrim _ _ a b -> [a, b]
+      RCall f a -> [f, a]
+      RCallKnown _ as -> as
+      RProj a _ -> [a]
+      RAlloc _ _ as -> as
+      RAllocAt _ _ _ as -> as
+      RField a _ -> [a]
+      RPushHandler cs _ -> map snd cs
+      RPopHandler a -> [a]
+      RPerform _ a -> [a]
+      RConv _ a -> [a]
+      RArray _ _ as -> as
+      _ -> []
+
+-- | Variables returned (Ret consumes its atom).
+rets :: Expr -> [String]
+rets e = case e of
+  Ret a -> atomVars a
+  Bind _ _ rest -> rets rest
+  BindIf _ _ a b rest -> rets a ++ rets b ++ rets rest
+  BindCase _ _ bs rest -> concat [rets b | (_, _, b) <- bs] ++ rets rest
+  Dup _ rest -> rets rest
+  Drop _ rest -> rets rest
+  DropReuse _ _ rest -> rets rest
+
+-- | Case scrutinees whose block a branch could reuse (a branch allocates a block its size).
+reusedScrutinees :: Expr -> S.Set String
+reusedScrutinees e = S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> any (allocs w) (rhss b)) bs]
+  where
+    allocs w (RAlloc _ _ as) = 1 + length as == w
+    allocs _ _ = False
+
+subExprs :: Expr -> [Expr]
+subExprs e = e : case e of
+  Ret _ -> []
+  Bind _ _ rest -> subExprs rest
+  BindIf _ _ a b rest -> subExprs a ++ subExprs b ++ subExprs rest
+  BindCase _ _ bs rest -> concat [subExprs b | (_, _, b) <- bs] ++ subExprs rest
+  Dup _ rest -> subExprs rest
+  Drop _ rest -> subExprs rest
+  DropReuse _ _ rest -> subExprs rest
+
+-- | Direct calls in tail position (let x = f as in x), with their arguments.
+tailCalls :: Expr -> [(Int, [Atom])]
+tailCalls e = [(j, as) | Bind x (RCallKnown j as) (Ret (AVar y)) <- subExprs e, x == y]
+
 -- | Variables whose reference a right-hand side takes over.
-consumed :: Rhs -> [String]
-consumed rhs = case rhs of
+consumedIn :: Sigs -> Rhs -> [String]
+consumedIn sigs rhs = case rhs of
   RAtom a -> atomVars a
   RCall f a -> atomVars f ++ atomVars a
-  RCallKnown _ as -> concatMap atomVars as
+  RCallKnown i as -> concat [atomVars a | (a, False) <- zip as (M.findWithDefault [] i sigs ++ repeat False)]
   RClosure _ fvs _ -> fvs
   RCodata _ fvs _ -> fvs
   RProj a _ -> atomVars a
@@ -522,16 +650,17 @@ consumed rhs = case rhs of
   _ -> []
 
 -- | Variables a right-hand side only reads.
-borrowed :: Rhs -> [String]
-borrowed (RField a _) = atomVars a
-borrowed (RArray op _ (a : _)) | op `elem` [ALength, AGet] = atomVars a
-borrowed _ = []
+borrowedIn :: Sigs -> Rhs -> [String]
+borrowedIn _ (RField a _) = atomVars a
+borrowedIn _ (RArray op _ (a : _)) | op `elem` [ALength, AGet] = atomVars a
+borrowedIn sigs (RCallKnown i as) = concat [atomVars a | (a, True) <- zip as (M.findWithDefault [] i sigs)]
+borrowedIn _ _ = []
 
 -- | Variables used anywhere in an expression (names are unique, so no shadowing to track).
 fv :: Expr -> S.Set String
 fv e = case e of
   Ret a -> S.fromList (atomVars a)
-  Bind _ rhs rest -> S.fromList (consumed rhs ++ borrowed rhs) <> fv rest
+  Bind _ rhs rest -> S.fromList (consumedIn M.empty rhs ++ borrowedIn M.empty rhs) <> fv rest
   BindIf _ c a b rest -> S.fromList (atomVars c) <> fv a <> fv b <> fv rest
   BindCase _ s brs rest -> S.fromList (atomVars s) <> S.unions [fv b | (_, _, b) <- brs] <> fv rest
   Dup v rest -> S.insert v (fv rest)
