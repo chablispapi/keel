@@ -15,7 +15,7 @@ library
   import:          shared
   hs-source-dirs:  src
   exposed-modules: Keel.Syntax, Keel.Check, Keel.Eval, Keel.Elab, Keel.Mono, Keel.Lower, Keel.AArch64,
-                   Keel.Infer, Keel.Parser, Keel.RiscV, Keel.Toolchain, Keel.Opt, Keel.Prelude, Keel.Modules,
+                   Keel.Infer, Keel.Parser, Keel.RiscV, Keel.Toolchain, Keel.Opt, Keel.Range, Keel.Prelude, Keel.Modules,
                    Keel.Lsp
   other-modules:   Paths_keel_ref
   autogen-modules: Paths_keel_ref

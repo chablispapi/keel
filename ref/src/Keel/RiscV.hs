@@ -418,6 +418,12 @@ rhsCode slots rhs = case rhs of
     ins "slli t1, t1, 3"
     ins "add t0, t0, t1"
     ins "ld a0, 16(t0)"
+  RIndex a i -> do
+    atom slots "t0" a
+    atom slots "t1" i
+    ins "slli t1, t1, 3"
+    ins "add t0, t0, t1"
+    ins "ld a0, 16(t0)"
   RArray op ptr as -> do
     forM_ (zip [0 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
     case op of

@@ -41,6 +41,17 @@ is what notes.md §16 promised for explicit dictionaries + monomorphization. The
 is type-checked again, and the test runner checks it computes the same result as the
 unoptimized one on every test.
 
+**Range analysis** (`ref/src/Keel/Range.hs`, on the lowered IR, both back ends). It tracks
+intervals of integers and the relations `≤`, `<`, `≠` between variables, constants and array
+lengths, from arithmetic and from the branches of comparisons. A function called only directly
+gets parameter invariants: candidates (`0 ≤ p`, `p ≤ k` or `k ≤ p` for a constant it compares
+`p` with, `p ≤ length q`) that every call proves, found by dropping the ones some call can't
+prove until the rest hold. A checked `+ - *` whose result fits its type becomes a plain one,
+and `array.get xs i` with `0 ≤ i < length xs` reads without the bounds check. In the `sum`
+benchmark's loop this removes `i + 1`'s check and the bounds check; `acc + x` stays checked,
+since nothing bounds the elements. No measurable speedup (the checks were never-taken branches
+next to `adds`); fewer checks matter once loops are vectorized.
+
 Both back ends (ARM64 and RISC-V) share the allocation (`allocate` in `ref/src/Keel/AArch64.hs`),
 and the full test suite passes on both after each step.
 

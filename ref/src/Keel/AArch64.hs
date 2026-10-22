@@ -25,6 +25,7 @@ import Data.Text.Encoding qualified as TE
 import Numeric (showOct)
 import Keel.Check (checkProgram)
 import Keel.Lower
+import Keel.Range (ranges)
 import Keel.Mono (compileWith)
 import Keel.Syntax
 
@@ -47,7 +48,7 @@ prepareWith :: Bool -> Program -> Either String ([Decl], Ty, LProg)
 prepareWith debug p = do
   mono <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram mono)
-  lp <- lower mono
+  lp <- ranges <$> lower mono
   let Program decls _ = mono
   pure (optionDecl : decls, t, lp)
 
@@ -247,6 +248,7 @@ uses e = case e of
       RPerform _ a -> av a
       RConv _ a -> av a
       RArray _ _ as -> concatMap av as
+      RIndex a i -> av a ++ av i
       RArena _ -> []
 
 -- | Variables bound in a body.
@@ -551,6 +553,12 @@ rhsInto slots d rhs = case rhs of
     ins ("add x11, " ++ ra ++ ", " ++ ri ++ ", lsl #3")
     ins ("ldr " ++ d ++ ", [x11, #16]")
     pure True
+  RIndex a i -> do
+    ra <- operand slots "x9" a
+    ri <- operand slots "x10" i
+    ins ("add x11, " ++ ra ++ ", " ++ ri ++ ", lsl #3")
+    ins ("ldr " ++ d ++ ", [x11, #16]")
+    pure True
   _ -> pure False
   where
     compare' a b cond = do
@@ -659,6 +667,7 @@ rhsCode slots rhs = case rhs of
     ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
     ins "add x9, x9, x10, lsl #3"
     ins "ldr x0, [x9, #16]"
+  RIndex a i -> atom slots "x9" a >> atom slots "x10" i >> ins "add x9, x9, x10, lsl #3" >> ins "ldr x0, [x9, #16]"
   RArray op ptr as -> do
     forM_ (zip [0 :: Int ..] as) $ \(r, a) -> atom slots ("x" ++ show r) a
     case op of

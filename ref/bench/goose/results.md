@@ -20,8 +20,10 @@ machine's load moves every number by up to 1.6× between runs.
 - **tree**: level with per-node C++ and Rust, 2.4× behind arenas and Goose. A node is 32 bytes
   (header + three words) where Goose packs 12, so building and reading move 2× the memory.
 - **sum**: 6–11× behind. The loop does no reference counting; what is left is code quality
-  (the loop is ~15 instructions where clang vectorizes 4 elements at a time), i64 elements
-  where the others use i32, and a grown array's old blocks are not reused.
+  (the loop is ~15 instructions where clang vectorizes 4 elements at a time: moves and a spill
+  at the back edge, the length loaded twice), i64 elements where the others use i32, and a
+  grown array's old blocks are not reused. The overflow checks cost nothing measurable: with
+  `+%` the loop runs at the same speed, and range analysis (below) removes all but `acc + x`'s.
 
 ## What each change did
 
@@ -38,6 +40,7 @@ are time after / time before (sum at 16M elements, tree at depth 24, bintrees at
 | the constructor tag in the header | a6582f0 | bintrees 0.74×, tree 0.96× |
 | AArch64 operands in registers, compare-and-branch | 9c982d7 | sum 0.84×, loop 0.73× |
 | arenas (`arena (\u. e)`) in the bintrees port | b350761 | bintrees 0.55× |
+| range analysis: unneeded overflow and bounds checks removed | `Keel.Range` | all 1.00× |
 
 From the first measurement to the last: sum 16M 1329 → 366 ms, tree 24 1754 → 1508 ms,
 bintrees 19 1716 → 809 ms.
@@ -46,4 +49,4 @@ bintrees 19 1716 → 809 ms.
 
 Narrow fields (an `i32` field in 4 bytes) and a smaller header would close most of the tree
 gap; for sum, keeping loop variables in registers across the back edge (no spills, no moves
-for the self call) and removing provably unneeded overflow checks.
+for the self call), then vectorizing with one overflow check per loop instead of per add.

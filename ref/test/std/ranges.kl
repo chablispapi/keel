@@ -1,0 +1,16 @@
+-- Range analysis (Keel.Range) drops the checks it proves unnecessary: i + 1 and get xs i in
+-- these loops, since 0 ≤ i ≤ length xs holds at every call, and d - 1 with d ≥ 0, d ≠ 0.
+-- ranges-skip.kl and ranges-down.kl are loops where it must keep them.
+
+import std.array
+
+def fill : i64 -> Array i64 ->{Panic, Diverge} Array i64 = \i xs. if i == 10 then xs else fill (i + 1) (array.push xs (i * i))
+
+def total : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else total xs (i + 1) (acc + array.get xs i)
+
+def depth : i64 ->{Panic, Diverge} i64 = \d. if d == 0 then 0 else 1 + depth (d - 1)
+
+def small : u8 ->{Panic} u8 = \x. (x land 15) + 200
+
+main = total (fill 0 array.empty) 0 0 * 1000 + depth 7 * 10 + (small 255 as i64) - 215

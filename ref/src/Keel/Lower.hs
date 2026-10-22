@@ -10,7 +10,7 @@
 -- values are pointers to heap blocks: @[fields…]@, @[code, captured…]@ and
 -- @[code₁, …, codeₙ, captured…]@, each preceded by a header word (reference count, size, the
 -- constructor's tag, pointer map). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr) where
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, reachableFuns, closureRefs) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (foldM, forM, forM_)
@@ -49,6 +49,7 @@ data Rhs
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
   | RArray ArrayOp Bool [Atom]          -- ^ an array operation; whether the elements are pointers
   | RArena Bool                         -- ^ open (True) or close the innermost arena
+  | RIndex Atom Atom                    -- ^ element i of an array, known to be in bounds ("Keel.Range")
   deriving (Show)
 
 data Expr
@@ -560,16 +561,7 @@ borrowSigs :: S.Set String -> M.Map Int Fun -> [(Int, String, [Int])] -> Fun -> 
 borrowSigs ptrs funs statics mainF = fixpoint start
   where
     referenced = S.fromList (concatMap (closureRefs . funBody) (mainF : M.elems funs))
-    staticFuns = M.fromList [(i, fs) | (i, _, fs) <- statics]
-    reachable = go S.empty (calls mainF)
-      where
-        go seen [] = seen
-        go seen (i : is)
-          | i `S.member` seen = go seen is
-          | otherwise = go (S.insert i seen) (maybe [] calls (M.lookup i funs) ++ is)
-        calls f =
-          [j | RCallKnown j _ <- rhss (funBody f)]
-            ++ concat [[j] ++ M.findWithDefault [] j staticFuns | j <- closureRefs (funBody f)]
+    reachable = reachableFuns funs statics mainF
     start =
       M.fromList
         [ (i, map (`S.member` ptrs) (funParams f))
@@ -590,6 +582,19 @@ borrowSigs ptrs funs statics mainF = fixpoint start
         tailOwned i f =
           let bor = S.fromList [p | Just bs <- [i >>= (`M.lookup` sigs)], (p, True) <- zip (funParams f) bs]
            in [(j, k) | (j, as) <- tailCalls (funBody f), (k, AVar v) <- zip [0 ..] as, v `S.member` ptrs, v `S.notMember` bor]
+
+-- | The functions main can reach, by calls or through closures and static blocks.
+reachableFuns :: M.Map Int Fun -> [(Int, String, [Int])] -> Fun -> S.Set Int
+reachableFuns funs statics mainF = go S.empty (calls mainF)
+  where
+    staticFuns = M.fromList [(i, fs) | (i, _, fs) <- statics]
+    go seen [] = seen
+    go seen (i : is)
+      | i `S.member` seen = go seen is
+      | otherwise = go (S.insert i seen) (maybe [] calls (M.lookup i funs) ++ is)
+    calls f =
+      [j | RCallKnown j _ <- rhss (funBody f)]
+        ++ concat [[j] ++ M.findWithDefault [] j staticFuns | j <- closureRefs (funBody f)]
 
 -- | Function indices used as values (closure code or static blocks), not only called directly.
 closureRefs :: Expr -> [Int]
@@ -636,6 +641,7 @@ exprAtoms e = case e of
       RPerform _ a -> [a]
       RConv _ a -> [a]
       RArray _ _ as -> as
+      RIndex a i -> [a, i]
       _ -> []
 
 -- | Variables returned (Ret consumes its atom).

@@ -1,0 +1,9 @@
+-- i steps by 2, so i ≤ length xs doesn't hold at every call: get stays checked and panics. (+% so
+-- that a read past the end can only show up as the missing bounds panic.)
+
+import std.array
+
+def every2 : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else every2 xs (i + 2) (acc +% array.get xs i)
+
+main = every2 (array.push (array.push (array.push array.empty 1) 2) 3) 0 0

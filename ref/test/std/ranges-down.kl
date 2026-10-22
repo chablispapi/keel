@@ -1,0 +1,5 @@
+-- 0 ≤ d doesn't hold at the call, so d - 1 stays checked and panics at -128.
+
+def down : i8 ->{Panic, Diverge} i8 = \d. if d == 0 then 0 else down (d - 1)
+
+main = down (-5)
