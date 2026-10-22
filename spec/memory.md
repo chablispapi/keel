@@ -50,12 +50,13 @@ gets a layout id from 512 up, and the runtime looks those up in a table. So `Lea
 bytes, the header alone, and `Node(i32, Box T, Box T)` 24. A program may have 510 layouts of
 each kind.
 
-**Packed layouts** (AArch64 only). A constructor with two or more pointer fields keeps its word
+**Packed layouts.** A constructor with two or more pointer fields keeps its word
 fields first and then each pointer in a 4-byte slot holding `(child − block) / 8`, signed: so
 `Node(i32, Box T, Box T)` is 16 bytes, `Node(Box T, Box T)` too. Bit 16 of the pointer map
 (header bit 56, or table bit 24) marks the layout, and its map's bits are then 4-byte slots.
-A slot reaches ±16 GB, which covers every heap block and the static blocks just below the
-heap, since the native heap is 15 GB. RISC-V and x86-64 lower without packing.
+A slot reaches ±16 GB, which covers every heap block and the static blocks: on macOS the heap
+is a 15 GB zero-fill section next to them, on x86-64 Linux a 14 GB mapping at 1 GB (the
+`-no-pie` binary sits at 4 MB), and RISC-V's heap is 64 MB in the image.
 
 An **array** has layout 509 when its elements are narrow (an integer of at most 32 bits, or a
 `Bool`: 4 bytes each, so `Array i32` holds two per word), 510 for other words, 511 when they

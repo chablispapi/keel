@@ -25,10 +25,10 @@ These are candidates to investigate, not proven explanations for the timing gaps
    number would remove it), and propagating let-bound literals alone measured no gain.
 6. **Pack tree data more tightly.** Investigate multiple narrow fields per word and
    arena-relative child offsets to reduce memory traffic and tree footprint.
-   *Done 2026-10-22 (AArch64):* block-relative 32-bit child offsets for constructors with
-   two or more pointers; `tree` 24 514 → 386 MB and −7% time, `bintrees` −30% memory. Two
-   narrow fields per word was not pursued: no benchmark has a second narrow field. RISC-V and
-   x86-64 still use full words.
+   *Done 2026-10-22, all back ends:* block-relative 32-bit child offsets for constructors
+   with two or more pointers; `tree` 24 514 → 386 MB and −7% time on ARM and x86-64,
+   `bintrees` −23–30% memory. Two narrow fields per word was not pursued: no benchmark has
+   a second narrow field.
 7. **Strengthen the optimization pipeline.** Consider SSA and broader, cost-guided
    inlining when concrete missed optimizations justify them.
 

@@ -12,7 +12,7 @@
 -- block's layout (which constructor, how many words, which are pointers) in its low half, and
 -- a data block's first narrow field (an integer of at most 32 bits, or a Bool) in its high
 -- half (spec/memory.md). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, lowerWith, isPtr, packedBit, packedFrom, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, packedBit, packedFrom, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (foldM, forM, forM_, unless, when)
@@ -139,8 +139,7 @@ isPtr t = case t of
   _ -> False
 
 -- | lsPos is the innermost source position around the term being lowered.
--- lsPack: data blocks with several pointer fields are packed (the back end supports it).
-data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer, lsPack :: Bool}
+data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer}
 
 type M = StateT LS (Either String)
 
@@ -208,12 +207,9 @@ fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, isJust (narrowTy t)] of
 -- its fields in payload order.
 dataLayout :: Integer -> [Ty] -> M (Integer, Maybe Int, [Int])
 dataLayout tag fts = do
-  pack <- gets lsPack
-  let ((_, n, bm), h, ws) = dataLayoutKey pack tag fts
-      packed = pack && (tag, n, bm) /= fst3 (dataLayoutKey False tag fts)
-      fst3 (k, _, _) = k
+  let ((_, n, bm), h, ws) = dataLayoutKey tag fts
   -- Unpacked, rejects maps beyond 16 words (so bit 16 marks only packed layouts).
-  unless packed $ () <$ bitmap 0 [isPtr (fts !! i) | i <- ws]
+  unless (packable fts) $ () <$ bitmap 0 [isPtr (fts !! i) | i <- ws]
   lid <- layoutId (isJust h) tag n bm
   pure (lid, h, ws)
 
@@ -230,11 +226,11 @@ packedFrom bm nfields
   | otherwise = Nothing
 
 -- | The key of a constructor's layout ('lLayouts') at these field types, its header field and
--- its fields in payload order. With @pack@, a constructor with two or more pointer fields
--- (all within 16 slots) keeps its word fields first and its pointers in 4-byte slots.
-dataLayoutKey :: Bool -> Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
-dataLayoutKey pack tag fts
-  | pack, length ptrs >= 2, 2 * nw + length ptrs <= 16 =
+-- its fields in payload order. A constructor with two or more pointer fields (all within 16
+-- slots) is packed: its word fields first, then its pointers in 4-byte slots.
+dataLayoutKey :: Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
+dataLayoutKey tag fts
+  | packable fts =
       ((tag, nw + (length ptrs + 1) `div` 2, foldl setBit 0 (packedBit : [2 * nw + k | k <- [0 .. length ptrs - 1]])), h, wordFields ++ ptrs)
   | otherwise = ((tag, length ws, foldl setBit 0 [j | (j, i) <- zip [0 ..] ws, isPtr (fts !! i)]), h, ws)
   where
@@ -242,6 +238,13 @@ dataLayoutKey pack tag fts
     ptrs = filter (isPtr . (fts !!)) ws
     wordFields = filter (not . isPtr . (fts !!)) ws
     nw = length wordFields
+
+-- | Whether a constructor at these field types gets a packed layout.
+packable :: [Ty] -> Bool
+packable fts = length ptrs >= 2 && 2 * (length ws - length ptrs) + length ptrs <= 16
+  where
+    (_, ws) = fieldSlots fts
+    ptrs = filter (isPtr . (fts !!)) ws
 
 -- | Every constructor's number in the program: in declaration order, across data types.
 conNumbers :: [Decl] -> M.Map String Integer
@@ -256,11 +259,7 @@ optionLayouts layouts it = (look 0 0, look 1 (if bits it <= 32 then 0 else 1))
 
 -- | Lower a monomorphic core program (the output of "Keel.Mono".compile).
 lower :: Program -> Either String LProg
-lower = lowerWith False
-
--- | With @pack@, data blocks with several pointer fields are packed ('dataLayoutKey').
-lowerWith :: Bool -> Program -> Either String LProg
-lowerWith pack (Program userDecls main) = do
+lower (Program userDecls main) = do
   let decls = optionDecl : arrayDecl : userDecls
       defs = [(f, t, e) | Def f t e <- decls]
       info =
@@ -301,7 +300,7 @@ lowerWith pack (Program userDecls main) = do
           m <- expr info M.empty main (pure . Ret)
           pure (statics, Fun "main" [] 1 [] [] False m)
       )
-      (LS 0 M.empty S.empty Nothing M.empty M.empty pack)
+      (LS 0 M.empty S.empty Nothing M.empty M.empty)
   let ptrs = lsPtrs s
       -- A block's words, by its layout (packed layouts have fewer than fields).
       wordsOf = M.fromList [(lid, n) | ((_, n, _), lid) <- M.toList (lsLayouts s)]
@@ -432,8 +431,7 @@ expr info env tm k = case tm of
           fts = map inst fields
       when (length ps /= length tys) $ unsupported ("case on " ++ prettyTy (typeOf info env e))
       (lid, h, ws) <- dataLayout tag fts
-      pack <- gets lsPack
-      let ((_, n, bm), _, _) = dataLayoutKey pack tag fts
+      let ((_, n, bm), _, _) = dataLayoutKey tag fts
       xs' <- mapM (uncurry newVar) (zip xs fts)
       let env' = M.union (M.fromList (zip xs (zip xs' fts))) env
           read' i = case (h, elemIndex i ws) of

@@ -16,7 +16,7 @@ import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, maxSmall, prepare, printerTypes, template)
+import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepare, printerTypes, template)
 import Data.Bits ((.|.), shiftL)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe)
@@ -330,8 +330,10 @@ expr slots join e = case e of
 
 -- | Allocate a block into a0 (header written). Clobbers a0, a1, t4–t6, a6 only.
 alloc :: Int -> Integer -> G ()
-alloc n lid = do
+alloc fields lid = do
   t <- gets (\st -> template (gsLayouts st) lid)
+  -- A packed layout has fewer words than fields.
+  n <- gets (\st -> maybe fields (\(_, w, _) -> w) (keyOf (gsLayouts st) lid))
   li "a0" (toInteger n)
   li "a1" t
   ins "call _keel_alloc"
@@ -374,7 +376,7 @@ rhsCode slots rhs = case rhs of
     ins "jalr t6"
   RAlloc lid h as -> do
     alloc (length as) lid
-    fields h as
+    fields lid h as
   RAllocAt tok lid h as -> do
     lFresh <- newLabel
     lDone <- newLabel
@@ -390,11 +392,15 @@ rhsCode slots rhs = case rhs of
     line (lFresh ++ ":")
     alloc (length as) lid
     line (lDone ++ ":")
-    fields h as
+    fields lid h as
   RField a i -> do
     atom slots "t0" a
     ins ("ld a0, " ++ show (8 * i) ++ "(t0)")
-  RRel {} -> error "packed layouts are AArch64 only" -- this back end lowers without packing
+  RRel a i -> do
+    atom slots "t0" a
+    ins ("lw t1, " ++ show (4 * i) ++ "(t0)")
+    ins "slli t1, t1, 3"
+    ins "add a0, t0, t1"
   RHeader a sgn -> atom slots "t0" a >> ins ((if sgn then "lw" else "lwu") ++ " a0, -4(t0)")
   RPushHandler cs lid -> do
     alloc (2 + 2 * length cs) lid
@@ -446,12 +452,20 @@ rhsCode slots rhs = case rhs of
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
       load' slots "t2" v
       ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
-    fields :: Maybe Atom -> [Atom] -> G ()
-    fields h as = do
+    -- A packed layout's pointers go in 4-byte slots after its words, relative to the block.
+    fields :: Integer -> Maybe Atom -> [Atom] -> G ()
+    fields lid h as = do
+      bm <- gets (\st -> maybe 0 (\(_, _, m) -> m) (keyOf (gsLayouts st) lid))
+      let nw = fromMaybe (length as) (packedFrom bm (length as))
       forM_ h $ \a -> atom slots "t2" a >> ins "sw t2, -4(a0)"
       forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "t2" a
-        ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
+        if j < nw
+          then ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
+          else do
+            ins "sub t2, t2, a0"
+            ins "srai t2, t2, 3"
+            ins ("sw t2, " ++ show (4 * (nw + j)) ++ "(a0)")
 
 -- | Load element t1 of array t0 into a0.
 element :: Elem -> G ()
@@ -624,18 +638,18 @@ emitPrinter decls printers lbl t = do
       printStr "false"
       line (lDone ++ ":")
     TUnit -> printStr "()"
-    TBox a -> printStr "box " >> field (Right (-1)) a
+    TBox a -> printStr "box " >> field (Right (-1, False)) a
     TPair a b -> do
       printStr "("
-      field (Right 0) a
+      field (Right (0, False)) a
       printStr ", "
-      field (Right 1) b
+      field (Right (1, False)) b
       printStr ")"
     TData d tys | Just (ps, cs) <- dataOf decls d -> do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- As in "Keel.AArch64": constructors never built at this type have no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey False (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins "ld t0, 0(sp)"
@@ -645,14 +659,18 @@ emitPrinter decls printers lbl t = do
         li "t1" lid
         jumpIf "beq" ["t0", "t1"] l
       ins ("j " ++ lDone)
-      forM_ (zip built labels) $ \((c, fts, _, h, ws), l) -> do
+      forM_ (zip built labels) $ \((c, fts, lid, h, ws), l) -> do
         line (l ++ ":")
         printStr c
         unless (null fts) $ do
           printStr "("
           forM_ (zip [0 :: Int ..] fts) $ \(i, ft) -> do
             when (i > 0) $ printStr ", "
-            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (fromMaybe i (elemIndex i ws))) ft
+            let w = fromMaybe i (elemIndex i ws)
+                rel = case keyOf layouts lid of
+                  Just (_, _, bm) | Just nw <- packedFrom bm (length ws), w >= nw -> Just (nw + w)
+                  _ -> Nothing
+            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (maybe (w, False) (,True) rel)) ft
           printStr ")"
         ins ("j " ++ lDone)
       line (lDone ++ ":")
@@ -685,12 +703,15 @@ emitPrinter decls printers lbl t = do
   epilogue
   ins "ret"
   where
-    field :: Either Bool Int -> Ty -> G ()
+    -- Word i of the block (-1: the value itself; with True, packed pointer slot i), or its
+    -- header field (Left: whether signed).
+    field :: Either Bool (Int, Bool) -> Ty -> G ()
     field place ft = do
       ins "ld a0, 0(sp)"
       case place of
         Left sgn -> ins ((if sgn then "lw" else "lwu") ++ " a0, -4(a0)")
-        Right i -> when (i >= 0) $ ins ("ld a0, " ++ show (8 * i) ++ "(a0)")
+        Right (i, True) -> ins ("lw t0, " ++ show (4 * i) ++ "(a0)") >> ins "slli t0, t0, 3" >> ins "add a0, a0, t0"
+        Right (i, _) -> when (i >= 0) $ ins ("ld a0, " ++ show (8 * i) ++ "(a0)")
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("call " ++ l)
         Nothing -> printStr "..."
@@ -857,8 +878,9 @@ emitRuntime = do
   li "t1" arrayLayout
   ins "bgeu t3, t1, .L_drop_special"
   ins "ld t2, -8(a0)"
-  ins "slli t2, t2, 8"
-  ins "srli t2, t2, 48" -- the pointer map, bits 40–55
+  ins "slli t2, t2, 7"
+  ins "srli t2, t2, 47" -- the pointer map, bits 40–55, and whether it is packed (bit 56)
+  splitPacked
   line ".L_drop_loop:"
   ins "beqz t2, .L_drop_free"
   ins "addi t3, t2, -1"
@@ -870,8 +892,7 @@ emitRuntime = do
   ins "sd t2, 8(sp)"
   lowIndex
   ins "ld t0, 0(sp)"
-  ins "add t0, t0, t4"
-  ins "ld a0, 0(t0)"
+  child "a0" "t0"
   ins "call _keel_drop"
   ins "ld t2, 8(sp)"
   ins "j .L_drop_loop"
@@ -879,8 +900,7 @@ emitRuntime = do
   ins "mv t3, t2"
   lowIndex
   ins "ld a0, 0(sp)"
-  ins "add t0, a0, t4"
-  ins "ld t0, 0(t0)"
+  child "t0" "a0"
   ins "sd t0, 8(sp)"
   ins "call _keel_free_block"
   ins "ld a0, 8(sp)"
@@ -897,6 +917,7 @@ emitRuntime = do
   li "t4" fieldLayouts
   ins "bltu t3, t4, .L_drop_array"
   pointerMap
+  splitPacked
   ins "j .L_drop_loop"
   -- An array: drop its elements if they are pointers, last first, then free it.
   line ".L_drop_array:"
@@ -1241,14 +1262,7 @@ emitRuntime = do
   ins "bne t1, t2, .L_reuse_shared"
   stat 24
   ins "sd a0, 0(sp)"
-  ins "ld t2, -8(a0)"
-  ins "slli t2, t2, 8"
-  ins "srli t2, t2, 48" -- the pointer map
-  ins "andi t3, t0, 0x200"
-  ins "beqz t3, .L_reuse_map"
-  ins "andi t3, t0, 0x3ff" -- a field in the header: the map is in the table
-  pointerMap
-  line ".L_reuse_map:"
+  reuseMap
   ins "not t4, a1" -- the fields taken over stay alive: they are the caller's now
   ins "and t2, t2, t4"
   line ".L_reuse_loop:"
@@ -1259,8 +1273,7 @@ emitRuntime = do
   ins "sd t2, 8(sp)"
   lowIndex
   ins "ld t0, 0(sp)"
-  ins "add t0, t0, t4"
-  ins "ld a0, 0(t0)"
+  child "a0" "t0"
   ins "call _keel_drop"
   ins "ld t2, 8(sp)"
   ins "j .L_reuse_loop"
@@ -1276,17 +1289,19 @@ emitRuntime = do
   -- The block keeps its references: duplicate the fields taken over.
   line ".L_reuse_none:"
   ins "beqz a1, .L_reuse_zero"
+  reuseMap -- only for its packed bit
+  line ".L_reuse_dup:"
   ins "neg t3, a1"
   ins "and t3, a1, t3" -- lowest set bit
   ins "xor a1, a1, t3"
   lowIndex
-  ins "add t4, t4, a0"
-  ins "ld t4, 0(t4)"
+  child "t4" "a0"
   ins "lw t5, -8(t4)"
-  ins "bltz t5, .L_reuse_none"
+  ins "bltz t5, .L_reuse_next"
   ins "addiw t5, t5, 1024"
   ins "sw t5, -8(t4)"
-  ins "j .L_reuse_none"
+  line ".L_reuse_next:"
+  ins "bnez a1, .L_reuse_dup"
   line ".L_reuse_zero:"
   ins "li a0, 0"
   line ".L_reuse_ret:"
@@ -1512,6 +1527,41 @@ emitRuntime = do
       ins "add t4, t4, t2"
       ins "lwu t2, 0(t4)"
       ins "srli t2, t2, 8"
+    -- The 17-bit map in t2: its packed bit to 16(sp), t2 the map. Clobbers t5.
+    splitPacked = do
+      ins "srli t5, t2, 16"
+      ins "sd t5, 16(sp)"
+      ins "slli t2, t2, 48"
+      ins "srli t2, t2, 48"
+    -- The map of the block in a0 (header's low half in t0) into t2, its packed bit to 16(sp).
+    reuseMap = do
+      lMap <- newLabel
+      ins "ld t2, -8(a0)"
+      ins "slli t2, t2, 7"
+      ins "srli t2, t2, 47"
+      ins "andi t3, t0, 0x200"
+      ins ("beqz t3, " ++ lMap)
+      ins "andi t3, t0, 0x3ff" -- a field in the header: the map is in the table
+      pointerMap
+      line (lMap ++ ":")
+      splitPacked
+    -- Child t4 / 8 (t4 from lowIndex) of the block in @base@ into @dst@: a word, or with the
+    -- packed bit at 16(sp) a 4-byte slot holding (child - block) / 8. Clobbers t5, t6.
+    child dst base = do
+      lPacked <- newLabel
+      lDone <- newLabel
+      ins "ld t5, 16(sp)"
+      ins ("bnez t5, " ++ lPacked)
+      ins ("add t6, " ++ base ++ ", t4")
+      ins ("ld " ++ dst ++ ", 0(t6)")
+      ins ("j " ++ lDone)
+      line (lPacked ++ ":")
+      ins "srli t6, t4, 1"
+      ins ("add t6, " ++ base ++ ", t6")
+      ins ("lw " ++ dst ++ ", 0(t6)")
+      ins ("slli " ++ dst ++ ", " ++ dst ++ ", 3")
+      ins ("add " ++ dst ++ ", " ++ base ++ ", " ++ dst)
+      line (lDone ++ ":")
     -- t3 holds a single set bit; put its byte offset (index · 8) in t4.
     lowIndex = do
       lLoop <- newLabel

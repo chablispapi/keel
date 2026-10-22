@@ -123,12 +123,14 @@ is now seen through, which also lets closed effectful λs specialize. `closure` 
 each iteration's `k`): 12.8 → 10.9 ms (1.17×, median of 15 alternating runs), and one closure
 per map fewer. The other benchmarks compile to identical assembly.
 
-**Packed child references** (AArch64, `dataLayoutKey` in `ref/src/Keel/Lower.hs`). A
+**Packed child references** (all back ends, `dataLayoutKey` in `ref/src/Keel/Lower.hs`). A
 constructor with two or more pointer fields stores them as 4-byte offsets from its block
 (spec/memory.md), read with `ldrsw` + `add`. `tree` at depth 24: 514 → 386 MB, Goose's
 footprint, and 652 → 606 ms (median of 15 alternating runs); `bintrees` at 19: 26 → 18 MB,
 same time. Making nodes 8 bytes larger had cost `tree` 19%, so the decoding takes back part
-of the gain. The microbenchmarks have one pointer per cell and are unchanged.
+of the gain. The microbenchmarks have one pointer per cell and are unchanged. On x86-64 (the
+Celeron N4020): `tree` 3353 → 3125 ms and 514 → 388 MB, `bintrees` 1411 → 1349 ms and
+26 → 20 MB (median of 7).
 
 **Range analysis** (`ref/src/Keel/Range.hs`, on the lowered IR, both back ends). It tracks
 intervals of integers and the relations `≤`, `<`, `≠` between variables, constants and array

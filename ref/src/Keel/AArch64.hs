@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
+module Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, keyOf, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
@@ -41,20 +41,19 @@ compileNativeWith debug = compileNativeWithReuse debug True
 -- reuse specialization retains the same lowering, ownership decisions and runtime helper.
 compileNativeWithReuse :: Bool -> Bool -> Program -> Either String String
 compileNativeWithReuse debug reuse p = do
-  (decls, t, lp) <- prepareWith debug True p
+  (decls, t, lp) <- prepareWith debug p
   pure (emitProgramWithReuse reuse decls t lp)
 
 -- | The target-independent part of every back end: the core pipeline and lowering. Returns
 -- the declarations (with built-ins), @main@'s type, and the lowered program.
 prepare :: Program -> Either String ([Decl], Ty, LProg)
-prepare = prepareWith False False
+prepare = prepareWith False
 
--- | With @pack@, data blocks with several pointer fields are packed (this back end only).
-prepareWith :: Bool -> Bool -> Program -> Either String ([Decl], Ty, LProg)
-prepareWith debug pack p = do
+prepareWith :: Bool -> Program -> Either String ([Decl], Ty, LProg)
+prepareWith debug p = do
   mono <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram mono)
-  lp <- ranges <$> lowerWith pack mono
+  lp <- ranges <$> lower mono
   let Program decls _ = mono
   pure (optionDecl : decls, t, lp)
 
@@ -1304,7 +1303,7 @@ emitPrinter decls printers lbl t = do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- Constructors never built at this type have no layout, and no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey True (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins "ldr x9, [sp, #16]"

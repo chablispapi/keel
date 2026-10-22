@@ -12,8 +12,10 @@
 -- leaves r8–r11 alone); rdx and rcx for division, shifts and inline reference counting. Calls
 -- into the C library follow the System V ABI, with the stack 16-byte aligned at every call.
 --
--- The heap is 16 GB of address space reserved with mmap (MAP_NORESERVE) at startup: pages
--- are only backed when touched.
+-- The heap is 14 GB of address space reserved with mmap (MAP_NORESERVE) at startup, at 1 GB:
+-- pages are only backed when touched. There, a packed slot ((child - block) / 8 in 32 bits,
+-- spec/memory.md) reaches from any heap block to any other and to the static blocks of the
+-- binary, which -no-pie puts at 4 MB.
 module Keel.X86 (compileX86, linkCommand) where
 
 import Control.Monad (forM_, unless, when)
@@ -27,7 +29,7 @@ import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Keel.AArch64 (Loc (..), Reduction (..), allocate, bound, dataOf, header, maxSmall, prepare, printerTypes, reduction, template, uses)
+import Keel.AArch64 (Loc (..), Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, prepare, printerTypes, reduction, template, uses)
 import Keel.Lower
 import Keel.Syntax
 import Numeric (showOct)
@@ -42,7 +44,7 @@ linkCommand :: FilePath -> FilePath -> (String, [String])
 linkCommand s out = ("gcc", ["-no-pie", "-o", out, s])
 
 heapReserve :: Integer
-heapReserve = 16 * 1024 * 1024 * 1024
+heapReserve = 14 * 1024 * 1024 * 1024
 
 data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer}
 
@@ -395,6 +397,11 @@ rhsInto slots d rhs = case rhs of
     ra <- operand slots "r11" a
     ins ("mov " ++ d ++ ", " ++ mem ra (8 * i))
     pure True
+  RRel a i -> do
+    ra <- operand slots "r11" a
+    ins ("movsxd r10, " ++ mem32 ra (4 * i))
+    ins ("lea " ++ d ++ ", [" ++ ra ++ " + r10*8]")
+    pure True
   RHeader a sgn -> do
     ra <- operand slots "r11" a
     ins (narrowLoad sgn d ++ mem32 ra (-4))
@@ -557,8 +564,10 @@ vectorLoop slots red = when (length scalars <= 3 && length (rNodes red) <= 3) $ 
 
 -- | Allocate a block into rax (header written). Clobbers rax, rcx, rdx, rsi, rdi only.
 alloc :: Int -> Integer -> G ()
-alloc n lid = do
+alloc fields lid = do
   t <- gets (\st -> template (gsLayouts st) lid)
+  -- A packed layout has fewer words than fields.
+  n <- gets (\st -> maybe fields (\(_, w, _) -> w) (keyOf (gsLayouts st) lid))
   li "rax" (toInteger n)
   li "rdi" t
   ins "call _keel_alloc"
@@ -599,7 +608,7 @@ rhsCode slots rhs = case rhs of
     ins ("call " ++ mem "rax" (8 * i))
   RAlloc lid h as -> do
     alloc (length as) lid
-    fields h as
+    fields lid h as
   RAllocAt tok lid h as -> do
     lFresh <- newLabel
     lDone <- newLabel
@@ -613,9 +622,12 @@ rhsCode slots rhs = case rhs of
     line (lFresh ++ ":")
     alloc (length as) lid
     line (lDone ++ ":")
-    fields h as
+    fields lid h as
   RField a i -> atom slots "r11" a >> ins ("mov rax, " ++ mem "r11" (8 * i))
-  RRel {} -> error "packed layouts are AArch64 only" -- this back end lowers without packing
+  RRel a i -> do
+    atom slots "r11" a
+    ins ("movsxd r10, " ++ mem32 "r11" (4 * i))
+    ins "lea rax, [r11 + r10*8]"
   RHeader a sgn -> atom slots "r11" a >> ins (narrowLoad sgn "rax" ++ mem32 "r11" (-4))
   RPushHandler cs lid -> do
     alloc (2 + 2 * length cs) lid
@@ -682,12 +694,20 @@ rhsCode slots rhs = case rhs of
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
       load' slots "r9" v
       ins ("mov " ++ mem "rax" (8 * j) ++ ", r9")
-    fields :: Maybe Atom -> [Atom] -> G ()
-    fields h as = do
+    -- A packed layout's pointers go in 4-byte slots after its words, relative to the block.
+    fields :: Integer -> Maybe Atom -> [Atom] -> G ()
+    fields lid h as = do
+      bm <- gets (\st -> maybe 0 (\(_, _, m) -> m) (keyOf (gsLayouts st) lid))
+      let nw = fromMaybe (length as) (packedFrom bm (length as))
       forM_ h $ \a -> atom slots "r9" a >> ins ("mov " ++ mem32 "rax" (-4) ++ ", r9d")
       forM_ (zip [0 ..] as) $ \(j, a) -> do
         atom slots "r9" a
-        ins ("mov " ++ mem "rax" (8 * j) ++ ", r9")
+        if j < nw
+          then ins ("mov " ++ mem "rax" (8 * j) ++ ", r9")
+          else do
+            ins "sub r9, rax"
+            ins "sar r9, 3"
+            ins ("mov " ++ mem32 "rax" (4 * (nw + j)) ++ ", r9d")
 
 -- | The instruction that loads a 32-bit field into a 64-bit register, sign- or zero-extended:
 -- followed by its memory operand.
@@ -864,18 +884,18 @@ emitPrinter decls printers lbl t = do
       printStr "false"
       line (lDone ++ ":")
     TUnit -> printStr "()"
-    TBox a -> printStr "box " >> field (Right (-1)) a
+    TBox a -> printStr "box " >> field (Right (-1, False)) a
     TPair a b -> do
       printStr "("
-      field (Right 0) a
+      field (Right (0, False)) a
       printStr ", "
-      field (Right 1) b
+      field (Right (1, False)) b
       printStr ")"
     TData d tys | Just (ps, cs) <- dataOf decls d -> do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- As in "Keel.AArch64": constructors never built at this type have no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey False (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins ("mov r11, " ++ mem "rsp" 0)
@@ -885,14 +905,18 @@ emitPrinter decls printers lbl t = do
         ins ("cmp r11d, " ++ show lid)
         ins ("je " ++ l)
       ins ("jmp " ++ lDone)
-      forM_ (zip built labels) $ \((c, fts, _, h, ws), l) -> do
+      forM_ (zip built labels) $ \((c, fts, lid, h, ws), l) -> do
         line (l ++ ":")
         printStr c
         unless (null fts) $ do
           printStr "("
           forM_ (zip [0 :: Int ..] fts) $ \(i, ft) -> do
             when (i > 0) $ printStr ", "
-            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (fromMaybe i (elemIndex i ws))) ft
+            let w = fromMaybe i (elemIndex i ws)
+                rel = case keyOf layouts lid of
+                  Just (_, _, bm) | Just nw <- packedFrom bm (length ws), w >= nw -> Just (nw + w)
+                  _ -> Nothing
+            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (maybe (w, False) (,True) rel)) ft
           printStr ")"
         ins ("jmp " ++ lDone)
       line (lDone ++ ":")
@@ -925,14 +949,15 @@ emitPrinter decls printers lbl t = do
   ins "pop rbp"
   ins "ret"
   where
-    -- Print word i of the block (-1: the value itself), or its header field (Left: whether
-    -- signed), with its type's printer.
-    field :: Either Bool Int -> Ty -> G ()
+    -- Print word i of the block (-1: the value itself; with True, packed pointer slot i), or
+    -- its header field (Left: whether signed), with its type's printer.
+    field :: Either Bool (Int, Bool) -> Ty -> G ()
     field place ft = do
       ins ("mov rax, " ++ mem "rsp" 0)
       case place of
         Left sgn -> ins (narrowLoad sgn "rax" ++ mem32 "rax" (-4))
-        Right i -> when (i >= 0) $ ins ("mov rax, " ++ mem "rax" (8 * i))
+        Right (i, True) -> ins ("movsxd r10, " ++ mem32 "rax" (4 * i)) >> ins "lea rax, [rax + r10*8]"
+        Right (i, _) -> when (i >= 0) $ ins ("mov rax, " ++ mem "rax" (8 * i))
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("call " ++ l)
         Nothing -> printStr "..."
@@ -947,16 +972,17 @@ emitEntry printers t = do
   ins "push rbp"
   ins "mov rbp, rsp"
   ins "sub rsp, 64"
-  -- mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)
-  ins "xor edi, edi"
+  -- mmap(1 GB, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+  -- MAP_FIXED_NOREPLACE, -1, 0); a kernel without MAP_FIXED_NOREPLACE takes it as a hint.
+  ins "mov edi, 0x40000000"
   li "rsi" heapReserve
   ins "mov edx, 3"
-  ins "mov ecx, 0x4022"
+  ins "mov ecx, 0x104022"
   ins "mov r8, -1"
   ins "xor r9d, r9d"
   ins "call mmap"
-  ins "cmp rax, -1"
-  ins "je _keel_panic_oom"
+  ins "cmp rax, 0x40000000"
+  ins "jne _keel_panic_oom"
   ins "mov qword ptr [rip + _keel_heap_ptr], rax"
   li "r11" heapReserve
   ins "add rax, r11"
@@ -1116,22 +1142,23 @@ emitRuntime = do
   ins ("cmp ecx, " ++ show arrayLayout)
   ins "jae .L_drop_special"
   ins "mov r12, qword ptr [rax - 8]"
-  ins "shl r12, 8"
-  ins "shr r12, 48" -- the pointer map, bits 40–55
+  ins "shl r12, 7"
+  ins "shr r12, 47" -- the pointer map, bits 40–55, and whether it is packed (bit 56)
   line ".L_drop_loop:"
-  ins "test r12, r12"
+  ins "mov edx, r12d"
+  ins "and edx, 0xffff"
   ins "jz .L_drop_free"
-  ins "lea rdx, [r12 - 1]"
-  ins "and rdx, r12"
+  ins "lea rcx, [rdx - 1]"
+  ins "test rcx, rdx"
   ins "jz .L_drop_last" -- one pointer child left
-  ins "bsf rcx, r12"
+  ins "bsf rcx, rdx"
   ins "btr r12, rcx"
-  ins "mov rax, qword ptr [rbx + rcx*8]"
+  child "rax" "rbx"
   ins "call _keel_drop"
   ins "jmp .L_drop_loop"
   line ".L_drop_last:"
-  ins "bsf rcx, r12"
-  ins "mov r12, qword ptr [rbx + rcx*8]"
+  ins "bsf rcx, rdx"
+  child "r12" "rbx"
   ins "mov rax, rbx"
   ins "call _keel_free_block"
   ins "mov rax, r12"
@@ -1213,25 +1240,17 @@ emitRuntime = do
   ins "jne .L_reuse_shared"
   ins "inc qword ptr [rip + _keel_stats + 24]"
   ins "mov rbx, rax"
-  ins "mov r12, qword ptr [rax - 8]"
-  ins "shl r12, 8"
-  ins "shr r12, 48" -- the pointer map
-  ins ("test ecx, " ++ show fieldLayouts)
-  ins "jz .L_reuse_map"
-  ins "and ecx, 0x3ff" -- a field in the header: the map is in the table
-  address "rdx" "_keel_layouts"
-  ins ("mov r12d, dword ptr [rdx + rcx*4 - " ++ show (4 * fieldLayouts) ++ "]")
-  ins "shr r12d, 8"
-  line ".L_reuse_map:"
+  reuseMap
   ins "mov rdx, rdi" -- the fields taken over stay alive: they are the caller's now
   ins "not rdx"
   ins "and r12, rdx"
   line ".L_reuse_loop:"
-  ins "test r12, r12"
+  ins "mov edx, r12d"
+  ins "and edx, 0xffff"
   ins "jz .L_reuse_done"
-  ins "bsf rcx, r12"
+  ins "bsf rcx, rdx"
   ins "btr r12, rcx"
-  ins "mov rax, qword ptr [rbx + rcx*8]"
+  child "rax" "rbx"
   ins "call _keel_drop"
   ins "jmp .L_reuse_loop"
   line ".L_reuse_done:"
@@ -1245,15 +1264,19 @@ emitRuntime = do
   line ".L_reuse_none:"
   ins "test rdi, rdi"
   ins "jz .L_reuse_zero"
+  reuseMap -- only for its packed bit
+  line ".L_reuse_dup:"
   ins "bsf rcx, rdi"
   ins "btr rdi, rcx"
-  ins "mov rdx, qword ptr [rax + rcx*8]"
+  child "rdx" "rax"
   ins "mov esi, dword ptr [rdx - 8]"
   ins "test esi, esi"
-  ins "js .L_reuse_none"
+  ins "js .L_reuse_next"
   ins "add esi, 1024"
   ins "mov dword ptr [rdx - 8], esi"
-  ins "jmp .L_reuse_none"
+  line ".L_reuse_next:"
+  ins "test rdi, rdi"
+  ins "jnz .L_reuse_dup"
   line ".L_reuse_zero:"
   ins "xor eax, eax"
   line ".L_reuse_ret:"
@@ -1700,6 +1723,33 @@ emitRuntime = do
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"
   where
+    -- Child rcx of the block in @base@ into @dst@: a word, or for a packed layout (bit 16 of
+    -- r12, the map) a 4-byte slot holding (child - block) / 8.
+    child dst base = do
+      lPacked <- newLabel
+      lDone <- newLabel
+      ins "test r12d, 0x10000"
+      ins ("jnz " ++ lPacked)
+      ins ("mov " ++ dst ++ ", qword ptr [" ++ base ++ " + rcx*8]")
+      ins ("jmp " ++ lDone)
+      line (lPacked ++ ":")
+      ins ("movsxd " ++ dst ++ ", dword ptr [" ++ base ++ " + rcx*4]")
+      ins ("lea " ++ dst ++ ", [" ++ base ++ " + " ++ dst ++ "*8]")
+      line (lDone ++ ":")
+    -- The pointer map and packed bit of the block in rax (header's low half in ecx) into r12.
+    -- Clobbers rcx, rdx.
+    reuseMap = do
+      lMap <- newLabel
+      ins "mov r12, qword ptr [rax - 8]"
+      ins "shl r12, 7"
+      ins "shr r12, 47"
+      ins ("test ecx, " ++ show fieldLayouts)
+      ins ("jz " ++ lMap)
+      ins "and ecx, 0x3ff" -- a field in the header: the map is in the table
+      address "rdx" "_keel_layouts"
+      ins ("mov r12d, dword ptr [rdx + rcx*4 - " ++ show (4 * fieldLayouts) ++ "]")
+      ins "shr r12d, 8"
+      line (lMap ++ ":")
     fn lbl = line "\t.p2align 4" >> line (lbl ++ ":")
     -- An array's payload words for n elements into d: (n << (2 + cl) + 23) >> 3, with cl 1 for
     -- 8-byte elements (2 + the elements, rounded up to words).
