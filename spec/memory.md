@@ -121,6 +121,12 @@ list 1,000 times with about 1,000 fresh allocations and 1,001,000 in-place updat
 list the same code allocates, so the shared copy is never changed. This is how pure code gets
 mutation's performance without any `&mut`.
 
+On AArch64, when a `case` proves that all pointer fields are transferred, a unique parent's
+drop-to-token operation is emitted inline. The runtime count check includes the immortal bit;
+shared or immortal parents, invalid counts and partial transfers still go through the generic
+helper. This preserves the header's narrow field, arena behavior and allocator statistics.
+See [the paired measurements](perf.md#full-field-constructor-reuse-aarch64-2026-10-22).
+
 **Arrays** work the same way, without a token: `arraySet`, `arrayPush` and `arrayPop` take the
 array owned and update it in place when its count is 1; otherwise they copy it first (duplicating
 the elements) and decrement the original. `arrayGet` and `arrayLength` borrow the array, like a

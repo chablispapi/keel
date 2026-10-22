@@ -1,0 +1,28 @@
+-- Full-field reuse: narrow headers, unique and shared parents, repeated child pointers,
+-- partial transfers (which must keep the generic helper), and nested arenas.
+data Chain = End | Link(i32, Box Chain)
+data Fork = Fork(Box Chain, Box Chain)
+
+def make : i64 ->{Panic, Diverge} Chain =
+  \n. if n == 0 then End else Link(n as i32, box (make (n - 1)))
+
+def incr : Chain ->{Panic, Diverge} Chain =
+  \xs. case xs of { End -> End | Link(x, rest) -> Link(x + 1, box (incr (unbox rest))) }
+
+def total : Chain ->{Panic, Diverge} i64 =
+  \xs. case xs of { End -> 0 | Link(x, rest) -> (x as i64) + total (unbox rest) }
+
+def swap : Fork -> Fork = \t. case t of { Fork(a, b) -> Fork(b, a) }
+def first : Fork -> Fork = \t. case t of { Fork(a, _) -> Fork(a, box End) }
+def both : Fork ->{Panic, Diverge} i64 =
+  \t. case t of { Fork(a, b) -> total (unbox a) + total (unbox b) }
+
+def work : i64 ->{Panic, Diverge} i64 =
+  \n. let xs = make n in
+      let changed = total (incr xs) in
+      let original = total xs in
+      let repeated = both (swap (Fork(box xs, box xs))) in
+      let partial = both (first (Fork(box xs, box (make 3)))) in
+      changed + original + repeated + partial + total (incr (make n))
+
+main = work 8 + arena (\u. work 5 + arena (\v. work 3))

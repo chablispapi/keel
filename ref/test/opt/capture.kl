@@ -1,0 +1,27 @@
+-- Specialization on λs that capture locals: map and fold get copies that take the captured
+-- variables as parameters; a closure that escapes, and one rebuilt by each recursive call,
+-- stay closures.
+data List a = Nil | Cons(a, Box (List a))
+
+def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
+  \f xs. case xs of
+    { Nil -> Nil
+    | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
+
+def fold : (i64 -> i64 ->{Panic} i64) -> i64 -> List i64 ->{Panic, Diverge} i64 =
+  \f acc xs. case xs of { Nil -> acc | Cons(x, rest) -> fold f (f acc x) (unbox rest) }
+
+def range : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \n acc. if n < 1 then acc else range (n - 1) (Cons(n, box acc))
+
+def pick : (i64 ->{Panic} i64) -> (i64 ->{Panic} i64) = \f. f
+
+def twice : (i64 ->{Panic} i64) -> i64 ->{Panic, Diverge} i64 =
+  \f n. if n == 0 then f 1 else twice (\x. f (f x)) (n - 1)
+
+def work : i64 -> i64 ->{IO, Panic, Diverge} i64 =
+  \k m. let xs = map (\x. printInt (x * k); putc('\n'); x + k) (range 3 Nil) in
+        let total = fold (\acc x. acc * m + x - k) 0 xs in
+        total + (pick (\x. x * k)) 7 + twice (\x. x + k) 3
+
+main = work 10 100

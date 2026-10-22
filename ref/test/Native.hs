@@ -19,11 +19,13 @@ import Control.Monad (forM, unless)
 import Data.List (isInfixOf, isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.AArch64 (compileNative, compileNativeWith)
+import Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram)
+import Keel.Elab (elaborate)
 import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
+import Keel.Lower qualified as L
 import Keel.Parser (parseModule)
 import Keel.RiscV (compileRiscV)
 import Keel.X86 (compileX86)
@@ -210,6 +212,9 @@ exampleFiles =
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
   , ("test/memory/reuse-branches.kl", (Just "89829149613", ""))
+  , ("test/memory/reuse-fast.kl", (Just "374", ""))
+  , ("test/opt/capture.kl", (Just "10354", "10\n20\n30\n"))
+  , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
   , ("test/syntax/known-con.kl", (Just "12057", "1234"))
@@ -363,7 +368,7 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
-  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir]
+  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir, reuseChecks dir]
   let programs = cases ++ specCases ++ concatMap snd loaded
   failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir False))
   -- The examples have source positions: build them again with debug info.
@@ -376,7 +381,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ debugFailures ++ refused
-      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 2
+      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 3
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-
@@ -490,6 +495,82 @@ firmware tools dir = do
           (code, uart) <- runQemu tools elf
           pure ["FAIL [riscv] " ++ path ++ ": got " ++ show (code, uart) | code /= ExitSuccess || not ("Hi!\nresult: ()\n" `isPrefixOf` uart)]
 
+-- | Focused instruction-selection checks, plus native comparisons with the optimization
+-- disabled. The latter require identical output, exit status and every allocator counter.
+reuseChecks :: FilePath -> IO [String]
+reuseChecks dir = do
+  comparisons <- fmap concat $ forM paths $ \path -> do
+    loaded <- loadModules path
+    case loaded >>= either (Left . show) Right . inferProgram . fst of
+      Left e -> pure ["FAIL reuse baseline: " ++ path ++ ": " ++ e]
+      Right p -> do
+        runs <- forM [False, True] $ \enabled -> case compileNativeWithReuse False enabled p of
+          Left e -> pure (Left e)
+          Right asm -> do
+            let base = dir </> ("reuse-" ++ if enabled then "on" else "off")
+            fmap (\(code, out', stderr) -> (code, out', parseStats stderr)) <$> runAsm base asm
+        pure $ case runs of
+          [Right off, Right on] -> ["FAIL reuse baseline: " ++ path ++ ": " ++ show off ++ " /= " ++ show on | off /= on]
+          _ -> ["FAIL reuse baseline: " ++ path ++ ": " ++ show runs]
+  headers <- fmap concat $ forM [("zero", "and w9, w9, #0x3ff", ExitFailure 101, Nothing), ("immortal", "orr w9, w9, #0x80000000", ExitSuccess, Just 1)] $ \(name, change, expectedCode, expectedLive) -> do
+    -- Malformed zero counts and saturated immortal counts cannot be constructed by normal
+    -- small source programs. Inject just the header change in this tiny lowered-IR probe.
+    let inject l = l ++ if l == "L_kf_0_loop:" then "\n\tldr w9, [x1, #-8]\n\t" ++ change ++ "\n\tstr w9, [x1, #-8]" else ""
+        asm = unlines (map inject (lines headerProbe))
+    result <- runAsm (dir </> ("reuse-header-" ++ name)) asm
+    pure $ case result of
+      Left e -> ["FAIL reuse header " ++ name ++ ": " ++ e]
+      Right (code, output, stderr) ->
+        [ "FAIL reuse header " ++ name ++ ": " ++ show (code, output, stderr)
+        | code /= expectedCode
+            || (name == "zero" && not ("panic: reference count error" `isInfixOf` stderr))
+            || (name == "immortal" && (output /= "result: 42\n" || fmap live (parseStats stderr) /= expectedLive))
+        ]
+  pure (assemblyFailures ++ comparisons ++ headers)
+  where
+    runAsm base asm = do
+      writeFile (base ++ ".s") asm
+      (cc, _, err) <- readProcessWithExitCode "cc" ["-o", base, base ++ ".s"] ""
+      if cc /= ExitSuccess then pure (Left err) else do
+        environment <- getEnvironment
+        Right <$> readCreateProcessWithExitCode ((proc base []) {env = Just (("KEEL_STATS", "1") : environment)}) ""
+    paths = ["examples/reuse.kl", "test/memory/reuse-branches.kl", "test/memory/narrow.kl", "test/memory/arena.kl", "test/memory/reuse-fast.kl", "test/memory/reuse-fast-panic.kl"]
+    layouts = M.fromList [((0, 2, 3), 1), ((1, 2, 3), 512)]
+    reuse mask = L.DropReuse "p" mask "token" (L.Ret (L.AInt 0))
+    branch tag b = L.BindCase "r" (L.AVar "p") [(tag, 2, b)] (L.Ret (L.AInt 0))
+    body e = unlines . takeWhile (not . isPrefixOf "\t.globl _main") . lines $
+      emitProgram [] TUnit (L.LProg M.empty [] (L.Fun "probe" ["p"] 1 [] [] False e) M.empty layouts)
+    headerProbe = emitProgram [] tI $ L.LProg (M.singleton 0 probe) [] mainF M.empty (M.singleton (0, 1, 0) 1)
+      where
+        probe = L.Fun "probe" ["p"] 1 [] [] False $
+          L.BindCase "r" (L.AVar "p") [(1, 1, L.DropReuse "p" 0 "tok" $
+            L.Bind "q" (L.RAllocAt "tok" 1 Nothing [L.AInt 42]) (L.Ret (L.AVar "q")))] (L.Ret (L.AVar "r"))
+        mainF = L.Fun "main" [] 1 [] [] False $
+          L.Bind "p" (L.RAlloc 1 Nothing [L.AInt 7]) $
+            L.Bind "q" (L.RCallKnown 0 [L.AVar "p"]) $
+              L.Bind "x" (L.RField (L.AVar "q") 0) (L.Drop "q" (L.Ret (L.AVar "x")))
+    callFreeFastPath asm = case dropWhile (/= "\tcmp w10, #1") (lines asm) of
+      _ : guard : rest | Just slow <- stripPrefix "\tb.ne " guard ->
+        let fast = takeWhile (/= slow ++ ":") rest
+         in "\tstr w9, [x0, #-8]" `elem` fast && not (any (isPrefixOf "\tbl ") fast)
+      _ -> False
+    assemblyFailures =
+      [ "FAIL reuse assembly: " ++ name
+      | (name, e, expected) <-
+          [ ("full transfer", branch 1 (reuse 3), True)
+          , ("narrow-header full transfer", branch 512 (reuse 3), True)
+          , ("partial transfer", branch 1 (reuse 1), False)
+          , ("unknown layout", branch 7 (reuse 3), False)
+          , ("no case fact", reuse 3, False)
+          , ("branch fact does not escape", L.BindCase "r" (L.AVar "p") [(1, 2, L.Ret (L.AInt 0))] (reuse 3), False)
+          , ("consumed parent loses fact", branch 1 (L.Drop "p" (reuse 3)), False)
+          ]
+      , let asm = body e
+      , ("\tlsr w10, w9, #10" `isInfixOf` asm) /= expected
+          || not ("\tbl _keel_drop_reuse" `isInfixOf` asm)
+          || (expected && not (callFreeFastPath asm))
+      ]
+
 -- | Build and run a program natively, and compare with the evaluator. With @debug@, it is built
 -- as keelc build -g does: positions kept through optimization and a line table, which must
 -- change nothing but the debug info.
@@ -511,10 +592,12 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
         (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) (exampleInput name)
         machine <- machineFor name
         let native = parseRun code stdout
-            reference = reduce (evalProgramOn machine mono)
+            reference = reduce (evalProgramOn machine (elaborate prog))
+            optimized = reduce (evalProgramOn machine mono)
             stats = parseStats stderr
         pure $
           [failMsg ("native " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]
+            ++ [failMsg ("optimized evaluator " ++ show optimized ++ ", reference " ++ show reference) | optimized /= reference]
             ++ [failMsg ("leak: " ++ show stats) | code == ExitSuccess, fmap live stats /= Just 0]
             ++ [ failMsg ("expected most cells to be reused in place: " ++ show stats)
                | name == "examples/reuse.kl"
@@ -528,7 +611,7 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
     failMsg msg = "FAIL " ++ name ++ (if debug then " (-g)" else "") ++ ": " ++ msg
 
 data Stats = Stats {allocs, recycled, inplace, freed, live :: Integer}
-  deriving (Show)
+  deriving (Eq, Show)
 
 -- | Parse @keel-stats: allocs=… recycled=… inplace=… freed=… live=…@ from stderr.
 parseStats :: String -> Maybe Stats

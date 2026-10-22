@@ -1,0 +1,21 @@
+-- map.kl with a λ that captures a local: 1,000 maps over 1,000 elements, each adding the
+-- iteration's own k. Specialization gives map a copy that takes k as a parameter, so no
+-- closure is built per map and no element goes through a closure call.
+
+data List a = Nil | Cons(a, Box (List a))
+
+def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e, Diverge} List b =
+  \f xs. case xs of
+    { Nil -> Nil
+    | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
+
+def range : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \n acc. if n < 1 then acc else range (n - 1) (Cons(n, box acc))
+
+def repeat : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \k xs. if k < 1 then xs else repeat (k - 1) (map (\x. x + k) xs)
+
+def sum : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> x + sum (unbox rest) }
+
+main = sum (repeat 1000 (range 1000 Nil))

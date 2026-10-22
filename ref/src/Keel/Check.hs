@@ -4,7 +4,7 @@
 --
 -- @infer@ implements Γ ⊢ e ⇒ τ ! ε ▷ U: it synthesizes a type, the effect of evaluating the
 -- term, and the set U of linear local variables the term uses.
-module Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram, recursiveGroups, typeOfClosed) where
+module Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram, localTypes, recursiveGroups, typeOfClosed) where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.List (nub, sort)
@@ -144,6 +144,29 @@ typeOfClosed decls tm = do
   sig <- buildSig decls
   (t, _, _) <- infer sig S.empty M.empty tm
   pure t
+
+-- | The type of every local binder in a checked term (binders are unique), so the optimizer
+-- can give a lifted λ parameters for the locals it captures.
+localTypes :: [Decl] -> Term -> M.Map String Ty
+localTypes decls tm = either (const M.empty) (\s -> go s M.empty tm) (buildSig decls)
+  where
+    go s ctx e = case e of
+      Lam x t b -> under [(x, t)] b
+      LLam x t b -> under [(x, t)] b
+      Let x a b -> go s ctx a <> either (const M.empty) (\t -> under [(x, t)] b) (ty a)
+      LetPair x y a b -> go s ctx a <> case ty a of
+        Right (TPair ta tb) -> under [(x, ta), (y, tb)] b
+        _ -> M.empty
+      Case a alts -> go s ctx a <> case ty a of
+        Right (TData d tys) | Just (_, ps, cs) <- M.lookup d (sigData s) ->
+          let inst = substTy (M.fromList (zip ps tys)) M.empty
+           in M.unions [under (zip xs (map inst (fromMaybe [] (lookup c cs)))) b | (c, xs, b) <- alts]
+        _ -> M.empty
+      Handle l b cs -> go s ctx b <> M.unions [under [(x, a) | (op', a, _) <- M.findWithDefault [] l (sigEffs s), op' == op] b' | (op, x, b') <- cs]
+      _ -> M.unions (map (go s ctx) (children e))
+      where
+        ty a = (\(t, _, _) -> t) <$> infer s S.empty ctx a
+        under xts b = M.fromList xts <> go s (M.union (M.fromList xts) ctx) b
 
 -- | Attach the position of a term's outermost source location, if it has one.
 atPos' :: Term -> TC a -> TC a

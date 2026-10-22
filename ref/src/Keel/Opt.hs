@@ -5,7 +5,8 @@
 --    dictionary or interface implementation) or a top-level function uses a copy of @f@ with
 --    that parameter replaced by @c@. Recursive calls pass @c@ along, so they reach the same
 --    copy. Closed λ arguments (@map (\x. x + 1) xs@) are first lifted to top-level definitions,
---    so they specialize too, and the inliner then removes the call through the closure.
+--    so they specialize too, and the inliner then removes the call through the closure. A λ
+--    capturing locals is lifted with them as extra parameters, and the copy takes them instead.
 -- 2. __Inlining.__ @c.o@ on a known cocase becomes the branch; calls to small non-recursive
 --    definitions are replaced by their bodies, and constant definitions (@def none = None@,
 --    @array.empty@) by their values, so no top-level value outlives optimization.
@@ -25,7 +26,7 @@ import Data.List (intercalate)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
-import Keel.Check (recursiveGroups, typeOfClosed)
+import Keel.Check (localTypes, recursiveGroups, typeOfClosed)
 import Keel.Syntax
 
 optimize :: Program -> Program
@@ -69,31 +70,59 @@ thinPositions (Program decls main) = Program [thinDecl d | d <- decls] (thin mai
 
 -- Lifting closed λ arguments ------------------------------------------------------------------
 
--- | Give every closed λ passed to a top-level function its own top-level definition. A λ whose
--- type can't be computed (which can't happen for checked programs) is left in place.
+-- | Give every closed λ passed to a top-level function its own top-level definition. A λ
+-- capturing locals @y z@ becomes @lam'n y z@ for @lam'n = λy z. λ…@, a partial application of
+-- a known function that specialization then takes apart; only when the parameter it is passed
+-- for is only called (see 'onlyCalled'), else the copy would build a closure at each use. A λ
+-- whose type can't be computed (which can't happen for checked programs) is left in place.
 liftClosed :: Program -> Program
 liftClosed (Program decls main) = Program (decls' ++ [Def f t e | (f, t, e) <- reverse lifted]) main'
   where
     globals = S.fromList [f | Def f _ _ <- decls]
-    ((decls', main'), (_, lifted)) = runState ((,) <$> mapM liftDecl decls <*> go main) (0 :: Int, [])
+    bodies = M.fromList [(f, e) | Def f _ e <- decls]
+    ((decls', main'), (_, lifted)) = runState ((,) <$> mapM liftDecl decls <*> liftIn main) (0 :: Int, [])
     liftDecl d = case d of
-      Def f t e -> Def f t <$> go e
+      Def f t e -> Def f t <$> liftIn e
       _ -> pure d
-    go tm = case spine tm of
-      (Var f, args@(_ : _)) | f `S.member` globals -> foldl App (Var f) <$> mapM liftArg args
-      _ -> descendM go tm
-    liftArg a = do
-      a' <- go a
-      case a' of
-        _ | isLam a', S.null (freeVars a' S.\\ globals), Right t <- typeOfClosed decls a' -> do
-          (n, acc) <- get
-          let name = "lam'" ++ show n
-          put (n + 1, (name, t, a') : acc)
-          pure (Var name)
+    liftIn e = go (localTypes decls e) e
+    go tys tm = case spine tm of
+      -- The elaborator names the function before effectful arguments (let a = f in a …).
+      _ | Let x (Var g) b <- tm, g `S.member` globals -> go tys (replaceVars (M.singleton x (Var g)) b)
+      (Var f, args@(_ : _)) | f `S.member` globals -> foldl App (Var f) <$> mapM (uncurry (liftArg tys f)) (zip [0 ..] args)
+      _ -> descendM (go tys) tm
+    liftArg tys f i a = do
+      a' <- go tys a
+      let captured = S.toList (freeVars a' S.\\ globals)
+          lifts
+            | null captured = isLam a'
+            | Lam {} <- a', Just (ps, body) <- params <$> M.lookup f bodies, i < length ps =
+                let (x, _, _) = ps !! i in onlyCalled f i x body
+            | otherwise = False
+      case mapM (`M.lookup` tys) captured of
+        Just cts
+          | lifts
+          , Right t <- typeOfClosed decls (foldr (uncurry Lam) a' (zip captured cts)) -> do
+              (n, acc) <- get
+              let name = "lam'" ++ show n
+              put (n + 1, (name, t, foldr (uncurry Lam) a' (zip captured cts)) : acc)
+              pure (foldl App (Var name) (map Var captured))
         _ -> pure a'
     isLam Lam {} = True
     isLam LLam {} = True
     isLam _ = False
+
+-- | Every occurrence of @x@ in @body@ is called, or passed along as argument @i@ of @f@: then
+-- replacing @x@ by a partial application builds no closure.
+onlyCalled :: String -> Int -> String -> Term -> Bool
+onlyCalled f i x = go
+  where
+    go tm = case spine tm of
+      (Var h, args@(_ : _))
+        | h == x -> all go args
+        | h == f -> and [if stripAt a == Var x then j == i else go a | (j, a) <- zip [0 :: Int ..] args]
+      _ -> case tm of
+        Var y -> y /= x
+        _ -> all go (children tm)
 
 freeVars :: Term -> S.Set String
 freeVars tm = case tm of
@@ -126,8 +155,9 @@ arrows n (TFun a e r) = let (as, res) = arrows (n - 1) r in ((a, e, False) : as,
 arrows n (TLFun a e r) = let (as, res) = arrows (n - 1) r in ((a, e, True) : as, res)
 arrows _ t = ([], t)
 
--- | Worklist state: definitions so far, and specializations made (key ↦ new name).
-data SS = SS {ssDefs :: M.Map String (Ty, Term), ssMade :: M.Map String String, ssTodo :: [String]}
+-- | Worklist state: definitions so far, specializations made (key ↦ new name), and each
+-- definition's body before its calls were rewritten (for 'onlyCalled').
+data SS = SS {ssDefs :: M.Map String (Ty, Term), ssMade :: M.Map String String, ssTodo :: [String], ssRaw :: M.Map String Term}
 
 specialize :: Program -> Program
 specialize (Program decls main) = Program (others ++ [Def f t e | (f, (t, e)) <- order]) main'
@@ -143,7 +173,7 @@ specialize (Program decls main) = Program (others ++ [Def f t e | (f, (t, e)) <-
       LLam {} -> True
       _ -> False
     original = M.fromList [(f, (t, e)) | Def f t e <- decls]
-    (main', order) = evalState run (SS original M.empty (M.keys original))
+    (main', order) = evalState run (SS original M.empty (M.keys original) (M.map snd original))
     run = do
       m <- rewrite main
       loop
@@ -173,35 +203,58 @@ specialize (Program decls main) = Program (others ++ [Def f t e | (f, (t, e)) <-
           Nothing -> foldl App (Var f) args'
       _ -> descendM rewrite tm
 
-    -- The specialized copy for these arguments, if any are constants (and not all of them).
+    -- The specialized copy for these arguments, if any are constants (and not all of them). A
+    -- constant is a top-level cocase or function, or a function partially applied to
+    -- variables (a lifted capturing λ): the copy takes those variables as parameters instead.
     specFor f args = do
       defs <- gets ssDefs
+      raw <- gets ssRaw
       case M.lookup f defs of
         Nothing -> pure Nothing
         Just (t, e) -> do
           let (ps, _) = params e
               n = min (length ps) (length args)
-              fixed = [(i, g) | (i, Var g) <- zip [0 .. n - 1] args, g `S.member` consts]
-          if null fixed || length fixed == length ps
+              (_, rawBody) = params (M.findWithDefault e f raw)
+              known i a = case spine a of
+                (Var g, []) | g `S.member` consts -> Just (g, [])
+                (Var g, cs@(_ : _))
+                  | g `S.member` consts
+                  , Just vs <- mapM var cs
+                  , Just (gt, ge) <- M.lookup g defs
+                  , length vs < length (fst (params ge))
+                  , let (x, _, _) = ps !! i
+                  , onlyCalled f i x rawBody ->
+                      Just (g, [(v, ty, lin) | (v, (ty, _, lin)) <- zip vs (fst (arrows (length vs) gt))])
+                _ -> Nothing
+              fixed = [(i, k) | (i, a) <- zip [0 .. n - 1] args, Just k <- [known i a]]
+          if null fixed || (length fixed == length ps && all (null . snd . snd) fixed)
             then pure Nothing
             else do
-              let key = f ++ "{" ++ intercalate "," [show i ++ "=" ++ g | (i, g) <- fixed] ++ "}"
-                  kept = [a | (i, a) <- zip [0 ..] args, i `notElem` map fst fixed]
+              let key = f ++ "{" ++ intercalate "," [show i ++ "=" ++ g ++ (if null cs then "" else "/" ++ show (length cs)) | (i, (g, cs)) <- fixed] ++ "}"
+                  kept = concat [maybe [a] (map (\(v, _, _) -> Var v) . snd) (lookup i fixed) | (i, a) <- zip [0 ..] args]
               made <- gets ssMade
               case M.lookup key made of
                 Just name -> pure (Just (name, kept))
                 Nothing -> do
                   modify (\st -> st {ssMade = M.insert key key made})
                   let (ps', body) = params e
-                      subst = M.fromList [(x, Var g) | (i, g) <- fixed, let (x, _, _) = ps' !! i]
-                      keepPs = [p | (i, p) <- zip [0 ..] ps', i `notElem` map fst fixed]
-                      body' = foldr (\(x, ty, lin) b -> (if lin then LLam else Lam) x ty b) (replaceVars subst body) keepPs
+                      -- The captured variables become fresh parameters (simplify's fresh
+                      -- names are digits after the quote, so these can't collide).
+                      captured i = case lookup i fixed of
+                        Just (_, cs) -> let (x, _, _) = ps' !! i in [(x ++ "'c" ++ show j, ty, lin) | (j, (_, ty, lin)) <- zip [0 :: Int ..] cs]
+                        Nothing -> []
+                      subst = M.fromList [(x, foldl App (Var g) [Var c | (c, _, _) <- captured i]) | (i, (g, _)) <- fixed, let (x, _, _) = ps' !! i]
+                      newPs = concat [maybe [p] (const (captured i)) (lookup i fixed) | (i, p) <- zip [0 ..] ps']
+                      body' = foldr (\(x, ty, lin) b -> (if lin then LLam else Lam) x ty b) (replaceVars subst body) newPs
                       (arrs, res) = arrows (length ps') t
                       eff = S.unions [ef | (_, ef, _) <- arrs]
-                      keptArrs = [a | (i, a) <- zip [0 ..] arrs, i `notElem` map fst fixed]
-                      t' = rebuild keptArrs eff res
-                  modify (\st -> st {ssDefs = M.insert key (t', body') (ssDefs st), ssTodo = key : ssTodo st})
+                      newArrs = concat [maybe [a] (const [(ty, S.empty, lin) | (_, ty, lin) <- captured i]) (lookup i fixed) | (i, a) <- zip [0 ..] arrs]
+                      t' = rebuild newArrs eff res
+                  modify (\st -> st {ssDefs = M.insert key (t', body') (ssDefs st), ssTodo = key : ssTodo st, ssRaw = M.insert key body' (ssRaw st)})
                   pure (Just (key, kept))
+    var a = case stripAt a of
+      Var v -> Just v
+      _ -> Nothing
 
     -- Intermediate arrows of nested λs are pure; the last carries every effect.
     rebuild [] _ res = res

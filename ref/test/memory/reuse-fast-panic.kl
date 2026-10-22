@@ -1,0 +1,10 @@
+-- Reuse happens before effects and a checked narrow addition. Preserve the output prefix
+-- and panic on the second cell, before evaluating its recursive tail.
+data Chain = End | Link(i32, Box Chain)
+
+def walk : Chain ->{IO, Panic, Diverge} Chain =
+  \xs. case xs of
+    { End -> End
+    | Link(x, rest) -> printInt (x as i64); putc('\n'); Link(x + 1, box (walk (unbox rest))) }
+
+main = walk (Link(1, box Link(2147483647, box End)))

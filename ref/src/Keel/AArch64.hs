@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
+module Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
@@ -35,9 +35,14 @@ compileNative = compileNativeWith False
 
 -- | With @debug@, the assembly carries a line table (.file/.loc) for @cc -g@.
 compileNativeWith :: Bool -> Program -> Either String String
-compileNativeWith debug p = do
+compileNativeWith debug = compileNativeWithReuse debug True
+
+-- | Test/benchmark control: debug information, then inline full-field reuse. Disabling
+-- reuse specialization retains the same lowering, ownership decisions and runtime helper.
+compileNativeWithReuse :: Bool -> Bool -> Program -> Either String String
+compileNativeWithReuse debug reuse p = do
   (decls, t, lp) <- prepareWith debug p
-  pure (emitProgram decls t lp)
+  pure (emitProgramWithReuse reuse decls t lp)
 
 -- | The target-independent part of every back end: the core pipeline and lowering. Returns
 -- the declarations (with built-ins), @main@'s type, and the lowered program.
@@ -102,7 +107,10 @@ printStr s = do
 
 -- | Emit a program whose @main@ has type @mainTy@.
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF locs layouts) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts))))
+emitProgram = emitProgramWithReuse True
+
+emitProgramWithReuse :: Bool -> [Decl] -> Ty -> LProg -> String
+emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -110,8 +118,8 @@ emitProgram decls mainTy (LProg funs statics mainF locs layouts) = unlines (reve
     gen = do
       line "\t.section __TEXT,__text,regular,pure_instructions"
       forM_ (zip [1 :: Int ..] files) $ \(n, f) -> ins (".file " ++ show n ++ " " ++ show f)
-      forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
-      emitFun "_kf_main" mainF
+      forM_ (M.toList funs) $ \(i, f) -> emitFun reuse ("_kf_" ++ show i) f
+      emitFun reuse "_kf_main" mainF
       -- The runtime has no Keel source: line 0.
       unless (null files) $ ins ".loc 1 0 0"
       emitEntry printers mainTy
@@ -223,13 +231,36 @@ data Loc = InReg String | InSlot Int
 -- fLoop: the function's own label, when a call to itself in tail position can jump back to
 -- where the arguments are stored instead of leaving and re-entering the frame.
 -- fUses: how often each variable occurs (a comparison used once, by an if, becomes a branch).
-data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String, fUses :: M.Map String Int, fParams :: [String]}
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String, fUses :: M.Map String Int, fParams :: [String], fFullReuse :: S.Set String}
 
-emitFun :: String -> Fun -> G ()
-emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
+-- | Tokens whose case branch proves that all pointer fields are taken over. Facts are
+-- local to a branch, and die when the parent is consumed. No uniqueness is assumed here:
+-- the emitter still checks its count, including the immortal bit, at the point of reuse.
+fullFieldReuse :: M.Map (Integer, Int, Integer) Integer -> Expr -> S.Set String
+fullFieldReuse layouts = go M.empty
+  where
+    maps = M.fromList [(lid, pointers) | ((_, _, pointers), lid) <- M.toList layouts]
+    go known e = case e of
+      Bind _ _ rest -> go known rest
+      BindIf _ _ a b rest -> go known a <> go known b <> go known rest
+      BindCase _ s bs rest ->
+        S.unions [go (inBranch known s tag) b | (tag, _, b) <- bs] <> go known rest
+      Dup _ rest -> go known rest
+      Drop v rest -> go (M.delete v known) rest
+      DropReuse v mask tok rest ->
+        (if M.lookup v known == Just mask then S.singleton tok else S.empty) <> go (M.delete v known) rest
+      Ret _ -> S.empty
+    inBranch known (AVar v) tag = case M.lookup tag maps of
+      Just pointers -> M.insert v pointers known
+      Nothing -> M.delete v known
+    inBranch known _ _ = known
+
+emitFun :: Bool -> String -> Fun -> G ()
+emitFun reuse lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   when (length params > 7) $ error "more than 7 parameters"
+  layouts <- gets gsLayouts
   let (locs, saved, frame) = allocate ["x" ++ show r | r <- [19 .. 28 :: Int]] f (params ++ env ++ bound body)
-      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing) (M.fromListWith (+) [(v, 1) | v <- uses body]) params
+      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing) (M.fromListWith (+) [(v, 1) | v <- uses body]) params (if reuse then fullFieldReuse layouts body else S.empty)
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t// " ++ name)
   line ("L" ++ lbl ++ "_begin:")
@@ -513,10 +544,30 @@ expr slots join e = case e of
     expr slots join rest
   DropReuse v mask tok rest -> do
     load' slots "x0" v
-    movImm "x1" mask
-    ins "bl _keel_drop_reuse"
+    if tok `S.member` fFullReuse slots then do
+      lSlow <- newLabel
+      lDone <- newLabel
+      ins "ldr w9, [x0, #-8]"
+      ins "lsr w10, w9, #10" -- count plus immortal bit: exactly 1 is unique
+      ins "cmp w10, #1"
+      ins ("b.ne " ++ lSlow)
+      -- Same freed counter and count-zero token as the helper. All child references move
+      -- to the caller, so there is no child walk (also inside an arena).
+      address "x12" "_keel_stats"
+      ins "ldr x13, [x12, #24]"
+      ins "add x13, x13, #1"
+      ins "str x13, [x12, #24]"
+      ins "and w9, w9, #0x3ff"
+      ins "str w9, [x0, #-8]" -- leave the narrow field in the upper half untouched
+      ins ("b " ++ lDone)
+      line (lSlow ++ ":")
+      genericReuse
+      line (lDone ++ ":")
+    else genericReuse
     store slots "x0" tok
     expr slots join rest
+    where
+      genericReuse = movImm "x1" mask >> ins "bl _keel_drop_reuse"
   where
     isNothingJ = case join of
       Nothing -> True
@@ -1054,7 +1105,7 @@ arith it@(IntTy sgn n) ov aop
             else alloc 1 some >> ins "str x12, [x0]"
           ins ("b " ++ lDone)
           line (lOvf ++ ":")
-          atom (Slots M.empty [] Nothing M.empty []) "x0" (ANullary none)
+          atom (Slots M.empty [] Nothing M.empty [] S.empty) "x0" (ANullary none)
           line (lDone ++ ":")
         _ -> pure ()
   where
