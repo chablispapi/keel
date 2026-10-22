@@ -1,0 +1,13 @@
+-- A pair or constructor taken apart where it is built allocates nothing (Keel.Opt): its
+-- components are bound in order, so their effects happen left to right as before. The test
+-- runner checks that this program allocates no block. known-con-panic.kl panics midway.
+
+data List a = Nil | Cons(a, Box (List a))
+
+def first : List i64 -> i64 = \l. case l of { Nil -> 0 | Cons(x, _) -> x }
+
+main =
+  let (a, b) = ((printInt 1; 10), (printInt 2; 20)) in
+  let c = case Some((printInt 3; 5)) of { None -> 0 | Some(x) -> x } in
+  let d = case Cons((printInt 4; 7), box Nil) of { Nil -> 0 | Cons(y, rest) -> y + first (unbox rest) } in
+  a * 1000 + b * 100 + c * 10 + d

@@ -10,7 +10,9 @@
 --    definitions are replaced by their bodies, and constant definitions (@def none = None@,
 --    @array.empty@) by their values, so no top-level value outlives optimization.
 -- 3. __β-reduction.__ @(λx. b) a@ becomes @let x = a in b@, and a @let@ in function position
---    floats out; both keep call-by-value evaluation order.
+--    floats out; both keep call-by-value evaluation order. Likewise a pair or constructor taken
+--    apart where it is built (@let (x, y) = (a, b) in e@, @case C(a) of { C(x) -> e | … }@)
+--    becomes @let@s of its components: no block is allocated.
 -- 4. __Dead definitions__ (not reachable from @main@) are removed.
 --
 -- Inlined code is renamed apart, since the core forbids shadowing. The result is checked
@@ -266,6 +268,10 @@ simplify (Program decls main) = evalState go (0 :: Int)
           e' <- rename e
           beta e' a
         App f a -> beta f a
+        -- A pair or constructor taken apart where it is built: no block, its components bound
+        -- in order (the core forbids shadowing, so no component sees the new names).
+        LetPair x y e b | Pair p q <- stripAt e -> pure (Let x p (Let y q b))
+        Case e alts | Con c _ args <- stripAt e, Just (xs, b) <- lookup c [(c', (xs, b)) | (c', xs, b) <- alts] -> pure (foldr (uncurry Let) b (zip xs args))
         _ -> pure tm'
 
     -- (λx. b) a ⇒ let x = a in b;  (let x = e in b) a ⇒ let x' = e in (b a). The floated

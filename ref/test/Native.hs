@@ -211,6 +211,8 @@ exampleFiles =
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
+  , ("test/syntax/known-con.kl", (Just "12057", "1234"))
+  , ("test/syntax/known-con-panic.kl", (Nothing, "78"))
   , ("test/syntax/const-ops.kl", (Just "930031494736259442", ""))
   , ("test/memory/array32.kl", (Just "142081499369", ""))
   , ("test/memory/array32-print.kl", (Just "[-5, -5, 2147483647, -2147483648]", ""))
@@ -519,6 +521,8 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
                ]
             -- 200,000 pushes and 100,000 updates: arrays not shared are updated in place.
             ++ [failMsg ("expected arrays to be updated in place: " ++ show stats) | name == "test/std/array.kl", maybe True ((> 100) . allocs) stats]
+            -- Pairs and constructors taken apart where they are built are never allocated.
+            ++ [failMsg ("expected no allocation: " ++ show stats) | name == "test/syntax/known-con.kl", maybe True ((/= 0) . allocs) stats]
   where
     failMsg msg = "FAIL " ++ name ++ (if debug then " (-g)" else "") ++ ": " ++ msg
 

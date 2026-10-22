@@ -1,0 +1,3 @@
+-- The second component panics after the first one's output, as without the rewrite.
+
+main = let (a, b) = ((printInt 7; 1), (printInt 8; 1 / 0)) in a + b
