@@ -1,7 +1,10 @@
 -- | x86-64 back end: the lowered IR ("Keel.Lower") → x86-64 assembly for Linux (GNU as, Intel
--- syntax), linked with the C library by @gcc -no-pie@. The structure follows "Keel.RiscV"
--- (each right-hand side computed into the result register, then stored); the hosted runtime
--- (printf, files, KEEL_STATS) follows "Keel.AArch64".
+-- syntax), linked with the C library by @gcc -no-pie@. The code generation follows
+-- "Keel.AArch64": the common right-hand sides are computed straight into their variable's
+-- register from their operands' registers, a comparison only an if uses becomes a branch, a
+-- self tail call moves its arguments into the parameters at once, and a reduction over an
+-- array runs in SSE registers. The rest is computed into rax and stored, as in "Keel.RiscV".
+-- The hosted runtime (printf, files, KEEL_STATS) follows "Keel.AArch64".
 --
 -- Keel's own calling convention: rax = block / result, arguments in rdi, rsi, rdx, rcx, r8, r9,
 -- r10. Variables live in rbx, r12–r15 (callee-saved, as for C) or in stack slots; rbp is the
@@ -18,13 +21,13 @@ import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Bits ((.|.), shiftL)
 import Data.ByteString qualified as B
 import Data.Char (isAscii, isPrint)
-import Data.List (elemIndex)
+import Data.List (elemIndex, nub)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, maxSmall, prepare, printerTypes, template)
+import Keel.AArch64 (Loc (..), Reduction (..), allocate, bound, dataOf, header, maxSmall, prepare, printerTypes, reduction, template, uses)
 import Keel.Lower
 import Keel.Syntax
 import Numeric (showOct)
@@ -174,14 +177,15 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts) = unlines (reverse
 
 -- | A function's frame: where each variable lives and which registers to restore (allocation
 -- as in "Keel.AArch64", with rbx and r12–r15). fLoop: the function's own label, when a call to
--- itself in tail position can jump back to where the arguments are stored.
-data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String}
+-- itself in tail position can move its arguments into the parameters and jump back. fUses: how
+-- often each variable occurs (a comparison used once, by an if, becomes a branch).
+data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop :: Maybe String, fUses :: M.Map String Int, fParams :: [String]}
 
 emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   when (length params > 7) $ error "more than 7 parameters"
   let (locs, saved, frame) = allocate ["rbx", "r12", "r13", "r14", "r15"] f (params ++ env ++ bound body)
-      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing)
+      slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing) (M.fromListWith (+) [(v, 1) | v <- uses body]) params
   line "\t.p2align 4"
   line (lbl ++ ":\t\t\t# " ++ name)
   ins "push rbp"
@@ -191,8 +195,9 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   forM_ (zip [base ..] env) $ \(j, v) -> do
     ins ("mov r11, " ++ mem "rax" (8 * j))
     store slots "r11" v
-  line (".L" ++ lbl ++ "_loop:")
   forM_ (zip [1 ..] params) $ \(r, p) -> store slots (argReg r) p
+  forM_ (fLoop slots >> reduction lbl f) (vectorLoop slots)
+  line (".L" ++ lbl ++ "_loop:")
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "call _keel_drop" -- rax is still the block
   expr slots Nothing body
@@ -242,23 +247,24 @@ expr slots join e = case e of
       Nothing -> leave slots >> ins "ret"
       Just (v, lbl) -> store slots "rax" v >> ins ("jmp " ++ lbl)
   Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> tc
+  -- A comparison used only by the if after it: compare and branch, no 0/1 value.
+  Bind c (RPrim op it a b) (BindIf x (AVar c') ea eb rest)
+    | c == c', op `elem` [Eq, Lt], M.lookup c (fUses slots) == Just 2 -> do
+        ra <- operand slots "r11" a
+        rb <- operandI slots "r10" b
+        ins ("cmp " ++ ra ++ ", " ++ rb)
+        let jElse = if op == Eq then "jne" else if signed it then "jge" else "jae"
+        ifThen x (\l -> ins (jElse ++ " " ++ l)) ea eb rest
   Bind x rhs rest -> do
-    rhsCode slots rhs
-    store slots "rax" x
+    let d = destOf slots x
+    direct <- rhsInto slots d rhs
+    unless direct (rhsCode slots rhs)
+    when (not direct || d == "rax") $ store slots "rax" x
     expr slots join rest
   BindIf x c a b rest -> do
-    let tailPos = isNothingJ && returns x rest
-    lElse <- newLabel
-    lJoin <- newLabel
-    atom slots "r11" c
-    ins "test r11, r11"
-    ins ("jz " ++ lElse)
-    expr slots (target tailPos x lJoin) a
-    line (lElse ++ ":")
-    expr slots (target tailPos x lJoin) b
-    unless tailPos $ do
-      line (lJoin ++ ":")
-      expr slots join rest
+    rc <- operand slots "r11" c
+    ins ("test " ++ rc ++ ", " ++ rc)
+    ifThen x (\l -> ins ("jz " ++ l)) a b rest
   BindCase x s bs rest -> do
     let tailPos = isNothingJ && returns x rest
     lJoin <- newLabel
@@ -294,6 +300,20 @@ expr slots join e = case e of
     returns _ _ = False
     target tailPos x lJoin = if tailPos then Nothing else Just (x, lJoin)
 
+    -- let x = (if … then a else b) in rest, with @jumpElse l@ branching to the else part.
+    ifThen :: String -> (String -> G ()) -> Expr -> Expr -> Expr -> G ()
+    ifThen x jumpElse a b rest = do
+      let tailPos = isNothingJ && returns x rest
+      lElse <- newLabel
+      lJoin <- newLabel
+      jumpElse lElse
+      expr slots (target tailPos x lJoin) a
+      line (lElse ++ ":")
+      expr slots (target tailPos x lJoin) b
+      unless tailPos $ do
+        line (lJoin ++ ":")
+        expr slots join rest
+
     tailCall rhs = case rhs of
       RCall f a -> Just $ do
         atom slots "rax" f
@@ -301,11 +321,14 @@ expr slots join e = case e of
         ins ("mov r11, " ++ mem "rax" 0)
         leave slots
         ins "jmp r11"
-      RCallKnown i as -> Just $ do
-        forM_ (zip [1 ..] as) $ \(r, a) -> atom slots (argReg r) a
-        if fLoop slots == Just ("_kf_" ++ show i)
-          then ins ("jmp .L_kf_" ++ show i ++ "_loop")
-          else leave slots >> ins ("jmp _kf_" ++ show i)
+      RCallKnown i as
+        | fLoop slots == Just ("_kf_" ++ show i) -> Just $ do
+            moves slots [(fLocs slots M.! p, a) | (p, a) <- zip (fParams slots) as]
+            ins ("jmp .L_kf_" ++ show i ++ "_loop")
+        | otherwise -> Just $ do
+            forM_ (zip [1 ..] as) $ \(r, a) -> atom slots (argReg r) a
+            leave slots
+            ins ("jmp _kf_" ++ show i)
       RProj a i -> Just $ do
         atom slots "rax" a
         ins "xor edi, edi"
@@ -313,6 +336,223 @@ expr slots join e = case e of
         leave slots
         ins "jmp r11"
       _ -> Nothing
+
+-- | The register holding an atom: its own, if it lives in one; otherwise it is loaded into r.
+operand :: Slots -> String -> Atom -> G String
+operand slots r a = case a of
+  AVar v | InReg x <- fLocs slots M.! v -> pure x
+  _ -> atom slots r a >> pure r
+
+-- | An instruction's second operand: a 32-bit immediate, or a register.
+operandI :: Slots -> String -> Atom -> G String
+operandI slots r a = case a of
+  AInt n | n >= -(2 ^ (31 :: Int)), n < 2 ^ (31 :: Int) -> pure (show n)
+  _ -> operand slots r a
+
+-- | Where a variable is computed: its own register, or rax when it lives in a slot.
+destOf :: Slots -> String -> String
+destOf slots x = case fLocs slots M.! x of
+  InReg r -> r
+  InSlot _ -> "rax"
+
+-- | The common right-hand sides, computed straight into register d from their operands'
+-- registers; False for the rest (rhsCode computes those into rax). d is written only after
+-- the operands are read, or through r11, since it may share a register with an operand that
+-- dies here.
+rhsInto :: Slots -> String -> Rhs -> G Bool
+rhsInto slots d rhs = case rhs of
+  RAtom a -> atom slots d a >> pure True
+  RPrim Eq _ a b -> compare' a b "sete"
+  RPrim Lt it a b -> compare' a b (if signed it then "setl" else "setb")
+  RPrim (Arith ov aop) (IntTy sgn 64) a b
+    | ov `elem` [Wrap, Checked], aop `elem` [Add, Sub] || (aop == Mul && (sgn || ov == Wrap)) -> do
+        binop (case aop of Add -> "add"; Sub -> "sub"; _ -> "imul") (aop /= Sub) (aop /= Mul) a b
+        when (ov == Checked) $ ins ((if sgn then "jo" else "jc") ++ " _keel_panic_overflow")
+        pure True
+  -- Canonical (sign- or zero-extended) operands give a canonical result: any width.
+  RPrim (Bits bop) _ a b | bop `elem` [And, Or, Xor] -> do
+    binop (case bop of And -> "and"; Or -> "or"; _ -> "xor") True True a b
+    pure True
+  -- A shift by a constant in range: one instruction. A right shift of a canonical value stays
+  -- canonical; a left shift only at 64 bits, where nothing needs re-extending.
+  RPrim (Bits bop) (IntTy sgn n) a (AInt k)
+    | k >= 0, k < 64, bop == Shr || (bop == Shl && n == 64) -> do
+        ra <- operand slots "r11" a
+        unless (ra == d) $ ins ("mov " ++ d ++ ", " ++ ra)
+        ins ((if bop == Shl then "shl " else if sgn then "sar " else "shr ") ++ d ++ ", " ++ show k)
+        pure True
+  -- Division by a constant that is neither 0 nor -1 can't panic.
+  RPrim (Arith Checked aop) (IntTy sgn _) a (AInt k)
+    | aop `elem` [Div, Rem], k /= 0, k /= -1 || not sgn -> do
+        atom slots "rax" a
+        li "r10" k
+        if sgn then ins "cqo" >> ins "idiv r10" else ins "xor edx, edx" >> ins "div r10"
+        let r = if aop == Div then "rax" else "rdx"
+        unless (r == d) $ ins ("mov " ++ d ++ ", " ++ r)
+        pure True
+  RField a i -> do
+    ra <- operand slots "r11" a
+    ins ("mov " ++ d ++ ", " ++ mem ra (8 * i))
+    pure True
+  RHeader a sgn -> do
+    ra <- operand slots "r11" a
+    ins (narrowLoad sgn d ++ mem32 ra (-4))
+    pure True
+  -- To a 64-bit type the canonical form doesn't change: a move.
+  RConv to a | bits to == 64 -> atom slots d a >> pure True
+  RArray ALength _ [a] -> do
+    ra <- operand slots "r11" a
+    ins ("mov " ++ d ++ ", " ++ mem ra 0)
+    pure True
+  RArray AGet e [a, i] -> do
+    ra <- operand slots "r11" a
+    ri <- operand slots "r10" i
+    ins ("cmp " ++ ri ++ ", " ++ mem ra 0)
+    ins "jae _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
+    elementInto e d ra ri
+    pure True
+  RIndex a i e -> do
+    ra <- operand slots "r11" a
+    ri <- operand slots "r10" i
+    elementInto e d ra ri
+    pure True
+  _ -> pure False
+  where
+    compare' a b set = do
+      ra <- operand slots "r11" a
+      rb <- operandI slots "r10" b
+      ins ("cmp " ++ ra ++ ", " ++ rb)
+      ins (set ++ " al")
+      ins ("movzx " ++ w32 d ++ ", al")
+      pure True
+    -- d = a op b, in x86's two-operand form; b may be an immediate (not for imul's).
+    binop op commutative immOk a b = do
+      ra <- operand slots "r11" a
+      rb <- (if immOk then operandI else operand) slots "r10" b
+      case () of
+        _
+          | ra == d -> ins (op ++ " " ++ d ++ ", " ++ rb)
+          | rb == d && commutative -> ins (op ++ " " ++ d ++ ", " ++ ra)
+          | rb == d -> do
+              unless (ra == "r11") $ ins ("mov r11, " ++ ra)
+              ins (op ++ " r11, " ++ rb)
+              ins ("mov " ++ d ++ ", r11")
+          | otherwise -> ins ("mov " ++ d ++ ", " ++ ra) >> ins (op ++ " " ++ d ++ ", " ++ rb)
+
+-- | Load element ri of array ra into d.
+elementInto :: Elem -> String -> String -> String -> G ()
+elementInto e d ra ri = case e of
+  ENarrow sgn -> ins (narrowLoad sgn d ++ "dword ptr [" ++ ra ++ " + " ++ ri ++ "*4 + 16]")
+  _ -> ins ("mov " ++ d ++ ", qword ptr [" ++ ra ++ " + " ++ ri ++ "*8 + 16]")
+
+-- | Move atoms into locations all at once (a self tail call's arguments into its parameters):
+-- a move waits while its destination is still to be read; a cycle goes through a scratch
+-- register (at most three cycles among seven parameters). r11 carries slot-to-slot moves.
+moves :: Slots -> [(Loc, Atom)] -> G ()
+moves slots ms0 = go [(d, src a) | (d, a) <- ms0, src a /= Left d] ["r8", "r9", "r10", "rdx", "rcx", "rsi"]
+  where
+    src a = case a of
+      AVar v -> Left (fLocs slots M.! v)
+      _ -> Right a
+    go [] _ = pure ()
+    go ms scratch = case [m | m@(d, _) <- ms, Left d `notElem` map snd ms] of
+      m : _ -> move m >> go (filter (/= m) ms) scratch
+      [] -> case (ms, scratch) of
+        ((d, _) : _, r : rs) -> do
+          move (InReg r, Left d)
+          go [(d', if s' == Left d then Left (InReg r) else s') | (d', s') <- ms] rs
+        _ -> error "moves: out of scratch registers"
+    move (d, s) = case (d, s) of
+      (InReg r, Left l) -> load r l
+      (InReg r, Right a) -> atom slots r a
+      (InSlot i, Left (InReg r)) -> ins ("mov " ++ mem "rsp" (8 * i) ++ ", " ++ r)
+      (InSlot i, Left l) -> load "r11" l >> ins ("mov " ++ mem "rsp" (8 * i) ++ ", r11")
+      (InSlot i, Right a) -> atom slots "r11" a >> ins ("mov " ++ mem "rsp" (8 * i) ++ ", r11")
+    load r l = case l of
+      InReg x -> unless (x == r) $ ins ("mov " ++ r ++ ", " ++ x)
+      InSlot i -> ins ("mov " ++ r ++ ", " ++ mem "rsp" (8 * i))
+
+-- | A reduction over an array ("Keel.AArch64".reduction) four elements at a time in SSE
+-- registers, two 64-bit lanes each: from the current i to the last multiple of four before
+-- the end, then the scalar loop does the rest. 4-byte elements are widened as they are loaded
+-- (pmovsxdq / pmovzxdq, SSE4.1). With a checked acc + e the result is kept only if every e was
+-- ≥ 0 and no lane's sum overflowed, as on ARM: then the checked adds of the lanes panic
+-- exactly when the scalar loop would; otherwise the scalar loop redoes those elements (the
+-- loop is pure).
+--
+-- Registers: xmm0, xmm1 the lane sums, xmm2, xmm3 the sign bits seen (two chains), xmm4 the
+-- ORs feeding them, xmm5–xmm7 the invariants and constants, xmm8, xmm9 the elements,
+-- xmm10–xmm15 the other values (two each).
+vectorLoop :: Slots -> Reduction -> G ()
+vectorLoop slots red = when (length scalars <= 3 && length (rNodes red) <= 3) $ do
+  lSkip <- newLabel
+  lLoop <- newLabel
+  atom slots "r11" (AVar (rXs red))
+  atom slots "r10" (AVar (rI red))
+  ins "mov rcx, qword ptr [r11]"
+  ins "sub rcx, r10"
+  ins "cmp rcx, 4"
+  ins ("jl " ++ lSkip)
+  ins "and rcx, -4"
+  ins ("lea r8, [r11 + r10*" ++ show size ++ " + 16]")
+  ins ("lea r9, [r8 + rcx*" ++ show size ++ "]")
+  forM_ ["xmm0", "xmm1", "xmm2", "xmm3"] $ \x -> ins ("pxor " ++ x ++ ", " ++ x)
+  forM_ (zip scalars [5 :: Int ..]) $ \(a, k) -> do
+    atom slots "rdx" a
+    ins ("movq xmm" ++ show k ++ ", rdx")
+    ins ("punpcklqdq xmm" ++ show k ++ ", xmm" ++ show k)
+  line (lLoop ++ ":")
+  case rElem red of
+    ENarrow sgn -> do
+      let x = if sgn then "pmovsxdq" else "pmovzxdq"
+      ins (x ++ " xmm8, qword ptr [r8]")
+      ins (x ++ " xmm9, qword ptr [r8 + 8]")
+    _ -> ins "movdqu xmm8, xmmword ptr [r8]" >> ins "movdqu xmm9, xmmword ptr [r8 + 16]"
+  ins ("add r8, " ++ show (4 * size))
+  forM_ (rNodes red) $ \(t, op, a, b) -> forM_ [0, 1] $ \h -> do
+    ins ("movdqa " ++ vreg (AVar t) h ++ ", " ++ vreg a h)
+    ins (opName op ++ " " ++ vreg (AVar t) h ++ ", " ++ vreg b h)
+  let e = AVar (rE red)
+  forM_ [0, 1] $ \h -> ins ("paddq xmm" ++ show h ++ ", " ++ vreg e h)
+  when (rChecked red) $ do
+    ins ("movdqa xmm4, " ++ vreg e 0)
+    ins ("por xmm4, " ++ vreg e 1)
+    ins "por xmm2, xmm4"
+    ins "movdqa xmm4, xmm0"
+    ins "por xmm4, xmm1"
+    ins "por xmm3, xmm4"
+  ins "cmp r8, r9"
+  ins ("jne " ++ lLoop)
+  when (rChecked red) $ do
+    ins "por xmm2, xmm3"
+    ins "movmskpd edx, xmm2" -- the lanes' sign bits
+    ins "test edx, edx"
+    ins ("jnz " ++ lSkip)
+  atom slots "rsi" (AVar (rAcc red))
+  forM_ [(x, lane) | x <- ["xmm0", "xmm1"], lane <- [0, 1 :: Int]] $ \(x, lane) -> do
+    ins (if lane == 0 then "movq rdx, " ++ x else "pextrq rdx, " ++ x ++ ", 1")
+    ins "add rsi, rdx"
+    when (rChecked red) $ ins "jo _keel_panic_overflow"
+  ins "add r10, rcx"
+  store slots "r10" (rI red)
+  store slots "rsi" (rAcc red)
+  line (lSkip ++ ":")
+  where
+    size = case rElem red of
+      ENarrow _ -> 4 :: Int
+      _ -> 8
+    temps = rElems red ++ [t | (t, _, _, _) <- rNodes red]
+    scalars = nub [o | (_, _, a, b) <- rNodes red, o <- [a, b], case o of AVar v -> v `notElem` temps; _ -> True]
+    vreg a h = case a of
+      AVar v | v `elem` rElems red -> "xmm" ++ show (8 + h :: Int)
+      AVar v | Just k <- elemIndex v [t | (t, _, _, _) <- rNodes red] -> "xmm" ++ show (10 + 2 * k + h)
+      _ -> "xmm" ++ show (5 + fromMaybe 0 (elemIndex a scalars))
+    opName op = case op of
+      Bits And -> "pand"
+      Bits Or -> "por"
+      Bits Xor -> "pxor"
+      Arith _ Sub -> "psubq"
+      _ -> "paddq"
 
 -- | Allocate a block into rax (header written). Clobbers rax, rcx, rdx, rsi, rdi only.
 alloc :: Int -> Integer -> G ()
@@ -414,7 +654,26 @@ rhsCode slots rhs = case rhs of
       AEmpty -> ins "xor eax, eax" >> li "rdi" (elemKind e) >> ins "call _keel_array_alloc"
       ANew -> li "rsi" (elemKind e) >> ins "call _keel_array_new"
       ASet -> ins "call _keel_array_set"
-      APush -> ins "call _keel_array_push"
+      -- A unique array with room: store and count, without calling the runtime.
+      APush -> do
+        lSlow <- newLabel
+        lDone <- newLabel
+        ins "mov rcx, qword ptr [rax]"
+        ins "cmp rcx, qword ptr [rax + 8]"
+        ins ("jae " ++ lSlow)
+        ins "mov edx, dword ptr [rax - 8]"
+        ins "shr edx, 10"
+        ins "cmp edx, 1"
+        ins ("jne " ++ lSlow)
+        ins $ case e of
+          ENarrow _ -> "mov dword ptr [rax + rcx*4 + 16], edi"
+          _ -> "mov qword ptr [rax + rcx*8 + 16], rdi"
+        ins "inc rcx"
+        ins "mov qword ptr [rax], rcx"
+        ins ("jmp " ++ lDone)
+        line (lSlow ++ ":")
+        ins "call _keel_array_push"
+        line (lDone ++ ":")
       _ -> ins "call _keel_array_pop"
   where
     storeAll :: Int -> [String] -> G ()
@@ -499,7 +758,7 @@ arith it@(IntTy sgn n) ov aop
             else alloc 1 some >> ins ("mov " ++ mem "rax" 0 ++ ", r8")
           ins ("jmp " ++ lDone)
           line (lOvf ++ ":")
-          atom (Slots M.empty [] Nothing) "rax" (ANullary none)
+          atom (Slots M.empty [] Nothing M.empty []) "rax" (ANullary none)
           line (lDone ++ ":")
         _ -> pure ()
   where

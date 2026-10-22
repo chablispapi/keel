@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template) where
+module Keel.AArch64 (compileNative, compileNativeWith, emitProgram, prepare, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)

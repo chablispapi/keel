@@ -36,17 +36,19 @@ through its x86-64 back end (`Keel.X86`). Best of 3, ms / MB; every row the same
 
 | benchmark | keel | goose | best C++ | C++ new/delete | best Rust | Rust Box |
 |---|---:|---:|---:|---:|---:|---:|
-| sum 16M | 1186 / 64 | 179 / 65 | 238 / 65 | – | 182 / 63 | – |
-| sum 128M | 9458 / 492 | 1401 / 491 | 1882 / 492 | – | 1449 / 490 | – |
-| tree 20 | 245 / 34 | 138 / 26 | 148 / 28 | 300 / 68 | 170 / 26 | 322 / 66 |
-| tree 24 | 4020 / 514 | 2263 / 386 | 2159 / 388 | 4769 / 1028 | 2715 / 386 | 5124 / 1026 |
-| bintrees 17 | 305 / 14 | 132 / 15 | 180 / 15 | 1768 / 20 | 259 / 15 | 2276 / 18 |
-| bintrees 19 | 1473 / 26 | 604 / 27 | 814 / 36 | 8515 / 68 | 1185 / 26 | 11155 / 66 |
+| sum 16M | 354 / 64 | 178 / 65 | 243 / 65 | – | 186 / 63 | – |
+| sum 128M | 2809 / 492 | 1406 / 491 | 1887 / 492 | – | 1446 / 490 | – |
+| tree 20 | 201 / 34 | 138 / 26 | 148 / 28 | 296 / 68 | 169 / 26 | 319 / 66 |
+| tree 24 | 3301 / 514 | 2258 / 386 | 2160 / 388 | 4718 / 1028 | 2735 / 386 | 5070 / 1026 |
+| bintrees 17 | 289 / 14 | 132 / 14 | 179 / 14 | 1763 / 20 | 260 / 14 | 2296 / 18 |
+| bintrees 19 | 1398 / 26 | 604 / 27 | 814 / 36 | 8526 / 68 | 1186 / 26 | 11105 / 66 |
 
-The x86 back end is the simple code generator (as for RISC-V): every value goes through rax
-and its home, no compare-and-branch, no vector loop. So it trails more than on ARM: sum 6.6×
-behind Goose (the scalar loop, where ARM's is vectorized), tree 1.8×, bintrees 2.4×; still
-ahead of per-node C++ and Rust on tree and bintrees.
+With the ARM back end's optimizations ported (values computed straight into their registers,
+compare-and-branch, self tail calls as parallel moves, inline push, the reduction vectorized
+with SSE4.1): sum 2× behind Goose (was 6.6×), tree 1.5× (1.8×), bintrees 2.3× (2.4×); at the
+same memory as Goose but tree's, and ahead of per-node C++ and Rust on tree and bintrees.
+First version of the x86 back end, for comparison: sum 16M 1186 ms, tree 24 4020, bintrees 19
+1473.
 
 ## What each change did
 
