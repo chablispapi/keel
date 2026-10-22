@@ -427,6 +427,15 @@ infer env tm = case tm of
         pure (Perform op a', tr, S.insert l ea)
   Perform op a -> infer env (App (Var op) a)
   ArrayPrim op _ args -> infer env (foldl App (Var (concat [n | (n, o) <- arrayOps, o == op])) args)
+  -- arena f is typed as f (); Lower checks that nothing allocated inside can escape.
+  App (Var x) f
+    | Nothing <- M.lookup x (eLocals env)
+    , not (M.member x (sDefs sig))
+    , Just AArena <- lookup x arrayOps -> do
+        (call, r, eff) <- infer env (App f UnitLit)
+        case call of
+          App f' _ -> pure (ArrayPrim AArena r [f'], r, eff)
+          _ -> failWith Mismatch "arena takes a function of Unit: arena (\\u. e)"
   App _ _
     | (Var x, args) <- appSpine tm
     , Nothing <- M.lookup x (eLocals env)

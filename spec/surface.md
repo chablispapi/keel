@@ -194,6 +194,12 @@ through `set` and `push` runs as fast as mutation (spec/memory.md). The built-in
 always applied to all their arguments; `std.array` has them as functions. An index out of range
 panics.
 
+**Arenas:** `arena (\u. e)` is `e`, but everything `e` allocates is freed at once when it returns
+instead of block by block (spec/memory.md, "Arenas"). keelc only accepts it when nothing
+allocated inside can escape: the result and every local `e` uses must not be pointers (data,
+pairs, closures, arrays), and `e` may perform only built-in effects. For example, building a
+tree, measuring it and dropping it: `arena (\u. size (build 20))`.
+
 ## Error messages
 
 Errors name the file, line and column of the innermost expression involved, and show the line:

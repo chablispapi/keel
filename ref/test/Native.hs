@@ -208,6 +208,7 @@ exampleFiles =
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
+  , ("test/memory/arena.kl", (Just "13840", "1031\n"))
   , ("test/std/borrow.kl", (Just "745", ""))
   , ("test/std/array.kl", (Just "(Cons(Cons(110, box Cons(105, box Cons(108, box Nil))), box Cons(Cons(111, box Cons(110, box Cons(101, box Nil))), box Nil)), 100000)", "4999950000\n9592\nzero\nnil\n"))
   , ("selfhost/lex.kl", (Just "27", "1:1 keyword def\n1:5 ident f\n1:7 sym :\n1:9 ident i64\n1:13 sym ->\n1:15 sym {\n1:16 effvar e\n1:18 sym }\n1:20 ident i64\n1:24 sym =\n1:26 sym \\\n1:27 ident x\n1:28 sym .\n1:30 ident x\n1:32 sym +?\n1:35 num 7936\n1:42 sym ;\n2:1 str \"a\\\"bA\\n\"\n2:14 char 97\n2:18 char 10\n2:23 char 65\n2:47 num 250u8\n2:53 sym ..\n2:56 ident q\n2:57 sym .\n2:58 upper Name\n3:3 error unexpected letter after a number\n"))
@@ -305,6 +306,20 @@ selfhostChecks dir = do
         isDir <- doesDirectoryExist e
         if isDir then klFiles e else pure [e | ".kl" `isSuffixOf` e]
 
+-- | Programs that type-check but that keelc must refuse to compile, with this message.
+compileErrors :: [(FilePath, String)]
+compileErrors =
+  [ ("test/memory/arena-escape.kl", "arena: the result is a pointer (Tree)")
+  , ("test/memory/arena-capture.kl", "arena: it uses t : Tree from outside")
+  ]
+
+checkCompileError :: (FilePath, String) -> IO [String]
+checkCompileError (path, expected) = do
+  loaded <- loadModules path
+  pure $ case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileNative of
+    Left e | expected `isInfixOf` e -> []
+    r -> ["FAIL " ++ path ++ ": " ++ either id (const "compiled") r]
+
 checkModuleError :: (FilePath, String) -> IO [String]
 checkModuleError (path, expected) =
   loadModules path >>= \case
@@ -332,7 +347,7 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
-  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, lspChecks, selfhostChecks dir]
+  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir]
   let programs = cases ++ specCases ++ concatMap snd loaded
   failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir False))
   -- The examples have source positions: build them again with debug info.
@@ -345,7 +360,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ debugFailures ++ refused
-      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + 2
+      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 2
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-

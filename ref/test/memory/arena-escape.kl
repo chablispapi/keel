@@ -1,0 +1,2 @@
+data Tree = Leaf | Node(Box Tree, Box Tree)
+main = arena (\u. Node(box Leaf, box Leaf))

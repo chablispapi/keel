@@ -106,6 +106,7 @@ eval hs env tm = case tm of
     va <- eval hs env a
     vb <- eval hs env b
     prim op va vb
+  ArrayPrim AArena _ [f] -> eval hs env (App f UnitLit)
   ArrayPrim op _ args -> mapM (eval hs env) args >>= array op
   If c a b -> do
     vc <- eval hs env c

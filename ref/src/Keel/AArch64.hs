@@ -130,7 +130,15 @@ emitProgram decls mainTy (LProg funs statics mainF locs) = unlines (reverse (gsL
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
       ins (".quad _keel_heap+" ++ show nativeHeapSize)
+      -- The lowest open arena's start; all ones while none is open. And the innermost one.
+      line "_keel_arena_base:"
+      ins ".quad -1"
+      line "_keel_arena_top:"
+      ins ".quad 0"
+      line "_keel_fl:"
+      ins ".quad _keel_freelists"
       line ("\t.zerofill __DATA,__bss,_keel_freelists," ++ show (8 * (maxSmall + 1)) ++ ",3")
+      line ("\t.zerofill __DATA,__bss,_keel_nofree," ++ show (8 * (maxSmall + 1)) ++ ",3")
       line "\t.zerofill __DATA,__bss,_keel_stats,32,3"
       line "\t.zerofill __DATA,__bss,_keel_handlers,8,3"
       -- Last, so the runtime's other data stays within adrp's ±4 GB of the code.
@@ -239,6 +247,7 @@ uses e = case e of
       RPerform _ a -> av a
       RConv _ a -> av a
       RArray _ _ as -> concatMap av as
+      RArena _ -> []
 
 -- | Variables bound in a body.
 bound :: Expr -> [String]
@@ -638,6 +647,8 @@ rhsCode slots rhs = case rhs of
     atom slots "x1" a
     movImm "x0" (toInteger n)
     ins "bl _keel_perform"
+  RArena True -> ins "bl _keel_arena_open"
+  RArena False -> ins "bl _keel_arena_close"
   -- Arrays (spec/memory.md): length and get read the block; the rest are runtime routines.
   RArray ALength _ [a] -> atom slots "x9" a >> ins "ldr x0, [x9]"
   RArray AGet _ [a, i] -> do
@@ -975,7 +986,10 @@ emitRuntime = do
   fn "_keel_alloc"
   ins ("cmp x0, #" ++ show maxSmall)
   ins "b.hi L_alloc_bump"
-  address "x13" "_keel_freelists"
+  -- The free lists, or an empty table while an arena is open: then everything comes from the
+  -- bump pointer, so all of it lies above the arena's start and goes when it closes.
+  ins "adrp x13, _keel_fl@PAGE"
+  ins "ldr x13, [x13, _keel_fl@PAGEOFF]"
   ins "ldr x14, [x13, x0, lsl #3]"
   ins "cbz x14, L_alloc_bump"
   ins "ldr x15, [x14]" -- next free block
@@ -1001,6 +1015,67 @@ emitRuntime = do
   ins "mov x0, x14"
   ins "ret"
 
+  -- Arenas (spec/memory.md). Opening one takes a record [base before, enclosing record, bump
+  -- allocations so far] from the bump pointer; while any is open, _keel_drop leaves blocks at
+  -- or above _keel_arena_base (the outermost record) alone. Closing resets the bump pointer to
+  -- the record: everything allocated since is freed at once, and counted as freed.
+  fn "_keel_arena_open"
+  address "x13" "_keel_heap_ptr"
+  ins "ldr x14, [x13]"
+  ins "add x15, x14, #24"
+  ins "ldr x16, [x13, #8]"
+  ins "cmp x15, x16"
+  ins "b.hi _keel_panic_oom"
+  ins "str x15, [x13]"
+  address "x10" "_keel_arena_base"
+  ins "ldr x11, [x10]"
+  address "x12" "_keel_arena_top"
+  ins "ldr x9, [x12]"
+  ins "stp x11, x9, [x14]"
+  address "x15" "_keel_stats"
+  ins "ldr x15, [x15]"
+  ins "str x15, [x14, #16]"
+  ins "str x14, [x12]"
+  ins "cmp x11, x14"
+  ins "csel x11, x11, x14, lo"
+  ins "str x11, [x10]"
+  address "x10" "_keel_nofree"
+  address "x11" "_keel_fl"
+  ins "str x10, [x11]"
+  ins "mov x0, #0"
+  ins "ret"
+
+  fn "_keel_arena_close"
+  address "x12" "_keel_arena_top"
+  ins "ldr x14, [x12]"
+  ins "ldp x11, x9, [x14]"
+  address "x10" "_keel_arena_base"
+  ins "str x11, [x10]"
+  ins "str x9, [x12]"
+  address "x13" "_keel_stats"
+  ins "ldr x15, [x13]"
+  ins "ldr x16, [x14, #16]"
+  ins "sub x15, x15, x16"
+  ins "ldr x16, [x13, #24]"
+  ins "add x16, x16, x15"
+  ins "str x16, [x13, #24]"
+  -- … and not again when the enclosing arena closes.
+  ins "cbz x9, L_close_outermost"
+  ins "ldr x16, [x9, #16]"
+  ins "add x16, x16, x15"
+  ins "str x16, [x9, #16]"
+  line "L_close_outermost:"
+  address "x13" "_keel_heap_ptr"
+  ins "str x14, [x13]"
+  ins "cmn x11, #1" -- the outermost arena closed: the free lists are back
+  ins "b.ne L_close_ret"
+  address "x10" "_keel_freelists"
+  address "x11" "_keel_fl"
+  ins "str x10, [x11]"
+  line "L_close_ret:"
+  ins "mov x0, #0"
+  ins "ret"
+
   -- _keel_drop: x0 = block. Decrement; at zero, drop the children and free the block. The last
   -- pointer child is handled by looping, so dropping a long list uses constant stack.
   fn "_keel_drop"
@@ -1013,6 +1088,10 @@ emitRuntime = do
   ins "sub w9, w9, #1"
   ins "str w9, [x0, #-8]"
   ins "cbnz w9, L_drop_ret"
+  address "x12" "_keel_arena_base"
+  ins "ldr x12, [x12]"
+  ins "cmp x0, x12"
+  ins "b.hs L_drop_ret" -- in an open arena: freed when it closes
   stat 24 "x12" "x13"
   ins "str x0, [sp, #16]"
   ins "ldr x11, [x0, #-8]"
@@ -1215,6 +1294,10 @@ emitRuntime = do
   ins "cmp w12, #1"
   ins "b.ne L_aclone_shared"
   ins "str wzr, [x9, #-8]"
+  address "x12" "_keel_arena_base"
+  ins "ldr x12, [x12]"
+  ins "cmp x9, x12"
+  ins "b.hs L_aclone_ret" -- in an open arena: freed when it closes
   stat 24 "x12" "x13"
   ins "str x0, [sp, #32]"
   ins "mov x0, x9"

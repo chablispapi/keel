@@ -135,8 +135,16 @@ emitProgram decls mainTy (LProg funs statics mainF _) = Right (unlines (reverse 
       line "_keel_heap_ptr:"
       ins ".dword _keel_heap"
       ins (".dword _keel_heap+" ++ show heapSize)
+      line "_keel_arena_base:" -- as in "Keel.AArch64"
+      ins ".dword -1"
+      line "_keel_arena_top:"
+      ins ".dword 0"
+      line "_keel_fl:"
+      ins ".dword _keel_freelists"
       -- Zero-initialized state lives in .data so it needs no clearing at startup.
       line "_keel_freelists:"
+      ins (".zero " ++ show (8 * (maxSmall + 1)))
+      line "_keel_nofree:"
       ins (".zero " ++ show (8 * (maxSmall + 1)))
       line "_keel_stats:"
       ins ".zero 32"
@@ -399,6 +407,8 @@ rhsCode slots rhs = case rhs of
     ins "call _keel_perform"
   RConv to a -> atom slots "a0" a >> canonical to
   -- Arrays: as in "Keel.AArch64".
+  RArena True -> ins "call _keel_arena_open"
+  RArena False -> ins "call _keel_arena_close"
   RArray ALength _ [a] -> atom slots "t0" a >> ins "ld a0, 0(t0)"
   RArray AGet _ [a, i] -> do
     atom slots "t0" a
@@ -705,7 +715,8 @@ emitRuntime = do
   fn "_keel_alloc"
   li "t4" (toInteger maxSmall)
   ins "bgtu a0, t4, .L_alloc_bump"
-  ins "la t4, _keel_freelists"
+  ins "la t4, _keel_fl" -- the free lists, or an empty table while an arena is open
+  ins "ld t4, 0(t4)"
   ins "slli t5, a0, 3"
   ins "add t4, t4, t5"
   ins "ld t5, 0(t4)"
@@ -734,6 +745,65 @@ emitRuntime = do
   ins "mv a0, t5"
   ins "ret"
 
+  -- Arenas: as in "Keel.AArch64".
+  fn "_keel_arena_open"
+  ins "la t4, _keel_heap_ptr"
+  ins "ld t5, 0(t4)"
+  ins "addi t6, t5, 24"
+  ins "ld a6, 8(t4)"
+  jumpIf "bgtu" ["t6", "a6"] "_keel_panic_oom"
+  ins "sd t6, 0(t4)"
+  ins "la t4, _keel_arena_base"
+  ins "ld t6, 0(t4)"
+  ins "sd t6, 0(t5)"
+  ins "la a6, _keel_arena_top"
+  ins "ld a1, 0(a6)"
+  ins "sd a1, 8(t5)"
+  ins "sd t5, 0(a6)"
+  ins "la a1, _keel_stats"
+  ins "ld a1, 0(a1)"
+  ins "sd a1, 16(t5)"
+  jumpIf "bltu" ["t6", "t5"] ".L_arena_keep"
+  ins "sd t5, 0(t4)"
+  line ".L_arena_keep:"
+  ins "la t4, _keel_nofree"
+  ins "la t5, _keel_fl"
+  ins "sd t4, 0(t5)"
+  ins "li a0, 0"
+  ins "ret"
+
+  fn "_keel_arena_close"
+  ins "la a6, _keel_arena_top"
+  ins "ld t5, 0(a6)"
+  ins "ld t6, 8(t5)"
+  ins "sd t6, 0(a6)"
+  ins "ld t6, 0(t5)"
+  ins "la t4, _keel_arena_base"
+  ins "sd t6, 0(t4)"
+  ins "addi t6, t6, 1" -- the outermost arena closed: the free lists are back
+  jumpIf "bnez" ["t6"] ".L_close_inner"
+  ins "la t4, _keel_freelists"
+  ins "la t6, _keel_fl"
+  ins "sd t4, 0(t6)"
+  line ".L_close_inner:"
+  ins "la t4, _keel_stats"
+  ins "ld t6, 0(t4)"
+  ins "ld a1, 16(t5)"
+  ins "sub t6, t6, a1"
+  ins "ld a1, 24(t4)"
+  ins "add a1, a1, t6"
+  ins "sd a1, 24(t4)"
+  ins "ld a1, 8(t5)" -- … and not again when the enclosing arena closes
+  jumpIf "beqz" ["a1"] ".L_close_outermost"
+  ins "ld a6, 16(a1)"
+  ins "add a6, a6, t6"
+  ins "sd a6, 16(a1)"
+  line ".L_close_outermost:"
+  ins "la t4, _keel_heap_ptr"
+  ins "sd t5, 0(t4)"
+  ins "li a0, 0"
+  ins "ret"
+
   -- _keel_drop: a0 = block; the last pointer child is handled by looping.
   fn "_keel_drop"
   ins "addi sp, sp, -32"
@@ -745,6 +815,9 @@ emitRuntime = do
   ins "addiw t0, t0, -1"
   ins "sw t0, -8(a0)"
   ins "bnez t0, .L_drop_ret"
+  ins "la t3, _keel_arena_base"
+  ins "ld t3, 0(t3)"
+  jumpIf "bgeu" ["a0", "t3"] ".L_drop_ret" -- in an open arena: freed when it closes
   stat 24
   ins "sd a0, 0(sp)"
   ins "ld t2, -8(a0)"
@@ -923,6 +996,9 @@ emitRuntime = do
   ins "li t3, 1"
   ins "bne t2, t3, .L_aclone_shared"
   ins "sw zero, -8(t0)"
+  ins "la t1, _keel_arena_base"
+  ins "ld t1, 0(t1)"
+  jumpIf "bgeu" ["t0", "t1"] ".L_aclone_ret" -- in an open arena: freed when it closes
   stat 24
   ins "sd a0, 8(sp)"
   ins "mv a0, t0"

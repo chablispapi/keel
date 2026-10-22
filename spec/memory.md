@@ -125,6 +125,20 @@ and 100,000 updates with 36 allocations.
   `allocs recycled inplace freed live`. The native test suite runs every program this way and
   requires `live=0` at exit: **no program leaks**.
 
+## Arenas
+
+`arena (\u. e)` evaluates `e` and frees everything it allocated at once (the arena rows of
+Goose's benchmarks, and the "compile-time-sized arenas" of M2, without the compile-time size).
+Opening one records the bump pointer; while any is open, allocation skips the free lists (so
+everything allocated inside lies above that mark) and `drop` leaves blocks above the outermost
+open arena's mark alone: no child walk, no free list. Closing resets the bump pointer to the
+mark. Arenas nest; an inner one's memory is reused by the outer one after it closes.
+
+Nothing allocated inside may survive, which keelc checks when lowering: the result and every
+captured local are not pointers, and `e` performs only built-in effects (a user handler's clause
+could hand a pointer in or out). Counting still happens inside (in-place updates need it), and
+the statistics count an arena's blocks as freed when it closes, so `live=0` still holds.
+
 ## Measured
 
 | Program | Fresh | Recycled | In place | Live at exit |
@@ -137,7 +151,7 @@ call); known-arity calls (M4) remove them.
 
 ## Limits and next steps
 
-- **Not yet:** borrow inference for parameters, fusing a field's dup with the parent's drop when
+- **Not yet:** fusing a field's dup with the parent's drop when
   the parent is unique, reuse across branches, and specialized drop functions. All of these are
   standard Perceus refinements that remove counting work; none changes the model.
 - A block may have at most 16 payload words before its last pointer (the pointer map is

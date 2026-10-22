@@ -1,0 +1,3 @@
+data Tree = Leaf | Node(Box Tree, Box Tree)
+def size : Tree -> i64 = \t. case t of { Leaf -> 0 | Node(l, r) -> 1 }
+main = let t = Node(box Leaf, box Leaf) in arena (\u. size t)

@@ -48,6 +48,7 @@ data Rhs
   | RPerform Int Atom                   -- ^ perform operation n: innermost handler, else the machine
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
   | RArray ArrayOp Bool [Atom]          -- ^ an array operation; whether the elements are pointers
+  | RArena Bool                         -- ^ open (True) or close the innermost arena
   deriving (Show)
 
 data Expr
@@ -239,6 +240,29 @@ expr info env tm k = case tm of
     TInt it -> sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
   Convert to e -> sub e $ \v -> bindRhs (RConv to v)
+  -- arena f: f () between opening and closing an arena, which frees everything allocated in
+  -- between at once. So nothing allocated inside may escape: the result and every local f
+  -- captures are not pointers, and f performs only built-in effects (a handler's clause could
+  -- otherwise hand a pointer in or out).
+  ArrayPrim AArena t [f]
+    | isPtr t -> lift (Left ("arena: the result is a pointer (" ++ prettyTy t ++ "), which would outlive the arena"))
+    | (v, vt) : _ <- filter (isPtr . snd) captured ->
+        lift (Left ("arena: it uses " ++ v ++ " : " ++ prettyTy vt ++ " from outside; only values that are not pointers can go in"))
+    | not (S.null userEffects) -> lift (Left ("arena: it performs " ++ unwords (S.toList userEffects) ++ "; only built-in effects are allowed inside"))
+    | otherwise -> do
+        open <- newVar "arena" TUnit
+        rest <- expr info env body $ \v -> do
+          close <- newVar "arena" TUnit
+          Bind close (RArena False) <$> k v
+        pure (Bind open (RArena True) rest)
+    where
+      body = case stripAt f of
+        Lam u _ b -> Let u UnitLit b
+        _ -> App f UnitLit
+      captured = [(v, vt) | v <- S.toList (freeVars f), Just (_, vt) <- [M.lookup v env]]
+      userEffects = case typeOf info env f of
+        TFun _ e _ -> e S.\\ S.fromList (panicE : divergeE : map fst builtinEffects)
+        _ -> S.empty
   ArrayPrim op t args -> subs args $ \vs -> bindRhs (RArray op (isPtr t) vs)
   -- let x = y: x is another name for y, not a second reference (which would cost a dup and a
   -- drop around every use, e.g. an inlined array.length xs).

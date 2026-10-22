@@ -351,6 +351,7 @@ infer s rec ctx tm = case tm of
           Arith _ _ -> (ta, S.empty)
           Bits _ -> (ta, S.empty)
     pure (t, S.unions [ea, eb, extra], u)
+  ArrayPrim AArena _ [f] -> infer s rec ctx (App f UnitLit)
   ArrayPrim op a args -> do
     wfTy s a
     when (kindOf s a == Lin) $ err KindMismatch ("array elements must be Free, got linear " ++ prettyTy a)

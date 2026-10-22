@@ -1,0 +1,32 @@
+-- arena (\u. e) frees everything e allocated at once, when e returns (spec/memory.md). The
+-- native tests' leak check (live=0) and the comparison with the evaluator check each path:
+-- blocks taken from free lists inside an arena are freed as usual, blocks bump-allocated
+-- inside are not freed one by one, arenas nest, and an array may grow inside.
+
+import std.array
+
+data Tree = Leaf | Node(Box Tree, Box Tree)
+
+def make : i64 ->{Panic, Diverge} Tree =
+  \d. if d == 0 then Leaf else Node(box (make (d - 1)), box (make (d - 1)))
+
+def check : Tree ->{Panic, Diverge} i64 =
+  \t. case t of { Leaf -> 1 | Node(l, r) -> 1 + check (unbox l) + check (unbox r) }
+
+def many : i64 -> i64 ->{Panic, Diverge} i64 =
+  \n acc. if n == 0 then acc else many (n - 1) (acc + arena (\u. check (make 6)))
+
+def squares : i64 -> Array i64 ->{Panic, Diverge} Array i64 =
+  \i xs. if i == 0 then xs else squares (i - 1) (array.push xs (i * i))
+
+def nested : i64 ->{IO, Panic, Diverge} i64 =
+  \d. arena (\u.
+        let outer = make d in
+        let inner = arena (\v. check (make (d + 1)) + array.length (squares 1000 array.empty)) in
+        printInt inner; putc('\n');
+        check outer + inner)
+
+main =
+  let kept = make 4 in
+  let warm = check (make 5) in
+  warm + many 100 0 + nested 3 + check kept

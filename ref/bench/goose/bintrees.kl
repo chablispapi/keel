@@ -1,6 +1,6 @@
 -- Goose's bench/goose/bintrees.goose (the Benchmarks Game's binary-trees), ported: build many
 -- short-lived complete binary trees, check each, drop it; one long-lived tree is kept.
--- Every node is a reference-counted heap block, freed when the tree is dropped.
+-- Every node is a reference-counted heap block; each short-lived tree lives in an arena.
 
 data Tree = Leaf | Node(Box Tree, Box Tree)
 
@@ -14,7 +14,8 @@ def make : i64 ->{Panic, Diverge} Tree =
 def check : Tree ->{Panic, Diverge} i64 =
   \t. case t of { Leaf -> 1 | Node(l, r) -> 1 + check (unbox l) + check (unbox r) }
 
-def treeCheck : i64 ->{Panic, Diverge} i64 = \d. check (make d)
+-- Build, check, discard: the arena frees the whole tree at once, as Goose's local pool does.
+def treeCheck : i64 ->{Panic, Diverge} i64 = \d. arena (\u. check (make d))
 
 def emit : i64 ->{IO, Diverge, Panic} Unit = \n. printInt n; putc('\n')
 

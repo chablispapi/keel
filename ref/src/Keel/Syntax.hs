@@ -74,13 +74,15 @@ data Prim = Arith Overflow ArithOp | Bits BitOp | Eq | Lt
 
 -- | Operations on the built-in @Array a@ (M5): a growable array of one-word elements, updated
 -- in place when the array is not shared and copied when it is (spec/memory.md).
-data ArrayOp = AEmpty | ANew | ALength | AGet | ASet | APush | APop
+-- AArena is not an array operation but is built in the same way: @arena (\u. e)@ evaluates e
+-- and frees everything e allocated at once (spec/memory.md, "Arenas").
+data ArrayOp = AEmpty | ANew | ALength | AGet | ASet | APush | APop | AArena
   deriving (Eq, Show)
 
 -- | The names array operations are written with, applied to all their arguments
 -- (@arrayGet xs 3@, or just @arrayEmpty@); "std.array" wraps them as ordinary functions.
 arrayOps :: [(String, ArrayOp)]
-arrayOps = [("arrayEmpty", AEmpty), ("arrayNew", ANew), ("arrayLength", ALength), ("arrayGet", AGet), ("arraySet", ASet), ("arrayPush", APush), ("arrayPop", APop)]
+arrayOps = [("arrayEmpty", AEmpty), ("arrayNew", ANew), ("arrayLength", ALength), ("arrayGet", AGet), ("arraySet", ASet), ("arrayPush", APush), ("arrayPop", APop), ("arena", AArena)]
 
 -- | An array operation's argument types, result type and effects, for element type @a@
 -- (which must be Free: the elements are copied in and out).
@@ -93,6 +95,7 @@ arrayOpType op a = case op of
   ASet -> ([arr, TInt i64, a], arr, panic)
   APush -> ([arr, a], arr, S.empty)
   APop -> ([arr], arr, panic)
+  AArena -> ([TFun TUnit S.empty a], a, S.empty) -- only its arity and result: typed as f ()
   where
     arr = TData "Array" [a]
     panic = S.singleton panicE
