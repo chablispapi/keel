@@ -208,6 +208,7 @@ exampleFiles =
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
+  , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/arena.kl", (Just "13840", "1031\n"))
   , ("test/std/borrow.kl", (Just "745", ""))
   , ("test/std/ranges.kl", (Just "285070", ""))

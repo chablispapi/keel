@@ -108,8 +108,9 @@ mutation's performance without any `&mut`.
 array owned and update it in place when its count is 1; otherwise they copy it first (duplicating
 the elements) and decrement the original. `arrayGet` and `arrayLength` borrow the array, like a
 field read, so `let x = arrayGet xs i in arraySet xs i (x + 1)` leaves `xs` unique and updates in
-place. A full array doubles its capacity on push; when it was unique, the elements move to the
-new block and the old one is freed without touching them. `test/std/array.kl` does 200,000 pushes
+place. A full array doubles its capacity on push: in place when it is unique and the last block
+before the bump pointer (AArch64), otherwise into a new block; when it was unique, the elements
+move there and the old one is freed without touching them. `test/std/array.kl` does 200,000 pushes
 and 100,000 updates with 36 allocations.
 
 ## Runtime
@@ -157,7 +158,7 @@ call); known-arity calls (M4) remove them.
 - A block may have at most 16 payload words before its last pointer (the pointer map is
   16 bits); larger blocks are rejected at compile time. Arrays have no such limit.
 - Blocks over 64 words, so arrays of more than 62 elements, are not recycled: a growing array
-  leaves its smaller copies behind in the bump region. A free list for large blocks (first fit,
+  that isn't the last block (or on RISC-V) leaves its smaller copies behind in the bump region. A free list for large blocks (first fit,
   or size classes by powers of two) is the fix when a program runs out of heap.
 - Counts are not atomic: fine for single-core code; multicore sharing needs atomic counts or
   ownership transfer (`notes.md` §16, concurrency).

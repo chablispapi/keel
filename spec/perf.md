@@ -65,6 +65,12 @@ checked adds panics exactly when the scalar loop would. Otherwise the scalar loo
 elements, which is unobservable because the loop is pure. `sum` 0.64×; on an array that fits
 in cache, the scan is 3.4× faster.
 
+**Array growth** (AArch64). `array.push` on a full array that is unique and ends at the bump
+pointer (nothing allocated after it) extends the block where it is instead of copying it into
+one twice the size, which also leaves no old copy behind; a push with room in a unique array
+stores without calling the runtime. `sum` 0.73× and half the memory; at 128M elements 4× faster.
+RISC-V still copies.
+
 Both back ends (ARM64 and RISC-V) share the allocation (`allocate` in `ref/src/Keel/AArch64.hs`),
 and the full test suite passes on both after each step.
 

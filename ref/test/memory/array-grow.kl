@@ -1,0 +1,21 @@
+-- array.push grows a full array in place when it is unique and the last block on the heap;
+-- otherwise it copies. Here: growth in place (pushes in a row), growth after another
+-- allocation (the list cell in between), and a shared array, which must keep its old contents.
+
+import std.array
+
+def pushes : i64 -> i64 -> Array i64 ->{Panic, Diverge} Array i64 =
+  \i n xs. if i == n then xs else pushes (i + 1) n (array.push xs i)
+
+def total : Array i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \xs i acc. if i == array.length xs then acc else total xs (i + 1) (acc + array.get xs i)
+
+def len : List i64 ->{Panic, Diverge} i64 = \l. case l of { Nil -> 0 | Cons(_, rest) -> 1 + len (unbox rest) }
+
+main =
+  let a = pushes 0 100 array.empty in
+  let l = Cons(7, box Nil) in
+  let b = pushes 100 300 a in
+  let c = pushes 0 4 array.empty in
+  let d = array.push c 9 in
+  total b 0 0 * 100 + total c 0 0 * 10 + total d 0 0 + len l

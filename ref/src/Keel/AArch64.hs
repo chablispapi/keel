@@ -879,7 +879,24 @@ rhsCode slots rhs = case rhs of
       AEmpty -> ins "mov x0, #0" >> ins ("mov x1, #" ++ flag) >> ins "bl _keel_array_alloc"
       ANew -> ins ("mov x2, #" ++ flag) >> ins "bl _keel_array_new"
       ASet -> ins "bl _keel_array_set"
-      APush -> ins "bl _keel_array_push"
+      -- A unique array with room: store and count, without calling the runtime.
+      APush -> do
+        lSlow <- newLabel
+        lDone <- newLabel
+        ins "ldp x9, x10, [x0]"
+        ins "cmp x9, x10"
+        ins ("b.hs " ++ lSlow)
+        ins "ldr w11, [x0, #-8]"
+        ins "cmp w11, #1"
+        ins ("b.ne " ++ lSlow)
+        ins "add x11, x0, x9, lsl #3"
+        ins "str x1, [x11, #16]"
+        ins "add x9, x9, #1"
+        ins "str x9, [x0]"
+        ins ("b " ++ lDone)
+        line (lSlow ++ ":")
+        ins "bl _keel_array_push"
+        line (lDone ++ ":")
       _ -> ins "bl _keel_array_pop"
     where
       flag = if ptr then "1" else "0"
@@ -1569,7 +1586,9 @@ emitRuntime = do
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
 
-  -- _keel_array_push: x0 = array (owned), x1 = element (owned) → x0. A full array doubles.
+  -- _keel_array_push: x0 = array (owned), x1 = element (owned) → x0. A full array doubles: in
+  -- place when it is unique and the last block before the bump pointer (then nothing lies
+  -- after it, not even an arena's record), otherwise into a copy.
   fn "_keel_array_push"
   ins "stp x29, x30, [sp, #-32]!"
   ins "mov x29, sp"
@@ -1588,6 +1607,32 @@ emitRuntime = do
   ins "mov x12, #4"
   ins "cmp x1, x12"
   ins "csel x1, x1, x12, hs"
+  ins "ldr w11, [x0, #-8]"
+  ins "cmp w11, #1"
+  ins "b.ne L_apush_copy"
+  ins "add x12, x0, #16"
+  ins "add x12, x12, x10, lsl #3" -- the block's end
+  address "x13" "_keel_heap_ptr"
+  ins "ldr x14, [x13]"
+  ins "cmp x12, x14"
+  ins "b.ne L_apush_copy"
+  ins "add x12, x0, #16"
+  ins "add x12, x12, x1, lsl #3"
+  ins "ldr x14, [x13, #8]"
+  ins "cmp x12, x14"
+  ins "b.hi _keel_panic_oom"
+  ins "str x12, [x13]"
+  ins "str x1, [x0, #8]"
+  -- The header's size (capped at 255, as in _keel_array_alloc).
+  ins "add x12, x1, #2"
+  ins "mov x13, #0xFF"
+  ins "cmp x12, x13"
+  ins "csel x12, x12, x13, lo"
+  ins "ldr x13, [x0, #-8]"
+  ins "bfi x13, x12, #32, #8"
+  ins "str x13, [x0, #-8]"
+  ins "b L_apush_store"
+  line "L_apush_copy:"
   ins "bl _keel_array_clone"
   line "L_apush_store:"
   ins "ldr x9, [x0]"
