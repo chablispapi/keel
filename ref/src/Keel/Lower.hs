@@ -30,7 +30,8 @@ data Atom
   | AVar String  -- ^ a local variable (stack slot)
   | AGlobal Int  -- ^ the static block of top-level definition i (immortal)
   | ANullary Integer -- ^ a constructor without fields: the shared static block of its layout
-  deriving (Eq, Show)
+  | AStatic Int  -- ^ constant block i ('lConsts'): built from constants, immortal
+  deriving (Eq, Ord, Show)
 
 -- | How an array holds its elements: 4 bytes each (an integer of at most 32 bits, or a Bool;
 -- whether signed), a word each, or a pointer word each.
@@ -113,8 +114,10 @@ data Fun = Fun
 --
 -- @lLocs@ is the source position of each bound variable's computation, where the program
 -- still had one (only debug builds keep positions through optimization). @lLayouts@ numbers
--- the block layouts, (constructor or -1, words, pointer map) ↦ id.
-data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos, lLayouts :: M.Map (Integer, Int, Integer) Integer}
+-- the block layouts, (constructor or -1, words, pointer map) ↦ id. @lConsts@ are the blocks
+-- whose fields are all constants (string literals, say), numbered for 'AStatic': layout,
+-- header field and words, as for 'RAlloc'; their pointers are other constant blocks.
+data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos, lLayouts :: M.Map (Integer, Int, Integer) Integer, lConsts :: [(Integer, Maybe Atom, [Atom])]}
   deriving (Show)
 
 -- | What lowering needs to know about declarations.
@@ -139,7 +142,7 @@ isPtr t = case t of
   _ -> False
 
 -- | lsPos is the innermost source position around the term being lowered.
-data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer}
+data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer, lsConsts :: M.Map (Integer, Maybe Atom, [Atom]) Int}
 
 type M = StateT LS (Either String)
 
@@ -189,6 +192,21 @@ layoutId field tag n bm = do
       if i >= limit
         then unsupported "too many block layouts"
         else put s {lsLayouts = M.insert (tag, n, bm) i (lsLayouts s)} >> pure i
+
+-- | The constant block of this layout, header field and words (shared with an equal one).
+-- Its constructors without fields become constant blocks too, so that all of its pointers
+-- are in the constants' section, where a packed slot's offset is known when assembling.
+constBlock :: Integer -> Maybe Atom -> [Atom] -> M Atom
+constBlock lid h ws = do
+  ws' <- mapM (\a -> case a of ANullary t -> constBlock t Nothing []; _ -> pure a) ws
+  s <- get
+  let key = (lid, h, ws')
+  case M.lookup key (lsConsts s) of
+    Just i -> pure (AStatic i)
+    Nothing -> do
+      let i = M.size (lsConsts s)
+      put s {lsConsts = M.insert key i (lsConsts s)}
+      pure (AStatic i)
 
 -- | Arrays' layouts: this one plus 'elemKind'. From 'fieldLayouts' on, layouts whose header
 -- holds a field.
@@ -300,14 +318,14 @@ lower (Program userDecls main) = do
           m <- expr info M.empty main (pure . Ret)
           pure (statics, Fun "main" [] 1 [] [] False m)
       )
-      (LS 0 M.empty S.empty Nothing M.empty M.empty)
+      (LS 0 M.empty S.empty Nothing M.empty M.empty M.empty)
   let ptrs = lsPtrs s
       -- A block's words, by its layout (packed layouts have fewer than fields).
       wordsOf = M.fromList [(lid, n) | ((_, n, _), lid) <- M.toList (lsLayouts s)]
       blockWords lid as = M.findWithDefault (length as) lid wordsOf
       sigs = borrowSigs blockWords ptrs (lsFuns s) statics mainF
   let counted sig f = let f' = refcount blockWords ptrs sigs sig f in f' {funBody = fuseFields (funBody f')}
-  pure (LProg (M.mapWithKey (\i -> counted (M.lookup i sigs)) (lsFuns s)) statics (counted Nothing mainF) (lsLocs s) (lsLayouts s))
+  pure (LProg (M.mapWithKey (\i -> counted (M.lookup i sigs)) (lsFuns s)) statics (counted Nothing mainF) (lsLocs s) (lsLayouts s) (map fst (sortOn snd (M.toList (lsConsts s)))))
   where
     isLam e = case e of
       Lam {} -> True
@@ -418,7 +436,9 @@ expr info env tm k = case tm of
   Con c _ args -> do
     (tag, _, _) <- con c
     (lid, h, ws) <- dataLayout tag (map (typeOf info env) args)
-    subs args $ \vs -> bindRhs (RAlloc lid ((vs !!) <$> h) (map (vs !!) ws))
+    subs args $ \vs ->
+      let (h', ws') = ((vs !!) <$> h, map (vs !!) ws)
+       in if all constant vs then constBlock lid h' ws' >>= k else bindRhs (RAlloc lid h' ws')
   Case e alts -> sub e $ \ve -> do
     x <- newVar "case" ty
     let tys = case typeOf info env e of
@@ -506,6 +526,12 @@ expr info env tm k = case tm of
       x <- newVar "t" ty
       modify (\s -> s {lsLocs = maybe id (M.insert x) (lsPos s) (lsLocs s)})
       Bind x rhs <$> k (AVar x)
+
+    constant a = case a of
+      AInt _ -> True
+      ANullary _ -> True
+      AStatic _ -> True
+      _ -> False
 
     con c = maybe (lift (Left ("unknown constructor " ++ c))) pure (M.lookup c (iCons info))
 

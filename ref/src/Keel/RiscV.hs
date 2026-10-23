@@ -16,7 +16,7 @@ import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepare, printerTypes, pruneRuntime, runtimeBegin, runtimeEnd, template)
+import Keel.AArch64 (Loc (..), constData, allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepare, printerTypes, pruneRuntime, runtimeBegin, runtimeEnd, template)
 import Data.Bits ((.|.), shiftL)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe)
@@ -112,7 +112,7 @@ jumpIf cond operands target = do
       _ -> error ("jumpIf: " ++ c)
 
 emitProgram :: [Decl] -> Ty -> LProg -> Either String String
-emitProgram decls mainTy (LProg funs statics mainF _ layouts) = Right (unlines (pruneRuntime (reverse (gsLines final))))
+emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = Right (unlines (pruneRuntime (reverse (gsLines final))))
   where
     final = execState gen (GS 0 [] M.empty S.empty layouts)
     printers = printerTypes decls mainTy
@@ -136,6 +136,7 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts) = Right (unlines (
       forM_ (S.toList tags) $ \t -> do
         ins (".dword " ++ show (header layouts t .|. 0x80000000) ++ "\t\t# header: immortal, layout " ++ show t)
         line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with this layout")
+      mapM_ line (constData (".dword", ".word", ".L") layouts consts)
       -- The words and pointer map of each layout whose header holds a field, as in "Keel.AArch64".
       line "\t.p2align 2"
       line "_keel_layouts:"
@@ -234,6 +235,7 @@ atom slots r a = case a of
   AVar v -> load' slots r v
   AGlobal i -> ins ("la " ++ r ++ ", _kc_" ++ show i)
   ANullary t -> modify (\s -> s {gsNullary = S.insert t (gsNullary s)}) >> ins ("la " ++ r ++ ", _kn_" ++ show t)
+  AStatic i -> ins ("la " ++ r ++ ", .L_ks_" ++ show i)
 
 -- | Increment a reference count inline (a6, a7). The low 32 bits of the header, as in
 -- "Keel.AArch64" (count in bits 10–30): loaded sign-extended, an immortal block is negative.

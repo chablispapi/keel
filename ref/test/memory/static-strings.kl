@@ -1,0 +1,18 @@
+-- Constructors of constants are static blocks (immortal, in the data section): a string
+-- literal printed twice, rebuilt by a function that would reuse a unique cell in place (it
+-- must copy a static one), the same inside an arena, and a narrow field in the header.
+
+def up : List u8 ->{Panic, Diverge} List u8 =
+  \s. case s of {
+    Nil -> Nil
+    | Cons(c, cs) -> Cons(if c >= 'a' && c <= 'z' then c - 32 else c, box (up (unbox cs)))
+  }
+
+main =
+  let s = "keel" in
+  println s;
+  println (up s);
+  println s;
+  printInt (arena (\u. length (up "inside"))); putc('\n');
+  println (up (up "twice"));
+  up "end"

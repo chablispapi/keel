@@ -69,7 +69,11 @@ word, or, with no words, in the header's high half (in words from itself).
 
 Top-level definitions are static blocks in the data section with an immortal header: counting
 skips them. So is each constructor without fields (`Nil`, `None`, `Leaf`): one static block
-per layout, shared by every use.
+per layout, shared by every use. So is a constructor whose fields are all constants (integers,
+fieldless constructors, other such blocks): a string literal is a chain of static cells, built
+when assembling, with equal blocks shared. Reuse never takes one (its count is never 1), so
+code that rebuilds a literal copies it. A packed slot is the difference of two labels, so a
+static packed block's children are static blocks of the same kind, fieldless ones included.
 
 ## Ownership
 

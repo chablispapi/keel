@@ -230,6 +230,7 @@ exampleFiles =
   , ("test/memory/array32-print.kl", (Just "[-5, -5, 2147483647, -2147483648]", ""))
   , ("test/memory/narrow-print.kl", (Just "Cons(R(-12, -5000000000, true, 65535), box Cons(E, box Nil))", ""))
   , ("test/memory/arena.kl", (Just "13840", "1031\n"))
+  , ("test/memory/static-strings.kl", (Just "Cons(69, box Cons(78, box Cons(68, box Nil)))", "keel\nKEEL\nkeel\n6\nTWICE\n"))
   , ("test/std/borrow.kl", (Just "745", ""))
   , ("test/std/ranges.kl", (Just "285070", ""))
   , ("test/std/ranges-skip.kl", (Nothing, ""))
@@ -546,8 +547,8 @@ reuseChecks dir = do
     reuse mask = L.DropReuse "p" mask "token" (L.Ret (L.AInt 0))
     branch tag b = L.BindCase "r" (L.AVar "p") [(tag, 2, b)] (L.Ret (L.AInt 0))
     body e = unlines . takeWhile (not . isPrefixOf "\t.globl _main") . lines $
-      emitProgram [] TUnit (L.LProg M.empty [] (L.Fun "probe" ["p"] 1 [] [] False e) M.empty layouts)
-    headerProbe = emitProgram [] tI $ L.LProg (M.singleton 0 probe) [] mainF M.empty (M.singleton (0, 1, 0) 1)
+      emitProgram [] TUnit (L.LProg M.empty [] (L.Fun "probe" ["p"] 1 [] [] False e) M.empty layouts [])
+    headerProbe = emitProgram [] tI $ L.LProg (M.singleton 0 probe) [] mainF M.empty (M.singleton (0, 1, 0) 1) []
       where
         probe = L.Fun "probe" ["p"] 1 [] [] False $
           L.BindCase "r" (L.AVar "p") [(1, 1, L.DropReuse "p" 0 "tok" $
@@ -578,6 +579,10 @@ reuseChecks dir = do
           || (expected && not (callFreeFastPath asm))
       ]
 
+-- | Whether main's code calls anything.
+mainCalls :: String -> Bool
+mainCalls = any ("\tbl " `isPrefixOf`) . takeWhile (not . ("L_kf_main_end:" `isPrefixOf`)) . dropWhile (not . ("_kf_main:" `isPrefixOf`)) . lines
+
 -- | Build and run a program natively, and compare with the evaluator. With @debug@, it is built
 -- as keelc build -g does: positions kept through optimization and a line table, which must
 -- change nothing but the debug info.
@@ -585,7 +590,8 @@ runCase :: FilePath -> Bool -> Int -> (String, Program) -> IO [String]
 runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug prog) of
   (Left e, _) -> pure [failMsg ("does not type-check: " ++ show e)]
   (_, Left e) -> pure [failMsg e]
-  (_, Right asm) | debug, not (".loc " `isInfixOf` asm) -> pure [failMsg "no line table"]
+  -- A main that is one constant block has no code to give lines to.
+  (_, Right asm) | debug, mainCalls asm, not (".loc " `isInfixOf` asm) -> pure [failMsg "no line table"]
   (Right mono, Right asm) -> do
     let base = (if debug then "dcase" else "case") ++ show i
         src = dir </> (base ++ ".s")

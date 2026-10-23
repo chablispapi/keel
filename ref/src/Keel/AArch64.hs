@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, keyOf, performedOps, pruneRuntime, runtimeBegin, runtimeEnd, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
+module Keel.AArch64 (compileNative, constData, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, keyOf, performedOps, pruneRuntime, runtimeBegin, runtimeEnd, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
@@ -113,7 +113,7 @@ emitProgram :: [Decl] -> Ty -> LProg -> String
 emitProgram = emitProgramWithReuse True
 
 emitProgramWithReuse :: Bool -> [Decl] -> Ty -> LProg -> String
-emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts)))))
+emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts consts) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts)))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -140,6 +140,7 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) 
       forM_ (S.toList tags) $ \t -> do
         ins (".quad " ++ show (header layouts t .|. 0x80000000) ++ "\t\t// header: immortal, layout " ++ show t)
         line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with this layout")
+      mapM_ line (constData (".quad", ".long", "L") layouts consts)
       layoutTable layouts
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
@@ -435,6 +436,7 @@ atom slots r a = case a of
   AVar v -> load' slots r v
   AGlobal i -> address r ("_kc_" ++ show i)
   ANullary t -> modify (\s -> s {gsNullary = S.insert t (gsNullary s)}) >> address r ("_kn_" ++ show t)
+  AStatic i -> address r ("L_ks_" ++ show i)
 
 -- | The register holding an atom: its own, if it lives in one; otherwise it is loaded into @r@.
 operand :: Slots -> String -> Atom -> G String
@@ -895,6 +897,30 @@ layoutTable layouts = do
 -- (40–55). A free block of no words keeps its free-list link there.
 header :: M.Map (Integer, Int, Integer) Integer -> Integer -> Integer
 header layouts lid = 1024 .|. template layouts lid
+
+-- | The constant blocks ('lConsts'), immortal, as data lines: given the directives for 8 and 4
+-- bytes and the prefix of local labels (a packed slot is the difference of two labels, which
+-- assemblers resolve only between local ones). A block's words are written as 'fields' would.
+constData :: (String, String, String) -> M.Map (Integer, Int, Integer) Integer -> [(Integer, Maybe Atom, [Atom])] -> [String]
+constData (quad, long, local) layouts consts = concat (zipWith block [0 :: Int ..] consts)
+  where
+    lbl i = local ++ "_ks_" ++ show i
+    block i (lid, h, as) =
+      ["\t" ++ quad ++ " " ++ show (header layouts lid .|. 0x80000000 .|. (maybe 0 (\a -> (value a .&. 0xffffffff) `shiftL` 32) h)), lbl i ++ ":"]
+        ++ ["\t" ++ quad ++ " " ++ word a | a <- take nw as]
+        ++ ["\t" ++ long ++ " " ++ slot a | a <- drop nw as]
+        ++ ["\t" ++ long ++ " 0" | odd (length as - nw)]
+      where
+        nw = fromMaybe (length as) (packedFrom (maybe 0 (\(_, _, m) -> m) (keyOf layouts lid)) (length as))
+        slot a = case a of
+          AStatic j -> "(" ++ lbl j ++ " - " ++ lbl i ++ ")/8"
+          _ -> error "constData: a packed slot that is not a constant block"
+    word a = case a of
+      AStatic j -> lbl j
+      _ -> show (value a)
+    value a = case a of
+      AInt n -> n
+      _ -> error ("constData: not a constant word: " ++ show a)
 
 -- | A header without its count.
 template :: M.Map (Integer, Int, Integer) Integer -> Integer -> Integer

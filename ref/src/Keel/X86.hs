@@ -29,7 +29,7 @@ import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Keel.AArch64 (Loc (..), Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, performedOps, prepare, printerTypes, pruneRuntime, reduction, runtimeBegin, runtimeEnd, template, uses)
+import Keel.AArch64 (Loc (..), constData, Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, performedOps, prepare, printerTypes, pruneRuntime, reduction, runtimeBegin, runtimeEnd, template, uses)
 import Keel.Lower
 import Keel.Syntax
 import Numeric (showOct)
@@ -123,7 +123,7 @@ address :: String -> String -> G ()
 address r sym = ins ("lea " ++ r ++ ", [rip + " ++ sym ++ "]")
 
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF _ layouts) = unlines (pruneRuntime (reverse (gsLines final)))
+emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = unlines (pruneRuntime (reverse (gsLines final)))
   where
     final = execState gen (GS 0 [] M.empty S.empty layouts)
     printers = printerTypes decls mainTy
@@ -147,6 +147,7 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts) = unlines (pruneRu
       forM_ (S.toList tags) $ \t -> do
         ins (".quad " ++ show (header layouts t .|. 0x80000000) ++ "\t\t# header: immortal, layout " ++ show t)
         line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with this layout")
+      mapM_ line (constData (".quad", ".long", ".L") layouts consts)
       -- The words and pointer map of each layout whose header holds a field (spec/memory.md).
       line "\t.p2align 2"
       line "_keel_layouts:"
@@ -227,6 +228,7 @@ atom slots r a = case a of
   AVar v -> load' slots r v
   AGlobal i -> address r ("_kc_" ++ show i)
   ANullary t -> modify (\s -> s {gsNullary = S.insert t (gsNullary s)}) >> address r ("_kn_" ++ show t)
+  AStatic i -> address r (".L_ks_" ++ show i)
 
 -- | Increment a reference count inline (r11, edx). The header's low half (spec/memory.md): the
 -- count moves by 1024, an immortal block is negative, and a count of 0 is a freed block.
