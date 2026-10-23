@@ -314,12 +314,13 @@ data Decl
 data Program = Program [Decl] Term
   deriving (Eq, Show)
 
--- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@ and @Files@ have the operations in
--- 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
-ioE, inputE, mmioE, filesE, panicE, divergeE :: String
+-- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@, @Files@ and @Net@ have the
+-- operations in 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
+ioE, inputE, mmioE, filesE, netE, panicE, divergeE :: String
 ioE = "IO"
 inputE = "Input"
 filesE = "Files"
+netE = "Net"
 mmioE = "MMIO"
 panicE = "Panic"
 divergeE = "Diverge"
@@ -330,7 +331,8 @@ divergeE = "Diverge"
 -- end), the MMIO operations access device memory (freestanding targets only), and the Files
 -- operations read files: @openFile@ takes a path's bytes and gives a handle (-1 if it can't be
 -- opened), @readByte@ a byte (-1 at the end), @closeFile@ releases the handle (hosted targets
--- only). "std.file" wraps them.
+-- only). "std.file" wraps them. The Net operations are thin socket calls on IPv4 TCP (hosted
+-- targets only; elsewhere they fail): "std.loop" builds its event loop on them.
 builtinEffects :: [(String, [(String, Ty, Ty)])]
 builtinEffects =
   [ (ioE, [("out", TInt i64, TUnit), ("putc", TInt u8, TUnit)])
@@ -343,6 +345,18 @@ builtinEffects =
       ]
     )
   , (filesE, [("openFile", TData "Array" [TInt u8], TInt i64), ("readByte", TInt i64, TInt i64), ("closeFile", TInt i64, TUnit)])
+  , ( netE
+    , [ ("tcpListen", TPair (TInt u32) (TInt u16), TInt i64) -- address (0: any), port (0: any free) → fd or -1
+      , ("sockPort", TInt i64, TInt i64) -- a listener's port
+      , ("tcpAccept", TInt i64, TInt i64) -- a waiting connection's fd, or -1
+      , ("tcpConnect", TPair (TInt u32) (TInt u16), TInt i64) -- fd or -1
+      , ("sockSend", TPair (TInt i64) (TData "Array" [TInt u8]), TInt i64) -- all the bytes, or -1
+      , ("sockRecv", TInt i64, TData "Array" [TInt u8]) -- what has arrived; empty: closed
+      , ("sockClose", TInt i64, TUnit)
+      , ("pollWait", TPair (TData "Array" [TInt i32]) (TInt i64), TInt i64) -- fds, timeout in ms (-1: none) → index of a ready fd, -1 (timed out), or -2 (can't wait)
+      , ("clockMs", TUnit, TInt i64) -- milliseconds, monotonic
+      ]
+    )
   ]
 
 -- | Built-in data: @data Option a = None | Some(a)@, the result of @+?@.

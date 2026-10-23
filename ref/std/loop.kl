@@ -1,0 +1,173 @@
+-- An event loop: a program is a pure state machine, step : s -> Event -> (s, List Command),
+-- and run carries out its commands and feeds it events (effect Net: IPv4 TCP and timers, on
+-- hosted targets; elsewhere every Listen and Connect fails).
+--
+--   import std.loop
+--   def step : i64 -> loop.Event -> (i64, List loop.Command) = \n e. case e of
+--     { Start -> (n, Cons(loop.After(10, 1), box Nil))
+--     | Timer(t) -> (n +% 1, Cons(loop.Stop, box Nil))
+--     | _ -> (n, Nil) }
+--   main = loop.run 0 step
+--
+-- Connections are numbered by run and never renumbered: a Send or Close to a connection that
+-- has closed does nothing. One connection at a time is read; a Send waits until the bytes are
+-- sent.
+-- ponytail: poll over every socket each round, and blocking sends (no write queue).
+
+import std.array
+import std.map
+
+-- Listening(tag, port): Listen(tag, …) succeeded; port is the one given, or the one chosen for 0.
+-- Accepted(tag, conn): a connection came in on Listen(tag, …)'s listener.
+-- Connected(tag, conn): Connect(tag, …) succeeded. Failed(tag): a Listen or Connect failed.
+-- Received(conn, bytes), Closed(conn): the peer sent bytes, or closed the connection.
+-- Timer(tag): After(ms, tag)'s time has come.
+data Event = Start | Listening(i64, i64) | Accepted(i64, i64) | Connected(i64, i64) | Failed(i64)
+           | Received(i64, Array u8) | Closed(i64) | Timer(i64)
+
+-- Listen(tag, address, port), Connect(tag, address, port): address 0 listens on every
+-- interface; port 0 picks a free one. Send(conn, bytes), Close(conn). After(ms, tag): a Timer
+-- event later. Stop: run returns the state.
+data Command = Listen(i64, u32, u16) | Connect(i64, u32, u16) | Send(i64, Array u8) | Close(i64)
+             | After(i64, i64) | Stop
+
+-- An IPv4 address: ipv4 127 0 0 1.
+def ipv4 : u8 -> u8 -> u8 -> u8 -> u32 =
+  \a b c d. ((a as u32) lsl 24) lor ((b as u32) lsl 16) lor ((c as u32) lsl 8) lor (d as u32)
+
+-- What run knows about a socket: a listener (its fd and Listen's tag), or a connection.
+private data Socket = Listener(i64, i64) | Conn(i64)
+
+-- Drv(next connection number, sockets by number, timers (deadline, tag) soonest first, how far
+-- to rotate the poll order).
+private data Drv = Drv(i64, map.Map i64 Socket, List (i64, i64), i64)
+
+-- After a step: the driver and the events its commands caused, or Stop.
+private data Next = Going(Drv, List Event) | Stopped(Drv)
+
+-- Run a state machine from Start until it says Stop or has nothing left to wait for (no
+-- sockets, no timers); the final state.
+def run : forall (s : Free) 'e. s -> (s -> Event ->{'e} (s, List Command)) ->{Net, 'e, Diverge, Panic} s =
+  \s step. go step s (Cons(Start, box Nil)) (Drv(1, map.Tip, Nil, 0))
+
+private def go : forall (s : Free) 'e. (s -> Event ->{'e} (s, List Command)) -> s -> List Event -> Drv ->{Net, 'e, Diverge, Panic} s =
+  \step s queue d. case queue of
+    { Cons(ev, rest) ->
+        let (s2, cmds) = step s ev in
+        case exec cmds d (unbox rest) of
+          { Going(d2, q2) -> go step s2 q2 d2
+          | Stopped(d2) -> shutdown d2; s2 }
+    | Nil -> case wait d of
+        { None -> s
+        | Some(p) -> let (ev, d2) = p in go step s (Cons(ev, box Nil)) d2 } }
+
+-- Carry out the commands in order; the events they cause go after those already waiting.
+private def exec : List Command -> Drv -> List Event ->{Net, Diverge, Panic} Next =
+  \cmds d queue. case cmds of
+    { Nil -> Going(d, queue)
+    | Cons(c, rest) -> case c of
+        { Stop -> Stopped(d)
+        | Listen(tag, addr, port) ->
+            let fd = tcpListen(addr, port) in
+            if fd < 0 then exec (unbox rest) d (later queue (Failed(tag)))
+            else let (d2, conn) = add d (Listener(fd, tag)) in
+                 exec (unbox rest) d2 (later queue (Listening(tag, sockPort(fd))))
+        | Connect(tag, addr, port) ->
+            let fd = tcpConnect(addr, port) in
+            if fd < 0 then exec (unbox rest) d (later queue (Failed(tag)))
+            else let (d2, conn) = add d (Conn(fd)) in
+                 exec (unbox rest) d2 (later queue (Connected(tag, conn)))
+        | Send(conn, bytes) ->
+            (case connFd d conn of { None -> () | Some(fd) -> let n = sockSend(fd, bytes) in () });
+            exec (unbox rest) d queue
+        | Close(conn) -> exec (unbox rest) (forget d conn) queue
+        | After(ms, tag) ->
+            let at = clockMs () + ms in
+            (case d of { Drv(next, socks, timers, rot) -> exec (unbox rest) (Drv(next, socks, insertTimer at tag timers, rot)) queue }) } }
+
+private def later : List Event -> Event ->{Diverge} List Event = \q e. append q (Cons(e, box Nil))
+
+-- Number a new socket.
+private def add : Drv -> Socket ->{Diverge, Panic} (Drv, i64) =
+  \d sock. case d of
+    { Drv(next, socks, timers, rot) -> (Drv(next + 1, map.insert compareInt next sock socks, timers, rot), next) }
+
+private def connFd : Drv -> i64 ->{Diverge} Option i64 =
+  \d conn. case d of
+    { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
+        { Some(sock) -> (case sock of { Conn(fd) -> Some(fd) | Listener(fd, tag) -> None })
+        | None -> None } }
+
+-- Close a socket and forget its number.
+private def forget : Drv -> i64 ->{Net, Diverge} Drv =
+  \d conn. case d of
+    { Drv(next, socks, timers, rot) ->
+        (case map.lookup compareInt conn socks of { Some(sock) -> sockClose(socketFd sock) | None -> () });
+        Drv(next, map.delete compareInt conn socks, timers, rot) }
+
+private def socketFd : Socket -> i64 = \sock. case sock of { Listener(fd, tag) -> fd | Conn(fd) -> fd }
+
+private def insertTimer : i64 -> i64 -> List (i64, i64) ->{Diverge} List (i64, i64) =
+  \at tag ts. case ts of
+    { Nil -> Cons((at, tag), box Nil)
+    | Cons(t, rest) -> let (at2, tag2) = t in
+        if at < at2 then Cons((at, tag), box Cons((at2, tag2), rest))
+        else Cons((at2, tag2), box (insertTimer at tag (unbox rest))) }
+
+-- Wait for the next event: a timer that is due, a connection on a listener, or bytes or a
+-- close on a connection. None when there is nothing left to wait for.
+private def wait : Drv ->{Net, Diverge, Panic} Option (Event, Drv) =
+  \d. case d of
+    { Drv(next, socks, timers, rot) -> case timers of
+        { Cons(t, rest) ->
+            let (at, tag) = t in
+            let now = clockMs () in
+            if now < at then poll d (at - now) else Some((Timer(tag), Drv(next, socks, unbox rest, rot)))
+        | Nil -> case socks of { Tip -> None | _ -> poll d (-1) } } }
+
+-- Poll every socket, starting at a different one each round so none is starved; -1: no limit.
+private def poll : Drv -> i64 ->{Net, Diverge, Panic} Option (Event, Drv) =
+  \d timeout. case d of
+    { Drv(next, socks, timers, rot) ->
+        let all = rotate rot (map.toList socks) in
+        let i = pollWait(fdsOf all array.empty, timeout) in
+        let d2 = Drv(next, socks, timers, rot +% 1) in
+        if i == -2 then None -- no way to wait (no network): the loop ends
+        else if i < 0 then wait d2
+        else case nth i all of
+          { None -> wait d2
+          | Some(p) -> let (conn, sock) = p in case sock of
+              { Listener(fd, tag) ->
+                  let c = tcpAccept(fd) in
+                  if c < 0 then wait d2 else let (d3, id) = add d2 (Conn(c)) in Some((Accepted(tag, id), d3))
+              | Conn(fd) ->
+                  let bytes = sockRecv(fd) in
+                  if array.length bytes == 0 then Some((Closed(conn), forget d2 conn))
+                  else Some((Received(conn, bytes), d2)) } } }
+
+private def fdsOf : List (i64, Socket) -> Array i32 ->{Diverge} Array i32 =
+  \xs acc. case xs of
+    { Nil -> acc
+    | Cons(p, rest) -> let (conn, sock) = p in fdsOf (unbox rest) (array.push acc (socketFd sock as i32)) }
+
+private def nth : forall (a : Free). i64 -> List a ->{Diverge, Panic} Option a =
+  \i xs. case xs of { Nil -> None | Cons(x, rest) -> if i == 0 then Some(x) else nth (i - 1) (unbox rest) }
+
+private def drop : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
+  \k xs. if k == 0 then xs else case xs of { Nil -> Nil | Cons(x, rest) -> drop (k - 1) (unbox rest) }
+
+private def take : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
+  \k xs. if k == 0 then Nil else case xs of { Nil -> Nil | Cons(x, rest) -> Cons(x, box (take (k - 1) (unbox rest))) }
+
+private def rotate : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
+  \k xs. let n = count xs 0 in if n == 0 then xs else (let r = k % n in append (drop r xs) (take r xs))
+
+private def count : forall (a : Free). List a -> i64 ->{Diverge, Panic} i64 =
+  \xs n. case xs of { Nil -> n | Cons(x, rest) -> count (unbox rest) (n + 1) }
+
+-- Close every socket.
+private def shutdown : Drv ->{Net, Diverge} Unit =
+  \d. case d of { Drv(next, socks, timers, rot) -> closeAll (map.toList socks) }
+
+private def closeAll : List (i64, Socket) ->{Net, Diverge} Unit =
+  \xs. case xs of { Nil -> () | Cons(p, rest) -> let (conn, sock) = p in sockClose(socketFd sock); closeAll (unbox rest) }

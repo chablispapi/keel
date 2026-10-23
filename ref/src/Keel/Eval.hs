@@ -56,13 +56,21 @@ instance Eq Value where
 data Outcome = Done Value | Panicked String
   deriving (Eq, Show)
 
--- | What a program sees of the world: the bytes @getc@ reads, and the files @openFile@ can
--- open (bytes as characters; Nothing if a path can't be opened).
-data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String}
+-- | What a program sees of the world: the bytes @getc@ reads, the files @openFile@ can
+-- open (bytes as characters; Nothing if a path can't be opened), and whether it has a network.
+data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String, mNet :: Bool}
 
 -- | Evaluation can panic, and changes the world: input not yet read, output written (newest
--- chunk first), and the open files' unread bytes by handle.
-data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String}
+-- chunk first), the open files' unread bytes by handle, and the network (if there is one).
+data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wNet :: Maybe Net}
+
+-- | A loopback network, all inside the program: listeners by fd (port, connections waiting to
+-- be accepted), connected sockets by fd, the next fd and free port, and a clock that only
+-- moves when pollWait waits.
+data Net = Net {nListeners :: M.Map Integer (Integer, [Integer]), nSocks :: M.Map Integer Sock, nNext :: Integer, nPort :: Integer, nClock :: Integer}
+
+-- | A connected socket: its peer, the bytes that arrived, and whether the peer has closed.
+data Sock = Sock {sPeer :: Integer, sInbox :: String, sPeerClosed :: Bool}
 
 type Run = ExceptT String (State World)
 
@@ -75,16 +83,16 @@ evalProgram = evalProgramWith ""
 
 -- | Run @main@ with the bytes @getc@ reads (as characters), and no files.
 evalProgramWith :: String -> Program -> (Outcome, String)
-evalProgramWith input = evalProgramOn (Machine input (const Nothing))
+evalProgramWith input = evalProgramOn (Machine input (const Nothing) False)
 
 evalProgramOn :: Machine -> Program -> (Outcome, String)
-evalProgramOn (Machine input files) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)))
+evalProgramOn (Machine input files net) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)))
   where
-    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty)
+    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if net then Just (Net M.empty M.empty 3 49152 0) else Nothing))
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
     globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
-    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty) of
-      (Right v, World _ [] _ _) -> v
+    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty Nothing) of
+      (Right v, World _ [] _ _ _) -> v
       _ -> stuck "effectful top-level definition"
 
 -- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
@@ -195,7 +203,75 @@ machine "readByte" (VInt _ h) = do
     Just [] -> pure (VInt i64 (-1))
     Nothing -> throwE "readByte on a handle that isn't open"
 machine "closeFile" (VInt _ h) = lift (modify (\w -> w {wOpen = M.delete h (wOpen w)})) >> pure VUnit
+machine op v | op `elem` [o | (l, os) <- builtinEffects, l == netE, (o, _, _) <- os] = do
+  w <- lift get
+  case wNet w of
+    Nothing -> pure (netFailure op)
+    Just n -> do
+      (r, n') <- either throwE pure (network op v n)
+      lift (put w {wNet = Just n'})
+      pure r
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
+
+-- | What a Net operation gives without a network (RISC-V): it fails.
+netFailure :: String -> Value
+netFailure op = case op of
+  "sockRecv" -> VArray Seq.empty
+  "sockClose" -> VUnit
+  "clockMs" -> VInt i64 0
+  "pollWait" -> VInt i64 (-2)
+  _ -> VInt i64 (-1)
+
+-- | A Net operation on the loopback model. The native runtime does the same with sockets; a
+-- program sees the same events as long as it doesn't depend on how bytes are split into
+-- receives.
+network :: String -> Value -> Net -> Either String (Value, Net)
+network op v n = case (op, v) of
+  ("tcpListen", VPair _ (VInt _ p))
+    | p /= 0, p `elem` map fst (M.elems (nListeners n)) -> pure (int (-1), n)
+    | otherwise ->
+        let port = if p == 0 then nPort n else p
+         in pure (int (nNext n), n {nListeners = M.insert (nNext n) (port, []) (nListeners n), nNext = nNext n + 1, nPort = nPort n + (if p == 0 then 1 else 0)})
+  ("sockPort", VInt _ fd) -> pure (int (maybe (-1) fst (M.lookup fd (nListeners n))), n)
+  ("tcpAccept", VInt _ fd) -> case M.lookup fd (nListeners n) of
+    Just (port, c : rest) -> pure (int c, n {nListeners = M.insert fd (port, rest) (nListeners n)})
+    _ -> pure (int (-1), n)
+  ("tcpConnect", VPair _ (VInt _ p)) -> case [fd | (fd, (port, _)) <- M.toList (nListeners n), port == p] of
+    l : _ ->
+      let a = nNext n
+          b = a + 1
+          (port, waiting) = nListeners n M.! l
+       in pure (int a, n {nSocks = M.insert a (Sock b "" False) (M.insert b (Sock a "" False) (nSocks n)), nListeners = M.insert l (port, waiting ++ [b]) (nListeners n), nNext = b + 1})
+    [] -> pure (int (-1), n)
+  ("sockSend", VPair (VInt _ fd) (VArray bytes)) -> case M.lookup fd (nSocks n) of
+    Just s | not (sPeerClosed s), Just peer <- M.lookup (sPeer s) (nSocks n) ->
+      let text = [toEnum (fromInteger b) | VInt _ b <- toList bytes]
+       in pure (int (toInteger (length text)), n {nSocks = M.insert (sPeer s) peer {sInbox = sInbox peer ++ text} (nSocks n)})
+    _ -> pure (int (-1), n)
+  ("sockRecv", VInt _ fd) -> case M.lookup fd (nSocks n) of
+    Just s -> pure (VArray (Seq.fromList (map byte (sInbox s))), n {nSocks = M.insert fd s {sInbox = ""} (nSocks n)})
+    Nothing -> pure (VArray Seq.empty, n)
+  ("sockClose", VInt _ fd) ->
+    let socks = case M.lookup fd (nSocks n) of
+          Just s -> M.adjust (\p -> p {sPeerClosed = True}) (sPeer s) (M.delete fd (nSocks n))
+          Nothing -> nSocks n
+     in pure (VUnit, n {nSocks = socks, nListeners = M.delete fd (nListeners n)})
+  ("pollWait", VPair (VArray fds) (VInt _ timeout)) ->
+    case [i | (i, VInt _ fd) <- zip [0 ..] (toList fds), ready fd] of
+      i : _ -> pure (int i, n)
+      []
+        | timeout < 0 -> Left "pollWait would wait forever (no socket can become ready)"
+        | otherwise -> pure (int (-1), n {nClock = nClock n + timeout})
+  ("clockMs", _) -> pure (int (nClock n), n)
+  _ -> Left ("bad Net operation " ++ op)
+  where
+    int = VInt i64
+    -- As poll: a listener with a connection waiting, a socket with bytes or a closed peer, or
+    -- an fd that isn't open (POLLNVAL).
+    ready fd = case (M.lookup fd (nListeners n), M.lookup fd (nSocks n)) of
+      (Just (_, waiting), _) -> not (null waiting)
+      (_, Just s) -> not (null (sInbox s)) || sPeerClosed s
+      _ -> True
 
 -- | Arrays are values: an update returns a new sequence (the native code updates in place
 -- when it can, which no program can observe).

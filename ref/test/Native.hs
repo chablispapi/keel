@@ -209,6 +209,8 @@ exampleFiles =
   , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
   , ("test/modules/qual/main.kl", (Just "48", ""))
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
+  , ("examples/echo.kl", (Just "18", "hello, event loop\n"))
+  , ("examples/timers.kl", (Just "(123, 21)", ""))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
   , ("test/memory/reuse-branches.kl", (Just "89829149613", ""))
@@ -258,7 +260,7 @@ exampleInput name =
 machineFor :: String -> IO Machine
 machineFor name = do
   fact <- readFile "examples/fact.kl"
-  pure (Machine (exampleInput name) (`lookup` [("examples/fact.kl", fact)]))
+  pure (Machine (exampleInput name) (`lookup` [("examples/fact.kl", fact)]) True)
 
 -- | Multi-file programs the module loader must refuse, and part of the message.
 moduleErrors :: [(FilePath, String)]

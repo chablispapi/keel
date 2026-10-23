@@ -1,0 +1,29 @@
+-- An echo server and its client in one program, written as a pure state machine for
+-- std.loop: listen on a free port, connect to it, send a line; the server side sends back what
+-- it receives, and the client stops once the whole line is back. Without a network (RISC-V)
+-- the Listen fails and the program stops with nothing received.
+
+import std.array
+import std.loop
+
+-- The line, and State(the client's connection, the bytes it got back).
+def line : Unit -> List u8 = \u. "hello, event loop\n"
+data State = State(i64, List u8)
+
+def size : List u8 -> i64 ->{Diverge, Panic} i64 =
+  \xs n. case xs of { Nil -> n | Cons(x, rest) -> size (unbox rest) (n + 1) }
+
+def step : State -> loop.Event ->{Diverge, Panic} (State, List loop.Command) =
+  \s e. case s of { State(client, got) -> case e of
+    { Start -> (s, Cons(loop.Listen(1, loop.ipv4 127 0 0 1, 0), box Nil))
+    | Listening(tag, port) -> (s, Cons(loop.Connect(2, loop.ipv4 127 0 0 1, port as u16), box Nil))
+    | Connected(tag, conn) -> (State(conn, got), Cons(loop.Send(conn, array.fromList (line ())), box Nil))
+    | Received(conn, bytes) ->
+        if conn == client then
+          let got2 = append got (array.toList bytes) in
+          (State(client, got2), if size got2 0 == size (line ()) 0 then Cons(loop.Stop, box Nil) else Nil)
+        else (s, Cons(loop.Send(conn, bytes), box Nil))
+    | Failed(tag) -> (s, Cons(loop.Stop, box Nil))
+    | _ -> (s, Nil) } }
+
+main = case loop.run (State(0, Nil)) step of { State(client, got) -> print got; size got 0 }

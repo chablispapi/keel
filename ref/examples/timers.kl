@@ -1,0 +1,27 @@
+-- Timers with std.loop: three After commands given out of order fire soonest first, and the
+-- third Timer stops the loop. The same step is also run without the loop, on a list of
+-- events: a pure state machine is tested by feeding it events.
+
+import std.loop
+
+-- The tags of the timers that fired, latest first.
+def step : List i64 -> loop.Event ->{Diverge} (List i64, List loop.Command) =
+  \fired e. case e of
+    { Start -> (fired, Cons(loop.After(30, 3), box Cons(loop.After(10, 1), box Cons(loop.After(20, 2), box Nil))))
+    | Timer(tag) ->
+        let now = Cons(tag, box fired) in
+        (now, if tag == 3 then Cons(loop.Stop, box Nil) else Nil)
+    | _ -> (fired, Nil) }
+
+-- Feed the events to step, ignoring its commands.
+def replay : List i64 -> List loop.Event ->{Diverge} List i64 =
+  \s es. case es of { Nil -> s | Cons(e, rest) -> let (s2, cmds) = step s e in replay s2 (unbox rest) }
+
+def digits : List i64 ->{Diverge, Panic} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> digits (unbox rest) * 10 + x }
+
+main =
+  let live = digits (loop.run Nil step) in
+  let events = Cons(loop.Start, box Cons(loop.Timer(2), box Cons(loop.Timer(1), box Nil))) in
+  let replayed = digits (replay Nil events) in
+  (live, replayed)

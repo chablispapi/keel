@@ -79,7 +79,7 @@ main = do
           hSetBinaryMode stdin True
           hSetBinaryMode stdout True
           input <- getContents
-          let (outcome, output) = evalProgramOn (Machine input readBytes) mono
+          let (outcome, output) = evalProgramOn (Machine input readBytes True) mono
           putStr output
           case outcome of
             Done v -> putStrLn ("result: " ++ show v)

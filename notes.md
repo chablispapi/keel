@@ -750,6 +750,14 @@ multicore ordering), which is effectful by nature. Tools:
 - channels between cores
 - a small atomics API with a defined memory model
 
+**Done (hosted): a pure event loop**, `std.loop`. With tail-resumptive handlers there are no
+continuations to suspend a thread with, so a concurrent program is a pure state machine
+`step : s -> Event -> (s, List Command)`. `loop.run` owns the sockets and timers: it polls, turns
+readiness into events and carries out the commands through the built-in `Net` effect. It is
+one thread with no shared state, its connections are numbers that are never reused, and
+`step` can be tested by feeding it a list of events. The same shape fits firmware later, with
+interrupts as events.
+
 ### Ad hoc polymorphism and interfaces
 Explicit dictionary passing + monomorphization. A dictionary is a codata value and is inlined at
 zero cost. No global instance resolution and no orphan instances. Usage: `sort intOrd xs`.
