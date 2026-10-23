@@ -1,13 +1,14 @@
 -- | Call-by-value, environment-based evaluator for Keel Core, stages 1–4
 -- (spec/core.md §1.4, §2.5, §3.4, §4.5). Types are erased: @f[τ̄]@ evaluates like @f@. Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
-module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn) where
+module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn, runProgramOn) where
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Control.Monad.Trans.State.Strict (State, get, modify, put, runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Foldable (toList)
+import Data.Maybe (fromMaybe)
 import Data.Map.Strict qualified as M
 import Data.Sequence qualified as Seq
 import Keel.Syntax
@@ -57,12 +58,14 @@ data Outcome = Done Value | Panicked String
   deriving (Eq, Show)
 
 -- | What a program sees of the world: the bytes @getc@ reads, the files @openFile@ can
--- open (bytes as characters; Nothing if a path can't be opened), and whether it has a network.
-data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String, mNet :: Bool}
+-- open (bytes as characters; Nothing if a path can't be opened), and whether it is hosted:
+-- it has a network and can write files.
+data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String, mHosted :: Bool}
 
 -- | Evaluation can panic, and changes the world: input not yet read, output written (newest
--- chunk first), the open files' unread bytes by handle, and the network (if there is one).
-data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wNet :: Maybe Net}
+-- chunk first), the open files' unread bytes by handle, the files written (Nothing: none can
+-- be) and the handles writing them, and the network (if there is one).
+data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wWritten :: Maybe (M.Map FilePath String), wWriting :: M.Map Integer FilePath, wNet :: Maybe Net}
 
 -- | A loopback network, all inside the program: listeners by fd (port, connections waiting to
 -- be accepted), connected sockets by fd, the next fd and free port, and a clock that only
@@ -86,13 +89,17 @@ evalProgramWith :: String -> Program -> (Outcome, String)
 evalProgramWith input = evalProgramOn (Machine input (const Nothing) False)
 
 evalProgramOn :: Machine -> Program -> (Outcome, String)
-evalProgramOn (Machine input files net) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)))
+evalProgramOn m p = let (o, out, _) = runProgramOn m p in (o, out)
+
+-- | Also the files the program wrote, with their contents at the end (keelc run saves them).
+runProgramOn :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
+runProgramOn (Machine input files hosted) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)), fromMaybe M.empty (wWritten w))
   where
-    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if net then Just (Net M.empty M.empty 3 49152 0) else Nothing))
+    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if hosted then Just M.empty else Nothing) M.empty (if hosted then Just (Net M.empty M.empty 3 49152 0) else Nothing))
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
     globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
-    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty Nothing) of
-      (Right v, World _ [] _ _ _) -> v
+    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty Nothing M.empty Nothing) of
+      (Right v, World _ [] _ _ _ _ _) -> v
       _ -> stuck "effectful top-level definition"
 
 -- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
@@ -188,21 +195,38 @@ machine "getc" _ = do
   case wInput w of
     c : rest -> lift (put w {wInput = rest}) >> pure (byte c)
     [] -> pure (VInt i64 (-1))
--- Handles count up from 3, like file descriptors after stdin, stdout and stderr.
+-- Handles count up from 3, like file descriptors after stdin, stdout and stderr. A file the
+-- program wrote is read as it wrote it.
 machine "openFile" (VArray path) = do
   w <- lift get
-  let name = [toEnum (fromInteger b) | VInt _ b <- toList path]
-      h = maybe 3 ((+ 1) . fst) (M.lookupMax (wOpen w))
-  case wFiles w name of
-    Just bytes -> lift (put w {wOpen = M.insert h bytes (wOpen w)}) >> pure (VInt i64 h)
+  let name = pathOf path
+  case contents w name of
+    Just bytes -> lift (put w {wOpen = M.insert (nextHandle w) bytes (wOpen w)}) >> pure (VInt i64 (nextHandle w))
     Nothing -> pure (VInt i64 (-1))
+machine op (VArray path) | op `elem` ["createFile", "appendFile"] = do
+  w <- lift get
+  let name = pathOf path
+      start = if op == "createFile" then "" else fromMaybe "" (contents w name)
+  case wWritten w of
+    Just written -> do
+      lift (put w {wWritten = Just (M.insert name start written), wWriting = M.insert (nextHandle w) name (wWriting w)})
+      pure (VInt i64 (nextHandle w))
+    Nothing -> pure (VInt i64 (-1))
+machine "writeBytes" (VPair (VInt _ h) (VArray bytes)) = do
+  w <- lift get
+  case (M.lookup h (wWriting w), wWritten w) of
+    (Just name, Just written) -> do
+      let text = [toEnum (fromInteger b) | VInt _ b <- toList bytes]
+      lift (put w {wWritten = Just (M.adjust (++ text) name written)})
+      pure (VInt i64 (toInteger (length text)))
+    _ -> throwE "writeBytes on a handle that isn't open for writing"
 machine "readByte" (VInt _ h) = do
   w <- lift get
   case M.lookup h (wOpen w) of
     Just (c : rest) -> lift (put w {wOpen = M.insert h rest (wOpen w)}) >> pure (byte c)
     Just [] -> pure (VInt i64 (-1))
     Nothing -> throwE "readByte on a handle that isn't open"
-machine "closeFile" (VInt _ h) = lift (modify (\w -> w {wOpen = M.delete h (wOpen w)})) >> pure VUnit
+machine "closeFile" (VInt _ h) = lift (modify (\w -> w {wOpen = M.delete h (wOpen w), wWriting = M.delete h (wWriting w)})) >> pure VUnit
 machine op v | op `elem` [o | (l, os) <- builtinEffects, l == netE, (o, _, _) <- os] = do
   w <- lift get
   case wNet w of
@@ -212,6 +236,16 @@ machine op v | op `elem` [o | (l, os) <- builtinEffects, l == netE, (o, _, _) <-
       lift (put w {wNet = Just n'})
       pure r
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
+
+pathOf :: Seq.Seq Value -> FilePath
+pathOf path = [toEnum (fromInteger b) | VInt _ b <- toList path]
+
+-- | A file's bytes as the program sees them: as it wrote them, else as the machine has them.
+contents :: World -> FilePath -> Maybe String
+contents w name = maybe (wFiles w name) Just (wWritten w >>= M.lookup name)
+
+nextHandle :: World -> Integer
+nextHandle w = maybe 3 (+ 1) (max (fst <$> M.lookupMax (wOpen w)) (fst <$> M.lookupMax (wWriting w)))
 
 -- | What a Net operation gives without a network (RISC-V): it fails.
 netFailure :: String -> Value

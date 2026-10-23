@@ -1,0 +1,13 @@
+-- Writing files with std.file: replace a file's contents, add to its end, read it back.
+-- Without a file system (RISC-V) the write fails and nothing can be read.
+
+import std.file
+
+def path : Unit -> List u8 = \u. "/tmp/keel-write-example.txt"
+
+main =
+  let wrote = file.write (path ()) "first line\n" in
+  let added = file.appendTo (path ()) "second line\n" in
+  case file.read (path ()) of
+    { None -> println "can't read it back"; (wrote, (added, 0))
+    | Some(text) -> print text; (wrote, (added, prelude.length text)) }

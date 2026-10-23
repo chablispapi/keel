@@ -1,0 +1,5 @@
+-- std.array has its own length: a plain length would be ambiguous, so it is qualified.
+-- Importing std.array leaves the prelude's length alone (it used to hide it everywhere).
+import std.array
+
+main = (prelude.length (Cons(7, box Cons(8, box Nil))), array.length (array.make 3 0))

@@ -45,7 +45,7 @@ loadModulesWith readSource entry = do
       Left (path ++ ": only the entry file may define main")
     lib <- preludeDecls
     let names private = M.fromList [(name, S.unions [declared d | (p, d) <- modDecls m, p == private]) | (name, (_, _, m)) <- mods]
-        scope = Scope (names False) (names True) (S.unions (map declared lib))
+        scope = Scope (names False) (names True) (S.unions (map declared lib)) (takeBaseName entry)
     resolved <- forM mods $ \(name, (path, _, m)) -> resolveModule scope name path m
     main <- case [m | (name, (_, Just m)) <- zip order resolved, name == takeBaseName entry] of
       m : _ -> Right m
@@ -96,8 +96,9 @@ importPath root imp = case imp of
   where
     file m = map (\c -> if c == '.' then '/' else c) m <.> "kl"
 
--- | Every module's public and private names, and the prelude's.
-data Scope = Scope {publics, privates :: M.Map String (S.Set String), preludeNames :: S.Set String}
+-- | Every module's public and private names, the prelude's, and the entry module (whose
+-- declarations may replace the prelude's).
+data Scope = Scope {publics, privates :: M.Map String (S.Set String), preludeNames :: S.Set String, entryName :: String}
 
 at :: Maybe Pos -> String
 at (Just (f, l, c)) = f ++ ":" ++ show l ++ ":" ++ show c ++ ": "
@@ -108,6 +109,9 @@ at Nothing = ""
 internal :: Scope -> String -> Bool -> String -> String
 internal scope m private n
   | private || length [() | ns <- M.elems (publics scope), n `S.member` ns] > 1 = n ++ "@" ++ m
+  -- Another module's name the prelude also has stays apart from it: only the entry file
+  -- replaces prelude definitions (Keel.Prelude.withPrelude).
+  | m /= entryName scope, n `S.member` preludeNames scope = n ++ "@" ++ m
   | otherwise = n
 
 -- | Resolve a module's names to program-wide names: its declarations and its main.
@@ -123,11 +127,15 @@ resolveModule scope self path (Module imports decls main _) = do
     pubs m = M.findWithDefault S.empty m (publics scope)
 
     -- An unqualified name: this module's, else an import's, else the prelude's (or unbound,
-    -- which inference reports).
+    -- which inference reports). An import's name that the prelude also has must be qualified,
+    -- so importing a module never changes what a prelude name means.
     plain pos n
       | Just i <- M.lookup n own = Right i
       | otherwise = case [m | m <- imported, n `S.member` pubs m] of
-          [m] -> Right (internal scope m False n)
+          [m]
+            | n `S.member` preludeNames scope ->
+                Left (at pos ++ n ++ " is ambiguous: it is declared in " ++ m ++ " and in the prelude; write " ++ qualifier m ++ "." ++ n ++ " or prelude." ++ n)
+            | otherwise -> Right (internal scope m False n)
           ms@(_ : _ : _) ->
             Left (at pos ++ n ++ " is ambiguous: it is declared in " ++ intercalate " and " ms ++ "; write " ++ intercalate " or " [qualifier m ++ "." ++ n | m <- ms])
           []
@@ -147,9 +155,17 @@ resolveModule scope self path (Module imports decls main _) = do
         Left (at pos ++ "module " ++ m ++ " has no " ++ n)
       Right (internal scope m False n)
 
+    -- prelude.n: the prelude's n, whatever this module or its imports declare.
+    fromPrelude pos n
+      | n `S.member` preludeNames scope = Right n
+      | otherwise = Left (at pos ++ "the prelude has no " ++ n)
+    preludeQ q = q == "prelude" && M.notMember q quals
+
     -- A name the parser read with its qualifier: q.f[t], q.Type, q.Con.
     name pos n = case break (== '.') n of
-      (q, '.' : f) | M.member q quals -> qualified pos q f
+      (q, '.' : f)
+        | M.member q quals -> qualified pos q f
+        | preludeQ q -> fromPrelude pos f
       _ -> plain pos n
 
     -- Types carry no positions: their errors point at the declaration's first expression.
@@ -181,6 +197,7 @@ resolveModule scope self path (Module imports decls main _) = do
       At p e -> At p <$> term (Just p) bound e
       Var x | x `S.notMember` bound -> Var <$> plain pos x
       Proj (Var q) n | q `S.notMember` bound, M.member q quals -> Var <$> qualified pos q n
+      Proj (Var q) n | q `S.notMember` bound, preludeQ q -> Var <$> fromPrelude pos n
       Lam x t b -> Lam x <$> ty pos t <*> go (S.insert x bound) b
       LLam x t b -> LLam x <$> ty pos t <*> go (S.insert x bound) b
       Let x e b -> Let x <$> go bound e <*> go (S.insert x bound) b

@@ -110,6 +110,11 @@ use is then ambiguous, and the qualified form picks one:
 main.kl:8:8: init is ambiguous: it is declared in drivers.console and drivers.led; write console.init or light.init
 ```
 
+An imported name the prelude also has is ambiguous the same way: after `import std.array`, a
+plain `length` is an error, and `array.length` or `prelude.length` picks one. Importing a
+module never changes what a prelude name means; only the entry file can replace a prelude
+definition, by declaring the name itself.
+
 A declaration marked `private` is visible only in its own file, so two modules can each have a
 `private def helper`. A qualifier wins over a projection only when no local variable has that
 name: with a local `console`, `console.greet` observes it. Types, constructors and effects are
@@ -169,7 +174,7 @@ other: `import std.map`, then `map.insert`.
 |---|---|
 | `std.map` | `Map k v`: ordered maps (AVL trees). `Tip` is the empty map; `insert`, `lookup`, `member`, `delete` take a comparison (`compareInt`, `string.compare`); `size`, `height`, `toList` (in key order) |
 | `std.array` | `Array a`: growable arrays with constant-time indexing. `empty`, `make n x`, `length`, `get`, `set`, `push`, `pop`, `fromList`, `toList`, `foldl` |
-| `std.file` | `read path`: a file's bytes as `Option (List u8)` (`None` if it can't be opened); `open`, `getByte`, `close` to stream one (effect `Files`) |
+| `std.file` | `read path`: a file's bytes as `Option (List u8)` (`None` if it can't be opened); `write path bytes` and `appendTo path bytes` (`false` if it can't be written); `open`, `getByte`, `create`, `openAppend`, `put`, `close` to stream (effect `Files`) |
 | `std.loop` | an event loop: `run init step` drives a pure `step : s -> Event -> (s, List Command)`. Events: `Start`, `Listening`, `Accepted`, `Connected`, `Failed`, `Received`, `Closed`, `Timer`; commands: `Listen`, `Connect`, `Send`, `Close`, `After`, `Stop`; `ipv4 127 0 0 1` (effect `Net`; `examples/echo.kl`, `examples/timers.kl`) |
 | `std.string` | for `List u8`: `compare`, `equal`, `fromInt`, `parseInt` (`Option i64`), `split`, `lines`, `join`, `isDigit`, `isSpace`, `isAlpha` |
 
@@ -296,11 +301,14 @@ RISC-V target has no debug info yet.
 (`keelc run` passes its stdin through); on RISC-V, the UART's receive register, with `-1` when no
 byte is waiting.
 
-**Files** reads files by name: `openFile : Array u8 => i64` (a handle, or -1), `readByte : i64
-=> i64` (a byte, or -1 at the end), `closeFile : i64 => Unit`. On the Mac they are `fopen`,
-`fgetc` and `fclose`, with paths relative to the current directory; `keelc run` reads the same
-files. RISC-V has no file system, so every `openFile` there gives -1. Use `std.file` rather
-than the handles: `examples/files.kl`.
+**Files** reads and writes files by name: `openFile : Array u8 => i64` (a handle to read, or
+-1), `readByte : i64 => i64` (a byte, or -1 at the end), `createFile` and `appendFile : Array u8
+=> i64` (a handle to write: the file emptied, or written after its end), `writeBytes : (i64,
+Array u8) => i64` (how many bytes, or -1), `closeFile : i64 => Unit`. On the Mac and on x86-64
+Linux they are `fopen`, `fgetc`, `fputc` and `fclose`, with paths relative to the current
+directory. `keelc run` reads the same files; what a program writes it reads back as written,
+and the files are saved when it ends. RISC-V has no file system, so every open there gives -1.
+Use `std.file` rather than the handles: `examples/files.kl`, `examples/write.kl`.
 
 **Net** is IPv4 TCP and a clock, as thin socket calls: `tcpListen (address, port)`,
 `sockPort`, `tcpAccept`, `tcpConnect (address, port)`, `sockSend (fd, (bytes, from))` (how

@@ -3,8 +3,11 @@
 --   import std.file
 --   main = case file.read "notes.txt" of { None -> println "no notes" | Some(text) -> print text }
 --
--- ponytail: reading only; file.open / file.getByte / file.close expose handles if a program
--- needs to stream. Handles are plain numbers, so the type system doesn't stop a use after close.
+--   main = if file.write "notes.txt" "first\n" then file.appendTo "notes.txt" "second\n" else false
+--
+-- file.open / file.getByte, file.create / file.openAppend / file.put and file.close expose
+-- handles if a program needs to stream.
+-- ponytail: handles are plain numbers, so the type system doesn't stop a use after close.
 
 private def pathBytes : List u8 -> Array u8 ->{Diverge} Array u8 =
   \s acc. case s of { Nil -> acc | Cons(c, rest) -> pathBytes (unbox rest) (arrayPush acc c) }
@@ -15,6 +18,24 @@ def open : List u8 ->{Files, Diverge} i64 = \path. openFile(pathBytes path array
 def getByte : i64 ->{Files} i64 = \h. readByte(h)
 
 def close : i64 ->{Files} Unit = \h. closeFile(h)
+
+-- A handle to write: create empties the file (or makes it), openAppend writes after its
+-- end; -1 if it can't be opened.
+def create : List u8 ->{Files, Diverge} i64 = \path. createFile(pathBytes path arrayEmpty)
+
+def openAppend : List u8 ->{Files, Diverge} i64 = \path. appendFile(pathBytes path arrayEmpty)
+
+-- Write bytes to a handle: how many, or -1.
+def put : i64 -> Array u8 ->{Files} i64 = \h bytes. writeBytes(h, bytes)
+
+private def writeWith : i64 -> List u8 ->{Files, Diverge} Bool =
+  \h text. if h < 0 then false else (let n = writeBytes(h, pathBytes text arrayEmpty) in closeFile(h); n == 0 || 0 < n)
+
+-- Replace a file's contents with these bytes, or add them at its end; false if it can't be
+-- written.
+def write : List u8 -> List u8 ->{Files, Diverge} Bool = \path text. writeWith (create path) text
+
+def appendTo : List u8 -> List u8 ->{Files, Diverge} Bool = \path text. writeWith (openAppend path) text
 
 private def readOnto : i64 -> List u8 ->{Files, Diverge} List u8 =
   \h acc. let c = readByte(h) in if c < 0 then reverse acc else readOnto h (Cons(c as u8, box acc))

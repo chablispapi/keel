@@ -217,10 +217,7 @@ private def take : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
   \k xs. if k == 0 then Nil else case xs of { Nil -> Nil | Cons(x, rest) -> Cons(x, box (take (k - 1) (unbox rest))) }
 
 private def rotate : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
-  \k xs. let n = count xs 0 in if n == 0 then xs else (let r = k % n in append (drop r xs) (take r xs))
-
-private def count : forall (a : Free). List a -> i64 ->{Diverge, Panic} i64 =
-  \xs n. case xs of { Nil -> n | Cons(x, rest) -> count (unbox rest) (n + 1) }
+  \k xs. let n = prelude.length xs in if n == 0 then xs else (let r = k % n in append (drop r xs) (take r xs))
 
 -- Close every socket.
 private def shutdown : Drv ->{Net, Diverge} Unit =

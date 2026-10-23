@@ -1638,17 +1638,9 @@ emitRuntime = do
   -- The machine, through the C library: out (0) and putc (1) print, getc (2) reads stdin,
   -- files (7–9); MMIO (3–6) needs a freestanding target.
   line ".L_perform_machine:"
-  ins "cmp rax, 1"
-  ins "je .L_perform_putc"
-  ins "cmp rax, 2"
-  ins "je .L_perform_getc"
-  ins "cmp rax, 7"
-  ins "je .L_perform_open"
-  ins "cmp rax, 8"
-  ins "je .L_perform_read"
-  ins "cmp rax, 9"
-  ins "je .L_perform_close"
-  ins "cmp rax, 10" -- the Net operations, 10–18
+  forM_ [("putc", "putc"), ("getc", "getc"), ("openFile", "open"), ("createFile", "create"), ("appendFile", "append"), ("readByte", "read"), ("closeFile", "close"), ("writeBytes", "write")] $ \(op, l) ->
+    ins ("cmp rax, " ++ show (opNumber op)) >> ins ("je .L_perform_" ++ l)
+  ins ("cmp rax, " ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
   ins "jae .L_perform_net"
   ins "test rax, rax"
   ins "jnz _keel_panic_unhandled"
@@ -1667,9 +1659,16 @@ emitRuntime = do
   ins "call getchar" -- a byte, or EOF (-1)
   ins "cdqe"
   ins "jmp .L_perform_ret"
-  -- openFile: rdi = the path, an Array u8 (owned). Copy it to the stack with a NUL, fopen it,
-  -- and drop the array. The handle is the FILE pointer, or -1.
-  line ".L_perform_open:"
+  -- openFile, createFile, appendFile: rdi = the path, an Array u8 (owned). Copy it to the stack
+  -- with a NUL, fopen it to read, write (emptied) or append, and drop the array. The handle is
+  -- the FILE pointer, or -1. r12 holds the mode until then (the handlers were not touched: r12
+  -- is free here).
+  forM_ [("open", "rb"), ("create", "wb"), ("append", "ab")] $ \(l, m) -> do
+    line (".L_perform_" ++ l ++ ":")
+    mode <- str m
+    address "r12" mode
+    ins "jmp .L_open_path"
+  line ".L_open_path:"
   ins "mov rbx, rdi"
   ins "mov rcx, qword ptr [rdi]"
   ins "mov r13, rsp"
@@ -1687,15 +1686,14 @@ emitRuntime = do
   line ".L_open_copied:"
   ins "mov byte ptr [rsp + rcx], 0"
   ins "mov rdi, rsp"
-  mode <- str "rb"
-  address "rsi" mode
+  ins "mov rsi, r12"
   ins "call fopen"
   ins "mov rsp, r13"
   ins "test rax, rax"
   ins "jnz .L_open_ok"
   ins "mov rax, -1"
   line ".L_open_ok:"
-  ins "mov r12, rax" -- (the handlers were not touched: r12 is free here)
+  ins "mov r12, rax"
   ins "mov rax, rbx"
   ins "call _keel_drop"
   ins "mov rax, r12"
@@ -1736,8 +1734,8 @@ emitRuntime = do
       ins "mov rbp, rsp"
       ins "sub rsp, 72"
       ins "mov rbx, rdi"
-      forM_ (zip [10 :: Int ..] ["listen", "port", "accept", "connect", "send", "recv", "close", "poll", "clock"]) $ \(n, l) ->
-        ins ("cmp rax, " ++ show n) >> ins ("je .L_net_" ++ l)
+      forM_ (zip netOpNames ["listen", "port", "accept", "connect", "send", "recv", "close", "poll", "clock"]) $ \(op, l) ->
+        ins ("cmp rax, " ++ show (opNumber op)) >> ins ("je .L_net_" ++ l)
       ins "jmp _keel_panic_unhandled"
       -- tcpListen (address, port) and tcpConnect (address, port): a TCP socket bound and
       -- listening (non-blocking, for accept), or connected; -1 if any step fails.
@@ -1970,6 +1968,30 @@ emitRuntime = do
       ins "div r8"
       ins "add rax, rcx"
       ins "jmp .L_net_ret"
+      -- writeBytes (handle, bytes): fputc each byte; how many, or -1. rbx = the pair, r12 =
+      -- the handle, r13 = the array; the index at rbp - 16.
+      line ".L_perform_write:"
+      ins "push rbp"
+      ins "mov rbp, rsp"
+      ins "sub rsp, 72"
+      ins "mov rbx, rdi"
+      ins "mov r12, qword ptr [rbx]"
+      ins "mov r13, qword ptr [rbx + 8]"
+      ins "mov qword ptr [rbp - 16], 0"
+      line ".L_write_loop:"
+      ins "mov rcx, qword ptr [rbp - 16]"
+      ins "cmp rcx, qword ptr [r13]"
+      ins "jae .L_write_done"
+      ins "mov edi, dword ptr [r13 + rcx*4 + 16]" -- 4-byte elements
+      ins "mov rsi, r12"
+      ins "call fputc"
+      ins "cmp eax, -1" -- EOF: it failed
+      ins "je .L_net_fail"
+      ins "inc qword ptr [rbp - 16]"
+      ins "jmp .L_write_loop"
+      line ".L_write_done:"
+      ins "mov rax, qword ptr [rbp - 16]"
+      ins "jmp .L_net_drop"
       line ".L_net_drop:" -- the result in rax; drop the argument
       ins "mov r12, rax"
       ins "mov rax, rbx"

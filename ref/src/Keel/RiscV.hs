@@ -1350,25 +1350,12 @@ emitRuntime = do
   -- The machine: out (0) and putc (1) print, getc (2) reads the UART; MMIO (3–6) reads and
   -- writes device memory; there are no files (7–9).
   line ".L_perform_machine:"
-  ins "li t0, 1"
-  ins "beq a0, t0, .L_putc_op"
-  ins "li t0, 2"
-  ins "beq a0, t0, .L_getc_op"
-  ins "li t0, 3"
-  ins "beq a0, t0, .L_read8"
-  ins "li t0, 4"
-  ins "beq a0, t0, .L_read32"
-  ins "li t0, 5"
-  ins "beq a0, t0, .L_write8"
-  ins "li t0, 6"
-  ins "beq a0, t0, .L_write32"
-  ins "li t0, 7"
-  ins "beq a0, t0, .L_open_op"
-  ins "li t0, 8"
-  ins "beq a0, t0, .L_no_file"
-  ins "li t0, 9"
-  ins "beq a0, t0, .L_no_file"
-  ins "li t0, 10" -- the Net operations, 10–18
+  -- No file system: openFile, createFile and appendFile drop the path and fail; writeBytes
+  -- drops its pair and fails; readByte and closeFile, which only a successful open would
+  -- reach, give -1.
+  forM_ [("putc", ".L_putc_op"), ("getc", ".L_getc_op"), ("read8", ".L_read8"), ("read32", ".L_read32"), ("write8", ".L_write8"), ("write32", ".L_write32"), ("openFile", ".L_open_op"), ("createFile", ".L_open_op"), ("appendFile", ".L_open_op"), ("writeBytes", ".L_net_drop"), ("readByte", ".L_no_file"), ("closeFile", ".L_no_file")] $ \(op, l) ->
+    ins ("li t0, " ++ show (opNumber op)) >> ins ("beq a0, t0, " ++ l)
+  ins ("li t0, " ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
   ins "bgeu a0, t0, .L_no_net"
   ins "bnez a0, .L_perform_unhandled"
   ins "mv a0, a1"
@@ -1393,27 +1380,18 @@ emitRuntime = do
   ins "beqz t1, .L_machine_ret"
   ins "lbu a0, 0(t0)"
   ins "j .L_machine_ret"
-  -- No file system: openFile fails (after dropping the path it was given), and readByte and
-  -- closeFile, which only a successful open would reach, give -1.
   line ".L_open_op:"
   ins "mv a0, a1"
   ins "call _keel_drop"
   line ".L_no_file:"
   ins "li a0, -1"
   ins "j .L_machine_ret"
-  -- No network: tcpListen, tcpConnect and sockSend (10, 13, 14) drop the pair they were given
-  -- and fail; pollWait (17) can't wait (-2), sockRecv (15) gives an empty array, sockClose (16)
-  -- and clockMs (18) 0, and the rest -1.
+  -- No network: tcpListen, tcpConnect and sockSend drop the pair they were given and fail;
+  -- pollWait can't wait (-2), sockRecv gives an empty array, sockClose and clockMs 0, and the
+  -- rest -1.
   line ".L_no_net:"
-  ins "li t0, 17"
-  ins "beq a0, t0, .L_net_nowait"
-  forM_ [10, 13, 14 :: Int] $ \n -> ins ("li t0, " ++ show n) >> ins "beq a0, t0, .L_net_drop"
-  ins "li t0, 15"
-  ins "beq a0, t0, .L_net_recv"
-  ins "li t0, 16"
-  ins "beq a0, t0, .L_net_zero"
-  ins "li t0, 18"
-  ins "beq a0, t0, .L_net_zero"
+  forM_ [("pollWait", ".L_net_nowait"), ("tcpListen", ".L_net_drop"), ("tcpConnect", ".L_net_drop"), ("sockSend", ".L_net_drop"), ("sockRecv", ".L_net_recv"), ("sockClose", ".L_net_zero"), ("clockMs", ".L_net_zero")] $ \(op, l) ->
+    ins ("li t0, " ++ show (opNumber op)) >> ins ("beq a0, t0, " ++ l)
   ins "j .L_no_file"
   line ".L_net_drop:"
   ins "mv a0, a1"

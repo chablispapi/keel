@@ -208,7 +208,9 @@ exampleFiles =
   , ("examples/strings.kl", (Just "3", "Hello from Keel!\n-9223372036854775808\nhello!\nlength of abc: \n"))
   , ("examples/project/src/main.kl", (Just "100", "console ready\nled ready\nhello, modules\n42\n"))
   , ("test/modules/qual/main.kl", (Just "48", ""))
+  , ("test/modules/qual/prelude.kl", (Just "(2, 3)", ""))
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
+  , ("examples/write.kl", (Just "(true, (true, 23))", "first line\nsecond line\n"))
   , ("examples/echo.kl", (Just "18", "hello, event loop\n"))
   , ("examples/timers.kl", (Just "(123, 21)", ""))
   , ("examples/bulk.kl", (Just "(1048576, true)", ""))
@@ -271,6 +273,7 @@ moduleErrors =
   , ("test/modules/scope/hidden.kl", "hidden.kl:3:8: hidden is declared in module b; import b to use it")
   , ("test/modules/scope/private.kl", "private.kl:3:8: secret is private to module a")
   , ("test/modules/qual/ambiguous.kl", "ambiguous.kl:3:8: Ready is ambiguous: it is declared in x and y; write x.Ready or y.Ready")
+  , ("test/modules/qual/prelude-ambiguous.kl", "prelude-ambiguous.kl:3:8: length is ambiguous: it is declared in std.array and in the prelude; write array.length or prelude.length")
   , ("test/modules/missing/main.kl", "test/modules/missing/main.kl:1:1: module nowhere not found")
   , ("test/syntax/nodefault.kl", "nodefault.kl:1:36: parse error")
   ]

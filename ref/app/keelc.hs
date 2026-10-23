@@ -16,6 +16,7 @@
 -- to its directory ("Keel.Modules").
 module Main (main) where
 
+import Control.Monad (forM_)
 import Data.Char (isSpace)
 import Data.Map.Strict qualified as M
 import Keel.AArch64 (compileNativeWith)
@@ -23,7 +24,7 @@ import Keel.Check (TypeError (..), checkProgram)
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as BC
-import Keel.Eval (Machine (..), Outcome (..), evalProgramOn)
+import Keel.Eval (Machine (..), Outcome (..), runProgramOn)
 import System.IO.Unsafe (unsafePerformIO)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (serve)
@@ -79,8 +80,10 @@ main = do
           hSetBinaryMode stdin True
           hSetBinaryMode stdout True
           input <- getContents
-          let (outcome, output) = evalProgramOn (Machine input readBytes True) mono
+          let (outcome, output, written) = runProgramOn (Machine input readBytes True) mono
           putStr output
+          -- The evaluator keeps written files to itself until the end (pure): save them now.
+          forM_ (M.toList written) $ \(path, bytes) -> B.writeFile path (BC.pack bytes)
           case outcome of
             Done v -> putStrLn ("result: " ++ show v)
             Panicked msg -> hPutStrLn stderr ("panic: " ++ msg) >> exitWith (ExitFailure 101)

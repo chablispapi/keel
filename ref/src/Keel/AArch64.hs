@@ -2034,17 +2034,9 @@ emitRuntime = do
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
   line "L_perform_machine:"
-  ins "cmp x0, #1" -- putc
-  ins "b.eq L_perform_putc"
-  ins "cmp x0, #2" -- getc
-  ins "b.eq L_perform_getc"
-  ins "cmp x0, #7" -- openFile
-  ins "b.eq L_perform_open"
-  ins "cmp x0, #8" -- readByte
-  ins "b.eq L_perform_read"
-  ins "cmp x0, #9" -- closeFile
-  ins "b.eq L_perform_close"
-  ins "cmp x0, #10" -- the Net operations, 10–18
+  forM_ [("putc", "putc"), ("getc", "getc"), ("openFile", "open"), ("createFile", "create"), ("appendFile", "append"), ("readByte", "read"), ("closeFile", "close"), ("writeBytes", "write")] $ \(op, l) ->
+    ins ("cmp x0, #" ++ show (opNumber op)) >> ins ("b.eq L_perform_" ++ l)
+  ins ("cmp x0, #" ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
   ins "b.hs L_perform_net"
   ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
   ins "sub sp, sp, #16"
@@ -2067,9 +2059,15 @@ emitRuntime = do
   ins "sxtw x0, w0"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
-  -- openFile: x1 = the path, an Array u8 (owned). Copy it to the stack with a NUL, fopen it,
-  -- and drop the array. The handle is the FILE pointer, or -1.
-  line "L_perform_open:"
+  -- openFile, createFile, appendFile: x1 = the path, an Array u8 (owned). Copy it to the stack
+  -- with a NUL, fopen it to read, write (emptied) or append, and drop the array. The handle is
+  -- the FILE pointer, or -1.
+  forM_ [("open", "rb"), ("create", "wb"), ("append", "ab")] $ \(l, m) -> do
+    line ("L_perform_" ++ l ++ ":")
+    mode <- str m
+    address "x15" mode
+    ins "b L_open_path"
+  line "L_open_path:"
   ins "str x1, [x29, #16]"
   ins "ldr x9, [x1]"
   ins "add x10, x9, #16"
@@ -2087,8 +2085,7 @@ emitRuntime = do
   line "L_open_copied:"
   ins "strb wzr, [sp, x9]"
   ins "mov x0, sp"
-  mode <- str "rb"
-  address "x1" mode
+  ins "mov x1, x15"
   ins "bl _fopen"
   ins "mov sp, x29"
   ins "cmp x0, #0"
@@ -2128,8 +2125,8 @@ emitRuntime = do
       line "L_perform_net:"
       ins "sub sp, sp, #64"
       ins "str x1, [x29, #16]"
-      forM_ (zip [10 :: Int ..] ["listen", "port", "accept", "connect", "send", "recv", "close", "poll", "clock"]) $ \(n, l) ->
-        ins ("cmp x0, #" ++ show n) >> ins ("b.eq L_net_" ++ l)
+      forM_ (zip netOpNames ["listen", "port", "accept", "connect", "send", "recv", "close", "poll", "clock"]) $ \(op, l) ->
+        ins ("cmp x0, #" ++ show (opNumber op)) >> ins ("b.eq L_net_" ++ l)
       ins "b _keel_panic_unhandled"
       -- tcpListen (address, port) and tcpConnect (address, port): a TCP socket bound and
       -- listening (non-blocking, for accept), or connected; -1 if any step fails.
@@ -2389,6 +2386,35 @@ emitRuntime = do
       ins "udiv x10, x10, x11"
       ins "add x0, x9, x10"
       ins "b L_net_ret"
+      -- writeBytes (handle, bytes): fputc each byte; how many, or -1. Locals: the handle -8,
+      -- the array -16, the index -24.
+      line "L_perform_write:"
+      ins "sub sp, sp, #64"
+      ins "str x1, [x29, #16]"
+      ins "ldr x9, [x1]"
+      ins "str x9, [x29, #-8]"
+      ins "ldr x9, [x1, #8]"
+      ins "str x9, [x29, #-16]"
+      ins "str xzr, [x29, #-24]"
+      line "L_write_loop:"
+      ins "ldr x11, [x29, #-24]"
+      ins "ldr x10, [x29, #-16]"
+      ins "ldr x12, [x10]"
+      ins "cmp x11, x12"
+      ins "b.hs L_write_done"
+      ins "add x13, x10, x11, lsl #2" -- 4-byte elements
+      ins "ldr w0, [x13, #16]"
+      ins "ldr x1, [x29, #-8]"
+      ins "bl _fputc"
+      ins "cmn w0, #1" -- EOF: it failed
+      ins "b.eq L_net_fail"
+      ins "ldr x11, [x29, #-24]"
+      ins "add x11, x11, #1"
+      ins "str x11, [x29, #-24]"
+      ins "b L_write_loop"
+      line "L_write_done:"
+      ins "ldr x0, [x29, #-24]"
+      ins "b L_net_drop"
       line "L_net_drop:" -- the result in x0; drop the argument
       ins "str x0, [x29, #24]"
       ins "ldr x0, [x29, #16]"

@@ -4,7 +4,8 @@
 -- checking and evaluation, which work on the core.
 module Keel.Syntax where
 
-import Data.List (intercalate)
+import Data.List (elemIndex, intercalate)
+import Data.Maybe (fromMaybe)
 import Data.Map.Strict qualified as M
 import Data.Set (Set)
 import Data.Set qualified as S
@@ -329,9 +330,10 @@ divergeE = "Diverge"
 -- numbers operations this way, then user operations in declaration order). Unhandled, @out@
 -- prints a number and a newline, @putc@ one byte, @getc@ reads one byte of input (-1 at its
 -- end), the MMIO operations access device memory (freestanding targets only), and the Files
--- operations read files: @openFile@ takes a path's bytes and gives a handle (-1 if it can't be
--- opened), @readByte@ a byte (-1 at the end), @closeFile@ releases the handle (hosted targets
--- only). "std.file" wraps them. The Net operations are thin socket calls on IPv4 TCP (hosted
+-- operations read and write files: @openFile@ takes a path's bytes and gives a handle to read
+-- (-1 if it can't be opened), @readByte@ a byte (-1 at the end); @createFile@ (emptied) and
+-- @appendFile@ give one to write, @writeBytes@ writes bytes (how many, or -1); @closeFile@
+-- releases a handle (hosted targets only). "std.file" wraps them. The Net operations are thin socket calls on IPv4 TCP (hosted
 -- targets only; elsewhere they fail): "std.loop" builds its event loop on them.
 builtinEffects :: [(String, [(String, Ty, Ty)])]
 builtinEffects =
@@ -344,7 +346,15 @@ builtinEffects =
       , ("write32", TPair (TInt u64) (TInt u32), TUnit)
       ]
     )
-  , (filesE, [("openFile", TData "Array" [TInt u8], TInt i64), ("readByte", TInt i64, TInt i64), ("closeFile", TInt i64, TUnit)])
+  , ( filesE
+    , [ ("openFile", TData "Array" [TInt u8], TInt i64)
+      , ("readByte", TInt i64, TInt i64)
+      , ("closeFile", TInt i64, TUnit)
+      , ("createFile", TData "Array" [TInt u8], TInt i64)
+      , ("appendFile", TData "Array" [TInt u8], TInt i64)
+      , ("writeBytes", TPair (TInt i64) (TData "Array" [TInt u8]), TInt i64)
+      ]
+    )
   , ( netE
     , [ ("tcpListen", TPair (TInt u32) (TInt u16), TInt i64) -- address (0: any), port (0: any free) → fd or -1
       , ("sockPort", TInt i64, TInt i64) -- a listener's port
@@ -358,6 +368,15 @@ builtinEffects =
       ]
     )
   ]
+
+-- | A built-in operation's number: its place in 'builtinEffects' (user operations follow).
+opNumber :: String -> Int
+opNumber op = fromMaybe (error ("not a built-in operation: " ++ op)) (elemIndex op [o | (_, os) <- builtinEffects, (o, _, _) <- os])
+
+-- | The Net operations, in order: the last built-in operations (the runtimes dispatch on
+-- @>= opNumber "tcpListen"@).
+netOpNames :: [String]
+netOpNames = [o | (l, os) <- builtinEffects, l == netE, (o, _, _) <- os]
 
 -- | Built-in data: @data Option a = None | Some(a)@, the result of @+?@.
 optionDecl :: Decl
