@@ -29,7 +29,7 @@ import Keel.Lower qualified as L
 import Keel.Parser (parseModule)
 import Keel.RiscV (compileRiscV)
 import Keel.X86 (compileX86)
-import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
+import Keel.Toolchain (RiscVTools, buildNative, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
 import Keel.Syntax
 import Sexp (sexpModule)
@@ -317,7 +317,7 @@ selfhostChecks dir = do
     Right asm -> do
       let exe = dir </> "selfhost-parse"
       writeFile (exe ++ ".s") asm
-      _ <- readProcessWithExitCode "cc" ["-o", exe, exe ++ ".s"] ""
+      _ <- buildNative False (exe ++ ".s") exe
       files <- concat <$> mapM klFiles ["examples", "std", "test", "selfhost"]
       fmap concat $ forM files $ \f -> do
         text <- readFile f
@@ -591,10 +591,10 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
         src = dir </> (base ++ ".s")
         exe = dir </> base
     writeFile src asm
-    (ccCode, _, ccErr) <- readProcessWithExitCode "cc" (["-g" | debug] ++ ["-o", exe, src]) ""
-    case ccCode of
-      ExitFailure _ -> pure [failMsg ("cc failed:\n" ++ ccErr)]
-      ExitSuccess -> do
+    built <- buildNative debug src exe
+    case built of
+      Left ccErr -> pure [failMsg ("assembling or linking failed:\n" ++ ccErr)]
+      Right () -> do
         environment <- getEnvironment
         (code, stdout, stderr) <- readCreateProcessWithExitCode ((proc exe []) {env = Just (("KEEL_STATS", "1") : environment)}) (exampleInput name)
         machine <- machineFor name

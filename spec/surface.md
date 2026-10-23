@@ -9,9 +9,11 @@ keelc new NAME                 create a project: NAME/keel.project, NAME/src/mai
 keelc check [FILE.kl]          type-check; print main's type and effects
 keelc run   [FILE.kl]          run with the reference evaluator
 keelc asm   [FILE.kl] [-g]     print the ARM64 assembly
-keelc build [FILE.kl] [-o OUT] [--target native|riscv64] [-g]
-                               native executable (via the system cc), or a freestanding
-                               RISC-V image for QEMU's virt board; -g adds debug info
+keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]
+                               native executable (assembled by Homebrew's LLVM clang if
+                               installed, else the system cc; linked by cc), a freestanding
+                               RISC-V image for QEMU's virt board, or x86-64 Linux assembly;
+                               -g adds debug info
 keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
 keelc lsp                      the language server, over stdin/stdout
 ```

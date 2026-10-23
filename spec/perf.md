@@ -195,6 +195,15 @@ and the full test suite passes on both after each step.
   above. Ordinary parent drops still do not transfer field ownership, and partial transfers
   still use the generic reuse helper (`spec/memory.md`).
 
+## Build time
+
+`keelc build` spends most of its time in the assembler: `selfhost/parse.kl` (about 1,000
+lines of Keel) is 89,000 lines of assembly, and Apple's clang 21 assembles about 27 µs per
+line against about 8 µs for Homebrew's LLVM 23 (same output). So native builds assemble with
+LLVM's clang when it is installed and link with `cc`: that build went from 4.4 to 1.3 s
+(0.53 s in keelc). Before that, `_ -> e` defaults stopped being copied into each constructor
+(139,000 → 89,000 lines).
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and

@@ -34,7 +34,7 @@ import Keel.X86 (compileX86, linkCommand)
 import System.Info qualified as Info
 import Keel.RiscV (compileRiscV)
 import Keel.Syntax (Program, prettyEff, prettyTy)
-import Keel.Toolchain (RiscVTools, buildRiscV, findRiscVTools, runQemu)
+import Keel.Toolchain (RiscVTools, buildNative, buildRiscV, findRiscVTools, runQemu)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
@@ -183,10 +183,10 @@ build job = do
   asm <- orDie (compileNativeWith (jobDebug job) core)
   let s = out <.> "s"
   writeFile s asm
-  (code, _, err) <- readProcessWithExitCode "cc" (["-g" | jobDebug job] ++ ["-o", out, s]) ""
-  case code of
-    ExitSuccess -> putStrLn ("built " ++ out)
-    ExitFailure _ -> hPutStr stderr err >> die "cc failed"
+  built <- buildNative (jobDebug job) s out
+  case built of
+    Right () -> putStrLn ("built " ++ out)
+    Left err -> hPutStr stderr err >> die "assembling or linking failed"
 
 -- | x86-64 Linux: write OUT.s; on such a machine, link it with gcc as well.
 buildX86 :: Job -> IO ()
