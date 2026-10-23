@@ -211,6 +211,7 @@ exampleFiles =
   , ("examples/files.kl", (Just "0", "examples/fact.kl: 9 lines\nexamples/no-such-file.kl: can't open\n"))
   , ("examples/echo.kl", (Just "18", "hello, event loop\n"))
   , ("examples/timers.kl", (Just "(123, 21)", ""))
+  , ("examples/bulk.kl", (Just "(1048576, true)", ""))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
   , ("test/memory/reuse-branches.kl", (Just "89829149613", ""))

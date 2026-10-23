@@ -243,9 +243,10 @@ network op v n = case (op, v) of
           (port, waiting) = nListeners n M.! l
        in pure (int a, n {nSocks = M.insert a (Sock b "" False) (M.insert b (Sock a "" False) (nSocks n)), nListeners = M.insert l (port, waiting ++ [b]) (nListeners n), nNext = b + 1})
     [] -> pure (int (-1), n)
-  ("sockSend", VPair (VInt _ fd) (VArray bytes)) -> case M.lookup fd (nSocks n) of
+  ("sockSend", VPair (VInt _ fd) (VPair (VArray bytes) (VInt _ from))) -> case M.lookup fd (nSocks n) of
     Just s | not (sPeerClosed s), Just peer <- M.lookup (sPeer s) (nSocks n) ->
-      let text = [toEnum (fromInteger b) | VInt _ b <- toList bytes]
+      let room = max 0 (buffer - length (sInbox peer))
+          text = [toEnum (fromInteger b) | VInt _ b <- toList (Seq.take room (Seq.drop (fromInteger from) bytes))]
        in pure (int (toInteger (length text)), n {nSocks = M.insert (sPeer s) peer {sInbox = sInbox peer ++ text} (nSocks n)})
     _ -> pure (int (-1), n)
   ("sockRecv", VInt _ fd) -> case M.lookup fd (nSocks n) of
@@ -257,7 +258,7 @@ network op v n = case (op, v) of
           Nothing -> nSocks n
      in pure (VUnit, n {nSocks = socks, nListeners = M.delete fd (nListeners n)})
   ("pollWait", VPair (VArray fds) (VInt _ timeout)) ->
-    case [i | (i, VInt _ fd) <- zip [0 ..] (toList fds), ready fd] of
+    case [i * 4 + r | (i, VInt _ e) <- zip [0 ..] (toList fds), let r = readiness (e `div` 4) (odd e) (odd (e `div` 2)), r /= 0] of
       i : _ -> pure (int i, n)
       []
         | timeout < 0 -> Left "pollWait would wait forever (no socket can become ready)"
@@ -266,12 +267,17 @@ network op v n = case (op, v) of
   _ -> Left ("bad Net operation " ++ op)
   where
     int = VInt i64
-    -- As poll: a listener with a connection waiting, a socket with bytes or a closed peer, or
-    -- an fd that isn't open (POLLNVAL).
-    ready fd = case (M.lookup fd (nListeners n), M.lookup fd (nSocks n)) of
-      (Just (_, waiting), _) -> not (null waiting)
-      (_, Just s) -> not (null (sInbox s)) || sPeerClosed s
-      _ -> True
+    -- Each socket receives into a buffer this size: a sender to a full one waits.
+    buffer = 65536
+    -- As poll: readable (1) is a listener with a connection waiting or a socket with bytes, if
+    -- asked, and always a closed peer (POLLHUP) or an fd that isn't open (POLLNVAL); writable
+    -- (2), if asked, is room in the peer's buffer.
+    readiness fd wantsRead wantsWrite = case (M.lookup fd (nListeners n), M.lookup fd (nSocks n)) of
+      (Just (_, waiting), _) -> if wantsRead && not (null waiting) then 1 else 0
+      (_, Just s) ->
+        (if (wantsRead && not (null (sInbox s))) || sPeerClosed s then 1 else 0)
+          + (if wantsWrite && maybe False ((< buffer) . length . sInbox) (M.lookup (sPeer s) (nSocks n)) then 2 else 0)
+      _ -> 1 :: Integer
 
 -- | Arrays are values: an update returns a new sequence (the native code updates in place
 -- when it can, which no program can observe).

@@ -1,0 +1,37 @@
+-- 1 MiB through std.loop's echo, more than the sockets can hold: the client queues sixteen
+-- 64 KiB arrays at once (array k is all byte k), the server sends back what it receives, and
+-- both sides keep going while their sends wait. Each piece that comes back is checked by its
+-- first and last byte against its place in the stream. Without a network (RISC-V) the Listen
+-- fails and nothing is sent.
+
+import std.array
+import std.loop
+
+def piece : i64 = 65536
+def pieces : i64 = 16
+
+-- State(the client's connection, bytes back so far, whether every piece was in place).
+data State = State(i64, i64, Bool)
+
+def sends : i64 -> i64 -> List loop.Command ->{Panic, Diverge} List loop.Command =
+  \conn k acc. if k == 0 then acc else sends conn (k - 1) (Cons(loop.Send(conn, array.make piece ((k - 1) as u8)), box acc))
+
+-- The byte at this place in the stream.
+def expected : i64 ->{Panic} i64 = \at. at / piece
+
+def step : State -> loop.Event ->{Diverge, Panic} (State, List loop.Command) =
+  \s e. case s of { State(client, got, ok) -> case e of
+    { Start -> (s, Cons(loop.Listen(1, loop.ipv4 127 0 0 1, 0), box Nil))
+    | Listening(tag, port) -> (s, Cons(loop.Connect(2, loop.ipv4 127 0 0 1, port as u16), box Nil))
+    | Connected(tag, conn) -> (State(conn, got, ok), sends conn pieces Nil)
+    | Received(conn, bytes) ->
+        if conn == client then
+          let n = array.length bytes in
+          let fits = (array.get bytes 0 as i64) == expected got && (array.get bytes (n - 1) as i64) == expected (got + n - 1) in
+          let got2 = got + n in
+          (State(client, got2, ok && fits), if got2 == piece * pieces then Cons(loop.Stop, box Nil) else Nil)
+        else (s, Cons(loop.Send(conn, bytes), box Nil))
+    | Failed(tag) -> (s, Cons(loop.Stop, box Nil))
+    | _ -> (s, Nil) } }
+
+main = case loop.run (State(0, 0, true)) step of { State(client, got, ok) -> (got, ok) }

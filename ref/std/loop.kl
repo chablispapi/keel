@@ -10,9 +10,11 @@
 --   main = loop.run 0 step
 --
 -- Connections are numbered by run and never renumbered: a Send or Close to a connection that
--- has closed does nothing. One connection at a time is read; a Send waits until the bytes are
--- sent.
--- ponytail: poll over every socket each round, and blocking sends (no write queue).
+-- has closed does nothing. A Send never waits: what the connection can't take yet is queued
+-- and sent as it drains, and a Close takes effect once its queue is sent. Closed means the
+-- peer has sent all it will; bytes still queued to it are sent before the connection closes.
+-- On Stop, run returns at once: bytes still queued are not sent.
+-- ponytail: poll over every socket each round.
 
 import std.array
 import std.map
@@ -35,8 +37,9 @@ data Command = Listen(i64, u32, u16) | Connect(i64, u32, u16) | Send(i64, Array 
 def ipv4 : u8 -> u8 -> u8 -> u8 -> u32 =
   \a b c d. ((a as u32) lsl 24) lor ((b as u32) lsl 16) lor ((c as u32) lsl 8) lor (d as u32)
 
--- What run knows about a socket: a listener (its fd and Listen's tag), or a connection.
-private data Socket = Listener(i64, i64) | Conn(i64)
+-- What run knows about a socket: a listener (its fd and Listen's tag), or a connection (its fd,
+-- the bytes queued to send, how many of the first array are sent, and whether Close came).
+private data Socket = Listener(i64, i64) | Conn(i64, List (Array u8), i64, Bool)
 
 -- Drv(next connection number, sockets by number, timers (deadline, tag) soonest first, how far
 -- to rotate the poll order).
@@ -75,12 +78,10 @@ private def exec : List Command -> Drv -> List Event ->{Net, Diverge, Panic} Nex
         | Connect(tag, addr, port) ->
             let fd = tcpConnect(addr, port) in
             if fd < 0 then exec (unbox rest) d (later queue (Failed(tag)))
-            else let (d2, conn) = add d (Conn(fd)) in
+            else let (d2, conn) = add d (Conn(fd, Nil, 0, false)) in
                  exec (unbox rest) d2 (later queue (Connected(tag, conn)))
-        | Send(conn, bytes) ->
-            (case connFd d conn of { None -> () | Some(fd) -> let n = sockSend(fd, bytes) in () });
-            exec (unbox rest) d queue
-        | Close(conn) -> exec (unbox rest) (forget d conn) queue
+        | Send(conn, bytes) -> exec (unbox rest) (enqueue d conn bytes) queue
+        | Close(conn) -> exec (unbox rest) (closing d conn) queue
         | After(ms, tag) ->
             let at = clockMs () + ms in
             (case d of { Drv(next, socks, timers, rot) -> exec (unbox rest) (Drv(next, socks, insertTimer at tag timers, rot)) queue }) } }
@@ -92,11 +93,54 @@ private def add : Drv -> Socket ->{Diverge, Panic} (Drv, i64) =
   \d sock. case d of
     { Drv(next, socks, timers, rot) -> (Drv(next + 1, map.insert compareInt next sock socks, timers, rot), next) }
 
-private def connFd : Drv -> i64 ->{Diverge} Option i64 =
+private def update : Drv -> i64 -> Socket ->{Diverge} Drv =
+  \d conn sock. case d of { Drv(next, socks, timers, rot) -> Drv(next, map.insert compareInt conn sock socks, timers, rot) }
+
+-- Queue bytes on a connection (not one being closed) and send what it takes now.
+private def enqueue : Drv -> i64 -> Array u8 ->{Net, Diverge, Panic} Drv =
+  \d conn bytes. case d of
+    { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
+        { Some(sock) -> (case sock of
+            { Conn(fd, out, from, shut) ->
+                if shut then d else flush (update d conn (Conn(fd, append out (Cons(bytes, box Nil)), from, shut))) conn
+            | Listener(fd, tag) -> d })
+        | None -> d } }
+
+-- Close a connection once its queue is sent; a listener at once.
+private def closing : Drv -> i64 ->{Net, Diverge, Panic} Drv =
   \d conn. case d of
     { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
-        { Some(sock) -> (case sock of { Conn(fd) -> Some(fd) | Listener(fd, tag) -> None })
-        | None -> None } }
+        { Some(sock) -> (case sock of
+            { Conn(fd, out, from, shut) -> flush (update d conn (Conn(fd, out, from, true))) conn
+            | Listener(fd, tag) -> forget d conn })
+        | None -> d } }
+
+-- Send what the connection takes without waiting; close it if Close came and nothing is left.
+-- A failed send means the peer is gone: the queue is dropped, and the next read reports it.
+private def flush : Drv -> i64 ->{Net, Diverge, Panic} Drv =
+  \d conn. case d of
+    { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
+        { Some(sock) -> (case sock of
+            { Conn(fd, out, from, shut) -> (case sendQueue fd out from of
+                { Sent(out2, from2) -> (case out2 of
+                    { Nil -> if shut then forget d conn else update d conn (Conn(fd, Nil, 0, shut))
+                    | _ -> update d conn (Conn(fd, out2, from2, shut)) })
+                | Broken -> if shut then forget d conn else update d conn (Conn(fd, Nil, 0, shut)) })
+            | Listener(fd, tag) -> d })
+        | None -> d } }
+
+-- What is left to send after sending all the connection takes: the arrays, and how many of
+-- the first are sent.
+private data Sending = Sent(List (Array u8), i64) | Broken
+
+private def sendQueue : i64 -> List (Array u8) -> i64 ->{Net, Diverge, Panic} Sending =
+  \fd out from. case out of
+    { Nil -> Sent(Nil, 0)
+    | Cons(bytes, rest) ->
+        let n = sockSend(fd, (bytes, from)) in
+        if n < 0 then Broken
+        else if from + n == array.length bytes then sendQueue fd (unbox rest) 0
+        else Sent(Cons(bytes, rest), from + n) }
 
 -- Close a socket and forget its number.
 private def forget : Drv -> i64 ->{Net, Diverge} Drv =
@@ -105,7 +149,7 @@ private def forget : Drv -> i64 ->{Net, Diverge} Drv =
         (case map.lookup compareInt conn socks of { Some(sock) -> sockClose(socketFd sock) | None -> () });
         Drv(next, map.delete compareInt conn socks, timers, rot) }
 
-private def socketFd : Socket -> i64 = \sock. case sock of { Listener(fd, tag) -> fd | Conn(fd) -> fd }
+private def socketFd : Socket -> i64 = \sock. case sock of { Listener(fd, tag) -> fd | Conn(fd, out, from, shut) -> fd }
 
 private def insertTimer : i64 -> i64 -> List (i64, i64) ->{Diverge} List (i64, i64) =
   \at tag ts. case ts of
@@ -125,30 +169,43 @@ private def wait : Drv ->{Net, Diverge, Panic} Option (Event, Drv) =
             if now < at then poll d (at - now) else Some((Timer(tag), Drv(next, socks, unbox rest, rot)))
         | Nil -> case socks of { Tip -> None | _ -> poll d (-1) } } }
 
--- Poll every socket, starting at a different one each round so none is starved; -1: no limit.
+-- Poll the sockets (for reading unless being closed, for writing if bytes are queued),
+-- starting at a different one each round so none is starved; -1: no limit. A writable
+-- connection is sent to; a readable one is read, or for one being closed (only a hangup or an
+-- error is reported then) forgotten.
 private def poll : Drv -> i64 ->{Net, Diverge, Panic} Option (Event, Drv) =
   \d timeout. case d of
     { Drv(next, socks, timers, rot) ->
         let all = rotate rot (map.toList socks) in
-        let i = pollWait(fdsOf all array.empty, timeout) in
+        let r = pollWait(fdsOf all array.empty, timeout) in
         let d2 = Drv(next, socks, timers, rot +% 1) in
-        if i == -2 then None -- no way to wait (no network): the loop ends
-        else if i < 0 then wait d2
-        else case nth i all of
+        if r == -2 then None -- no way to wait (no network): the loop ends
+        else if r < 0 then wait d2
+        else case nth (r / 4) all of
           { None -> wait d2
-          | Some(p) -> let (conn, sock) = p in case sock of
-              { Listener(fd, tag) ->
-                  let c = tcpAccept(fd) in
-                  if c < 0 then wait d2 else let (d3, id) = add d2 (Conn(c)) in Some((Accepted(tag, id), d3))
-              | Conn(fd) ->
-                  let bytes = sockRecv(fd) in
-                  if array.length bytes == 0 then Some((Closed(conn), forget d2 conn))
-                  else Some((Received(conn, bytes), d2)) } } }
+          | Some(p) -> let (conn, sock) = p in
+              let d3 = if (r / 2) % 2 == 1 then flush d2 conn else d2 in
+              if r % 2 == 0 then wait d3
+              else case sock of
+                { Listener(fd, tag) ->
+                    let c = tcpAccept(fd) in
+                    if c < 0 then wait d3 else let (d4, id) = add d3 (Conn(c, Nil, 0, false)) in Some((Accepted(tag, id), d4))
+                | Conn(fd, out, from, shut) ->
+                    if shut then wait (forget d3 conn)
+                    else let bytes = sockRecv(fd) in
+                    if array.length bytes == 0 then Some((Closed(conn), closing d3 conn))
+                    else Some((Received(conn, bytes), d3)) } } }
 
-private def fdsOf : List (i64, Socket) -> Array i32 ->{Diverge} Array i32 =
+-- Each socket for pollWait: its fd · 4, plus 1 to read (a listener, or a connection not being
+-- closed) and 2 to write (a connection with bytes queued).
+private def fdsOf : List (i64, Socket) -> Array i32 ->{Diverge, Panic} Array i32 =
   \xs acc. case xs of
     { Nil -> acc
-    | Cons(p, rest) -> let (conn, sock) = p in fdsOf (unbox rest) (array.push acc (socketFd sock as i32)) }
+    | Cons(p, rest) -> let (conn, sock) = p in
+        let wants = case sock of
+          { Conn(fd, out, from, shut) -> (if shut then 0 else 1) + (case out of { Nil -> 0 | _ -> 2 })
+          | Listener(fd, tag) -> 1 } in
+        fdsOf (unbox rest) (array.push acc ((socketFd sock * 4 + wants) as i32)) }
 
 private def nth : forall (a : Free). i64 -> List a ->{Diverge, Panic} Option a =
   \i xs. case xs of { Nil -> None | Cons(x, rest) -> if i == 0 then Some(x) else nth (i - 1) (unbox rest) }

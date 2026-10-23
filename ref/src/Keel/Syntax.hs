@@ -350,10 +350,10 @@ builtinEffects =
       , ("sockPort", TInt i64, TInt i64) -- a listener's port
       , ("tcpAccept", TInt i64, TInt i64) -- a waiting connection's fd, or -1
       , ("tcpConnect", TPair (TInt u32) (TInt u16), TInt i64) -- fd or -1
-      , ("sockSend", TPair (TInt i64) (TData "Array" [TInt u8]), TInt i64) -- all the bytes, or -1
+      , ("sockSend", TPair (TInt i64) (TPair (TData "Array" [TInt u8]) (TInt i64)), TInt i64) -- (fd, (bytes, from)): how many it took without waiting, or -1
       , ("sockRecv", TInt i64, TData "Array" [TInt u8]) -- what has arrived; empty: closed
       , ("sockClose", TInt i64, TUnit)
-      , ("pollWait", TPair (TData "Array" [TInt i32]) (TInt i64), TInt i64) -- fds, timeout in ms (-1: none) → index of a ready fd, -1 (timed out), or -2 (can't wait)
+      , ("pollWait", TPair (TData "Array" [TInt i32]) (TInt i64), TInt i64) -- fd · 4 + 1 (read) + 2 (write), timeout in ms (-1: none) → index · 4 + readable + 2 · writable, -1 (timed out), or -2 (can't wait)
       , ("clockMs", TUnit, TInt i64) -- milliseconds, monotonic
       ]
     )

@@ -303,13 +303,15 @@ files. RISC-V has no file system, so every `openFile` there gives -1. Use `std.f
 than the handles: `examples/files.kl`.
 
 **Net** is IPv4 TCP and a clock, as thin socket calls: `tcpListen (address, port)`,
-`sockPort`, `tcpAccept`, `tcpConnect (address, port)`, `sockSend (fd, bytes)`, `sockRecv fd`
-(an `Array u8`, empty when the peer has closed), `sockClose`, `pollWait (fds, timeout)` (the
-index of a ready fd, -1 on timeout, -2 when it can't wait) and `clockMs`. On the Mac and on
-x86-64 Linux they are the C library's sockets and `poll`; `keelc run` simulates a loopback
-network inside the program (connections only to its own listeners, and a clock that moves only
-when it waits); on RISC-V every listen and connect fails. Use `std.loop` rather than the
-operations.
+`sockPort`, `tcpAccept`, `tcpConnect (address, port)`, `sockSend (fd, (bytes, from))` (how
+many bytes from `from` on the socket took without waiting), `sockRecv fd` (an `Array u8`,
+empty when the peer has closed), `sockClose`, `pollWait (fds, timeout)` (each entry `fd · 4 +
+1 to read + 2 to write`; the first ready one as `index · 4 + readable + 2 · writable`, -1 on timeout,
+-2 when it can't wait) and `clockMs`. On the Mac and on x86-64 Linux they are the C library's
+sockets and `poll`; `keelc run` simulates a loopback network inside the program (connections
+only to its own listeners, 64 KiB of buffer per socket, and a clock that moves only when it
+waits); on RISC-V every listen and connect fails. Use `std.loop` rather than the operations:
+its `Send` queues what a connection can't take yet (`examples/bulk.kl`).
 
 **MMIO** is a built-in effect, like `IO`:
 

@@ -1822,17 +1822,23 @@ emitRuntime = do
       ins "call accept"
       ins "cdqe"
       ins "jmp .L_net_ret"
-      -- sockSend (fd, bytes): send everything, 64 KiB at a time through a stack buffer.
-      -- r12 = fd, r13 = the array; locals: sent so far -16, this chunk -24, of it sent -40.
+      -- sockSend (fd, (bytes, from)): send from byte `from` on, without waiting (the socket is
+      -- non-blocking meanwhile), 64 KiB at a time through a stack buffer; how many bytes the
+      -- socket took, or -1 if it failed before taking any. r12 = fd, r13 = the array; locals:
+      -- position -16, this chunk -24, taken -40.
       line ".L_net_send:"
       ins "mov r12, qword ptr [rbx]"
-      ins "mov r13, qword ptr [rbx + 8]"
-      ins "mov qword ptr [rbp - 16], 0"
+      ins "mov rax, qword ptr [rbx + 8]"
+      ins "mov r13, qword ptr [rax]"
+      ins "mov rax, qword ptr [rax + 8]"
+      ins "mov qword ptr [rbp - 16], rax"
+      ins "mov qword ptr [rbp - 40], 0"
+      nonblocking True
       ins "sub rsp, 65536"
       line ".L_send_chunk:"
       ins "mov rcx, qword ptr [r13]"
       ins "sub rcx, qword ptr [rbp - 16]"
-      ins "jbe .L_send_done"
+      ins "jle .L_send_done"
       ins "cmp rcx, 65536"
       ins "jbe .L_send_sized"
       ins "mov ecx, 65536"
@@ -1849,27 +1855,29 @@ emitRuntime = do
       ins "inc rdx"
       ins "jmp .L_send_copy"
       line ".L_send_copied:"
-      ins "mov qword ptr [rbp - 40], 0"
-      line ".L_send_part:"
-      ins "mov rax, qword ptr [rbp - 40]"
-      ins "cmp rax, qword ptr [rbp - 24]"
-      ins "jae .L_send_next"
       ins "mov edi, r12d"
-      ins "lea rsi, [rsp + rax]"
+      ins "mov rsi, rsp"
       ins "mov rdx, qword ptr [rbp - 24]"
-      ins "sub rdx, rax"
       ins "mov ecx, 0x4000" -- MSG_NOSIGNAL
       ins "call send"
       ins "test rax, rax"
-      ins "jle .L_net_fail"
+      ins "js .L_send_error"
       ins "add qword ptr [rbp - 40], rax"
-      ins "jmp .L_send_part"
-      line ".L_send_next:"
-      ins "mov rax, qword ptr [rbp - 24]"
       ins "add qword ptr [rbp - 16], rax"
-      ins "jmp .L_send_chunk"
+      ins "cmp rax, qword ptr [rbp - 24]"
+      ins "je .L_send_chunk" -- all of it: try the next chunk
+      ins "jmp .L_send_done"
+      line ".L_send_error:"
+      ins "call __errno_location"
+      ins "cmp dword ptr [rax], 11" -- EAGAIN: it takes nothing more now
+      ins "je .L_send_done"
+      ins "cmp qword ptr [rbp - 40], 0"
+      ins "jne .L_send_done"
+      ins "mov qword ptr [rbp - 40], -1"
       line ".L_send_done:"
-      ins "mov rax, qword ptr [r13]"
+      ins "lea rsp, [rbp - 72]" -- the buffer is done with
+      nonblocking False
+      ins "mov rax, qword ptr [rbp - 40]"
       ins "jmp .L_net_drop"
       -- sockRecv fd: up to 64 KiB into a stack buffer, then into a new Array u8 (empty at the
       -- end of the stream or on an error).
@@ -1899,8 +1907,8 @@ emitRuntime = do
       ins "call close"
       ins "xor eax, eax"
       ins "jmp .L_net_ret"
-      -- pollWait (fds, timeout): poll(2) for input on each; the index of the first one ready,
-      -- or -1. r12 = the array, r13 = its length.
+      -- pollWait (fds, timeout): poll(2) on each; the first one ready, as index · 4 +
+      -- readable + 2 · writable, or -1 (timed out) or -2. r12 = the array, r13 = its length.
       line ".L_net_poll:"
       ins "mov r12, qword ptr [rbx]"
       ins "mov r13, qword ptr [r12]"
@@ -1911,9 +1919,15 @@ emitRuntime = do
       line ".L_poll_fill:"
       ins "cmp rcx, r13"
       ins "jae .L_poll_filled"
-      ins "mov eax, dword ptr [r12 + rcx*4 + 16]"
+      ins "mov eax, dword ptr [r12 + rcx*4 + 16]" -- fd · 4 + 1 (read) + 2 (write)
+      ins "mov edx, eax"
+      ins "sar eax, 2"
       ins "mov dword ptr [rsp + rcx*8], eax" -- fd
-      ins "mov dword ptr [rsp + rcx*8 + 4], 1" -- POLLIN; revents 0
+      ins "mov r8d, edx"
+      ins "and edx, 1" -- POLLIN
+      ins "and r8d, 2"
+      ins "lea edx, [rdx + r8*2]" -- POLLOUT; revents 0
+      ins "mov dword ptr [rsp + rcx*8 + 4], edx"
       ins "inc rcx"
       ins "jmp .L_poll_fill"
       line ".L_poll_filled:"
@@ -1929,12 +1943,20 @@ emitRuntime = do
       line ".L_poll_scan:"
       ins "cmp rcx, r13"
       ins "jae .L_net_fail"
-      ins "cmp word ptr [rsp + rcx*8 + 6], 0"
-      ins "jne .L_poll_found"
+      ins "movzx edx, word ptr [rsp + rcx*8 + 6]"
+      ins "test edx, edx"
+      ins "jnz .L_poll_found"
       ins "inc rcx"
       ins "jmp .L_poll_scan"
-      line ".L_poll_found:"
-      ins "mov rax, rcx"
+      line ".L_poll_found:" -- index · 4 + readable (in, error, hangup, not open) + 2 · writable
+      ins "xor eax, eax"
+      ins "test edx, 0x39"
+      ins "setnz al"
+      ins "test edx, 4"
+      ins "setnz r8b"
+      ins "movzx r8d, r8b"
+      ins "lea rax, [rax + r8*2]"
+      ins "lea rax, [rax + rcx*4]"
       ins "jmp .L_net_drop"
       -- clockMs: CLOCK_MONOTONIC in milliseconds.
       line ".L_net_clock:"
@@ -1957,6 +1979,13 @@ emitRuntime = do
       ins "mov rsp, rbp"
       ins "pop rbp"
       ins "jmp .L_perform_ret"
+    -- fcntl(r12, F_SETFL, O_NONBLOCK or 0).
+    nonblocking on = do
+      ins "mov edi, r12d"
+      ins "mov esi, 4"
+      ins (if on then "mov edx, 0x800" else "xor edx, edx")
+      ins "xor eax, eax"
+      ins "call fcntl"
     -- Child rcx of the block in @base@ into @dst@: a word, or for a packed layout (bit 16 of
     -- r12, the map) a 4-byte slot holding (child - block) / 8.
     child dst base = do

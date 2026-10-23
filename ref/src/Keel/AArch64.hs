@@ -2220,22 +2220,29 @@ emitRuntime = do
       ins "bl _accept"
       ins "sxtw x0, w0"
       ins "b L_net_ret"
-      -- sockSend (fd, bytes): send everything, 64 KiB at a time through a stack buffer.
-      -- Locals: fd -8, array -16, length -24, sent so far -40, this chunk -48, of it sent -56.
+      -- sockSend (fd, (bytes, from)): send from byte `from` on, without waiting, 64 KiB at a
+      -- time through a stack buffer; how many bytes the socket took, or -1 if it failed before
+      -- taking any. Locals: fd -8, array -16, length -24, position -40, this chunk -48, taken -56.
       line "L_net_send:"
       ins "ldr x9, [x1]"
       ins "str x9, [x29, #-8]"
-      ins "ldr x10, [x1, #8]"
+      ins "ldr x9, [x1, #8]"
+      ins "ldr x10, [x9]"
       ins "str x10, [x29, #-16]"
       ins "ldr x11, [x10]"
       ins "str x11, [x29, #-24]"
-      ins "stur xzr, [x29, #-40]"
+      ins "ldr x9, [x9, #8]"
+      ins "stur x9, [x29, #-40]"
+      ins "stur xzr, [x29, #-56]"
+      -- Non-blocking for these sends (macOS's send can wait despite MSG_DONTWAIT): fcntl's
+      -- variadic argument goes on the stack, before the buffer is there.
+      nonblocking True
       ins "sub sp, sp, #16, lsl #12"
       line "L_send_chunk:"
       ins "ldur x9, [x29, #-40]"
       ins "ldr x11, [x29, #-24]"
       ins "subs x12, x11, x9"
-      ins "b.ls L_send_done"
+      ins "b.le L_send_done"
       ins "mov x13, #65536"
       ins "cmp x12, x13"
       ins "csel x12, x12, x13, lo"
@@ -2252,31 +2259,35 @@ emitRuntime = do
       ins "add x14, x14, #1"
       ins "b L_send_copy"
       line "L_send_copied:"
-      ins "stur xzr, [x29, #-56]"
-      line "L_send_part:"
-      ins "ldur x9, [x29, #-56]"
-      ins "ldur x12, [x29, #-48]"
-      ins "cmp x9, x12"
-      ins "b.hs L_send_next"
       ins "ldr x0, [x29, #-8]"
-      ins "add x1, sp, x9"
-      ins "sub x2, x12, x9"
+      ins "mov x1, sp"
+      ins "mov x2, x12"
       ins "mov x3, #0"
       ins "bl _send"
-      ins "cmp x0, #0"
-      ins "b.le L_net_fail"
+      ins "tbnz x0, #63, L_send_error"
       ins "ldur x9, [x29, #-56]"
       ins "add x9, x9, x0"
       ins "stur x9, [x29, #-56]"
-      ins "b L_send_part"
-      line "L_send_next:"
       ins "ldur x9, [x29, #-40]"
-      ins "ldur x12, [x29, #-48]"
-      ins "add x9, x9, x12"
+      ins "add x9, x9, x0"
       ins "stur x9, [x29, #-40]"
-      ins "b L_send_chunk"
+      ins "ldur x12, [x29, #-48]"
+      ins "cmp x0, x12"
+      ins "b.eq L_send_chunk" -- all of it: try the next chunk
+      ins "b L_send_done"
+      line "L_send_error:"
+      ins "bl ___error"
+      ins "ldr w9, [x0]"
+      ins "cmp w9, #35" -- EAGAIN: it takes nothing more now
+      ins "b.eq L_send_done"
+      ins "ldur x9, [x29, #-56]"
+      ins "cbnz x9, L_send_done"
+      ins "mov x9, #-1"
+      ins "stur x9, [x29, #-56]"
       line "L_send_done:"
-      ins "ldr x0, [x29, #-24]"
+      ins "sub sp, x29, #64" -- the buffer is done with
+      nonblocking False
+      ins "ldur x0, [x29, #-56]"
       ins "b L_net_drop"
       -- sockRecv fd: up to 64 KiB into a stack buffer, then into a new Array u8 (empty at the
       -- end of the stream or on an error).
@@ -2309,8 +2320,8 @@ emitRuntime = do
       ins "bl _close"
       ins "mov x0, #0"
       ins "b L_net_ret"
-      -- pollWait (fds, timeout): poll(2) for input on each; the index of the first one ready,
-      -- or -1. Locals: the array -8, its length -16.
+      -- pollWait (fds, timeout): poll(2) on each; the first one ready, as index · 4 +
+      -- readable + 2 · writable, or -1 (timed out) or -2. Locals: the array -8, its length -16.
       line "L_net_poll:"
       ins "ldr x9, [x1]"
       ins "str x9, [x29, #-8]"
@@ -2323,14 +2334,17 @@ emitRuntime = do
       ins "sub sp, sp, x11"
       ins "mov x12, sp"
       ins "mov x13, #0"
-      line "L_poll_fill:"
+      line "L_poll_fill:" -- each element: fd · 4 + 1 (read) + 2 (write)
       ins "cmp x13, x10"
       ins "b.hs L_poll_filled"
       ins "add x14, x9, x13, lsl #2"
       ins "ldr w15, [x14, #16]"
       ins "add x14, x12, x13, lsl #3"
-      ins "str w15, [x14]" -- fd
-      ins "mov w15, #1" -- POLLIN; revents 0
+      ins "asr w16, w15, #2"
+      ins "str w16, [x14]" -- fd
+      ins "and w16, w15, #1" -- POLLIN
+      ins "and w15, w15, #2"
+      ins "orr w15, w16, w15, lsl #1" -- POLLOUT; revents 0
       ins "str w15, [x14, #4]"
       ins "add x13, x13, #1"
       ins "b L_poll_fill"
@@ -2353,8 +2367,14 @@ emitRuntime = do
       ins "cbnz w15, L_poll_found"
       ins "add x13, x13, #1"
       ins "b L_poll_scan"
-      line "L_poll_found:"
-      ins "mov x0, x13"
+      line "L_poll_found:" -- index · 4 + readable (in, error, hangup, not open) + 2 · writable
+      ins "mov w9, #0x39"
+      ins "tst w15, w9"
+      ins "cset x0, ne"
+      ins "tst w15, #4"
+      ins "cset x9, ne"
+      ins "add x0, x0, x9, lsl #1"
+      ins "add x0, x0, x13, lsl #2"
       ins "b L_net_drop"
       -- clockMs: CLOCK_MONOTONIC in milliseconds.
       line "L_net_clock:"
@@ -2378,6 +2398,13 @@ emitRuntime = do
       ins "mov sp, x29"
       ins "ldp x29, x30, [sp], #32"
       ins "ret"
+    -- fcntl(fd at x29 - 8, F_SETFL, O_NONBLOCK or 0), its variadic argument at [sp].
+    nonblocking on = do
+      ins (if on then "mov x9, #4" else "mov x9, #0")
+      ins "str x9, [sp]"
+      ins "ldr x0, [x29, #-8]"
+      ins "mov x1, #4"
+      ins "bl _fcntl"
     -- Child x13 of the block in @base@ into @dst@: a word, or for a packed layout (bit 16 of
     -- x11, the map) a 4-byte slot holding (child - block) / 8.
     child dst base = do
