@@ -10,12 +10,13 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, keyOf, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
+module Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, keyOf, performedOps, pruneRuntime, runtimeBegin, runtimeEnd, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.List (elemIndex, nub, sortOn)
+import Data.Char (isAlphaNum)
+import Data.List (elemIndex, isPrefixOf, isSuffixOf, nub, sortOn)
 import Data.ByteString qualified as B
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
@@ -112,7 +113,7 @@ emitProgram :: [Decl] -> Ty -> LProg -> String
 emitProgram = emitProgramWithReuse True
 
 emitProgramWithReuse :: Bool -> [Decl] -> Ty -> LProg -> String
-emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) = unlines (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts))))
+emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts)))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -126,7 +127,9 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) 
       unless (null files) $ ins ".loc 1 0 0"
       emitEntry printers mainTy
       forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
-      emitRuntime
+      line runtimeBegin
+      emitRuntime (performedOps (mainF : M.elems funs))
+      line runtimeEnd
       line "\t.section __DATA,__data"
       line "\t.p2align 3"
       forM_ statics $ \(i, name, fs) -> do
@@ -160,6 +163,59 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts) 
       case files of
         f : _ -> debugInfo f ([("_kf_" ++ show i, funName fn) | (i, fn) <- M.toList funs] ++ [("_kf_main", "main")])
         [] -> pure ()
+
+-- | The built-in operations a program performs (the runtime leaves out the others).
+performedOps :: [Fun] -> S.Set Int
+performedOps fs = S.fromList [n | f <- fs, Bind _ (RPerform n _) _ <- subExprs (funBody f)]
+
+-- | The lines between these hold the runtime; 'pruneRuntime' takes them out.
+runtimeBegin, runtimeEnd :: String
+runtimeBegin = "@runtime"
+runtimeEnd = "@end runtime"
+
+-- | Keep only the runtime functions the program can reach: a function starts at an alignment
+-- line followed by its @_keel_…:@ label, and is kept if a kept line names it (the code outside
+-- the runtime, its data, the functions kept). One that doesn't end in a jump, return or exit
+-- falls through into the next, which is kept with it. All three back ends lay out their
+-- runtime this way.
+pruneRuntime :: [String] -> [String]
+pruneRuntime ls = case break (== runtimeBegin) ls of
+  (before, _ : rest) | (_, _ : after) <- break (== runtimeEnd) rest ->
+    let names = map fst blocks
+        roots = refs (before ++ prefix ++ after)
+        keep = grow roots
+        grow seen =
+          let seen' = seen <> S.unions [refs b <> fallsInto n | (n, b) <- blocks, n `S.member` seen]
+           in if seen' == seen then seen else grow seen'
+        fallsInto n = case [m | (k, m) <- zip names (drop 1 names), k == n] of
+          m : _ | Just b <- lookup n blocks, not (ends b) -> S.singleton m
+          _ -> S.empty
+     in before ++ prefix ++ concat [b | (n, b) <- blocks, n `S.member` keep] ++ after
+  _ -> ls
+  where
+    -- The lines before the first function, and each function: (its name, its lines).
+    (prefix, blocks) = let (p, fs) = upToFunction (drop 1 (snd (break (== runtimeBegin) ls))) in (p, functions fs)
+    functions xs = case xs of
+      a : l : more | Just n <- label l -> let (b, rest) = upToFunction more in (n, a : l : b) : functions rest
+      _ -> []
+    upToFunction xs = case xs of
+      a : l : _ | isAlign a, Just _ <- label l -> ([], xs)
+      l : _ | l == runtimeEnd -> ([], [])
+      x : more -> let (b, rest) = upToFunction more in (x : b, rest)
+      [] -> ([], [])
+    isAlign l = "\t.p2align" `isPrefixOf` l
+    label l = case break (== ':') l of
+      (n, ':' : _) | "_keel_" `isPrefixOf` n -> Just n
+      _ -> Nothing
+    refs = S.fromList . concatMap symbols
+    symbols l = case l of
+      [] -> []
+      _ | "_keel_" `isPrefixOf` l -> let (n, rest) = span (\c -> isAlphaNum c || c == '_') l in n : symbols rest
+      _ : more -> symbols more
+    -- The last instruction (not a label or a directive; comments cut) leaves the function.
+    ends b = case reverse [w | x <- b, w@(op : _) <- [words (takeWhile (/= '/') (takeWhile (/= '#') x))], not (":" `isSuffixOf` op), not ("." `isPrefixOf` op)] of
+      (op : args) : _ -> op `elem` ["ret", "b", "br", "jmp", "j", "jr", "tail"] || (op `elem` ["bl", "call"] && any (`elem` ["_exit", "exit", "_keel_exit"]) args)
+      _ -> False
 
 -- Functions -------------------------------------------------------------------------------
 
@@ -1417,8 +1473,9 @@ emitEntry printers t = do
 -- | Allocation, reference counting and panics. Header word: bits 0–31 reference count (bit 31
 -- marks an immortal static block, 0 a freed one), 32–47 payload size in words, 48–63 pointer
 -- map. Statistics at @_keel_stats@: fresh allocations, recycled, in place, freed.
-emitRuntime :: G ()
-emitRuntime = do
+-- | The runtime; @used@: the built-in operations the program performs (no code for the rest).
+emitRuntime :: S.Set Int -> G ()
+emitRuntime used = do
   -- _keel_alloc: x0 = payload words, x1 = header without its count → x0 = payload. Clobbers
   -- x13–x16 only.
   fn "_keel_alloc"
@@ -2035,9 +2092,10 @@ emitRuntime = do
   ins "ret"
   line "L_perform_machine:"
   forM_ [("putc", "putc"), ("getc", "getc"), ("openFile", "open"), ("createFile", "create"), ("appendFile", "append"), ("readByte", "read"), ("closeFile", "close"), ("writeBytes", "write")] $ \(op, l) ->
-    ins ("cmp x0, #" ++ show (opNumber op)) >> ins ("b.eq L_perform_" ++ l)
-  ins ("cmp x0, #" ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
-  ins "b.hs L_perform_net"
+    when (performs op) $ ins ("cmp x0, #" ++ show (opNumber op)) >> ins ("b.eq L_perform_" ++ l)
+  when (any performs netOpNames) $ do
+    ins ("cmp x0, #" ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
+    ins "b.hs L_perform_net"
   ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
   ins "sub sp, sp, #16"
   ins "str x1, [sp]" -- printf's variadic argument
@@ -2048,67 +2106,72 @@ emitRuntime = do
   ins "mov x0, #0"
   ins "ldp x29, x30, [sp], #32"
   ins "ret"
-  line "L_perform_putc:"
-  ins "mov x0, x1"
-  ins "bl _putchar"
-  ins "mov x0, #0"
-  ins "ldp x29, x30, [sp], #32"
-  ins "ret"
-  line "L_perform_getc:"
-  ins "bl _getchar" -- a byte, or EOF (-1)
-  ins "sxtw x0, w0"
-  ins "ldp x29, x30, [sp], #32"
-  ins "ret"
-  -- openFile, createFile, appendFile: x1 = the path, an Array u8 (owned). Copy it to the stack
-  -- with a NUL, fopen it to read, write (emptied) or append, and drop the array. The handle is
-  -- the FILE pointer, or -1.
-  forM_ [("open", "rb"), ("create", "wb"), ("append", "ab")] $ \(l, m) -> do
-    line ("L_perform_" ++ l ++ ":")
-    mode <- str m
-    address "x15" mode
-    ins "b L_open_path"
-  line "L_open_path:"
-  ins "str x1, [x29, #16]"
-  ins "ldr x9, [x1]"
-  ins "add x10, x9, #16"
-  ins "and x10, x10, #-16"
-  ins "sub sp, sp, x10"
-  ins "mov x11, #0"
-  line "L_open_copy:"
-  ins "cmp x11, x9"
-  ins "b.hs L_open_copied"
-  ins "add x12, x1, x11, lsl #2" -- 4-byte elements
-  ins "ldr w12, [x12, #16]"
-  ins "strb w12, [sp, x11]"
-  ins "add x11, x11, #1"
-  ins "b L_open_copy"
-  line "L_open_copied:"
-  ins "strb wzr, [sp, x9]"
-  ins "mov x0, sp"
-  ins "mov x1, x15"
-  ins "bl _fopen"
-  ins "mov sp, x29"
-  ins "cmp x0, #0"
-  ins "csinv x0, x0, xzr, ne" -- NULL becomes -1
-  ins "str x0, [x29, #24]"
-  ins "ldr x0, [x29, #16]"
-  ins "bl _keel_drop"
-  ins "ldr x0, [x29, #24]"
-  ins "ldp x29, x30, [sp], #32"
-  ins "ret"
-  line "L_perform_read:"
-  ins "mov x0, x1"
-  ins "bl _fgetc" -- a byte, or EOF (-1)
-  ins "sxtw x0, w0"
-  ins "ldp x29, x30, [sp], #32"
-  ins "ret"
-  line "L_perform_close:"
-  ins "mov x0, x1"
-  ins "bl _fclose"
-  ins "mov x0, #0"
-  ins "ldp x29, x30, [sp], #32"
-  ins "ret"
-  netOps
+  when (performs "putc") $ do
+    line "L_perform_putc:"
+    ins "mov x0, x1"
+    ins "bl _putchar"
+    ins "mov x0, #0"
+    ins "ldp x29, x30, [sp], #32"
+    ins "ret"
+  when (performs "getc") $ do
+    line "L_perform_getc:"
+    ins "bl _getchar" -- a byte, or EOF (-1)
+    ins "sxtw x0, w0"
+    ins "ldp x29, x30, [sp], #32"
+    ins "ret"
+  when (any performs ["openFile", "createFile", "appendFile"]) $ do
+    -- openFile, createFile, appendFile: x1 = the path, an Array u8 (owned). Copy it to the stack
+    -- with a NUL, fopen it to read, write (emptied) or append, and drop the array. The handle is
+    -- the FILE pointer, or -1.
+    forM_ [("open", "rb"), ("create", "wb"), ("append", "ab")] $ \(l, m) -> do
+      line ("L_perform_" ++ l ++ ":")
+      mode <- str m
+      address "x15" mode
+      ins "b L_open_path"
+    line "L_open_path:"
+    ins "str x1, [x29, #16]"
+    ins "ldr x9, [x1]"
+    ins "add x10, x9, #16"
+    ins "and x10, x10, #-16"
+    ins "sub sp, sp, x10"
+    ins "mov x11, #0"
+    line "L_open_copy:"
+    ins "cmp x11, x9"
+    ins "b.hs L_open_copied"
+    ins "add x12, x1, x11, lsl #2" -- 4-byte elements
+    ins "ldr w12, [x12, #16]"
+    ins "strb w12, [sp, x11]"
+    ins "add x11, x11, #1"
+    ins "b L_open_copy"
+    line "L_open_copied:"
+    ins "strb wzr, [sp, x9]"
+    ins "mov x0, sp"
+    ins "mov x1, x15"
+    ins "bl _fopen"
+    ins "mov sp, x29"
+    ins "cmp x0, #0"
+    ins "csinv x0, x0, xzr, ne" -- NULL becomes -1
+    ins "str x0, [x29, #24]"
+    ins "ldr x0, [x29, #16]"
+    ins "bl _keel_drop"
+    ins "ldr x0, [x29, #24]"
+    ins "ldp x29, x30, [sp], #32"
+    ins "ret"
+  when (performs "readByte") $ do
+    line "L_perform_read:"
+    ins "mov x0, x1"
+    ins "bl _fgetc" -- a byte, or EOF (-1)
+    ins "sxtw x0, w0"
+    ins "ldp x29, x30, [sp], #32"
+    ins "ret"
+  when (performs "closeFile") $ do
+    line "L_perform_close:"
+    ins "mov x0, x1"
+    ins "bl _fclose"
+    ins "mov x0, #0"
+    ins "ldp x29, x30, [sp], #32"
+    ins "ret"
+  when (any performs ("writeBytes" : netOpNames)) netOps
 
   panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO needs a freestanding target)\n"
   panic "_keel_panic_div" "panic: division by zero\n"
@@ -2117,6 +2180,7 @@ emitRuntime = do
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"
   where
+    performs op = opNumber op `S.member` used
     fn lbl = line "\t.p2align 2" >> line (lbl ++ ":")
     -- The Net operations (Keel.Syntax builtinEffects): x0 = operation, x1 = argument (owned).
     -- Locals at x29 - 8 … - 64; a sockaddr_in at x29 - 32. A pair or array argument is dropped

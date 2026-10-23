@@ -16,7 +16,7 @@ import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepare, printerTypes, template)
+import Keel.AArch64 (Loc (..), allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepare, printerTypes, pruneRuntime, runtimeBegin, runtimeEnd, template)
 import Data.Bits ((.|.), shiftL)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe)
@@ -112,7 +112,7 @@ jumpIf cond operands target = do
       _ -> error ("jumpIf: " ++ c)
 
 emitProgram :: [Decl] -> Ty -> LProg -> Either String String
-emitProgram decls mainTy (LProg funs statics mainF _ layouts) = Right (unlines (reverse (gsLines final)))
+emitProgram decls mainTy (LProg funs statics mainF _ layouts) = Right (unlines (pruneRuntime (reverse (gsLines final))))
   where
     final = execState gen (GS 0 [] M.empty S.empty layouts)
     printers = printerTypes decls mainTy
@@ -123,7 +123,9 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts) = Right (unlines (
       forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
       emitFun "_kf_main" mainF
       forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
+      line runtimeBegin
       emitRuntime
+      line runtimeEnd
       line "\t.data"
       line "\t.p2align 3"
       forM_ statics $ \(i, name, fs) -> do

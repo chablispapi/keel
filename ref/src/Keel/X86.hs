@@ -29,7 +29,7 @@ import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Keel.AArch64 (Loc (..), Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, prepare, printerTypes, reduction, template, uses)
+import Keel.AArch64 (Loc (..), Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, performedOps, prepare, printerTypes, pruneRuntime, reduction, runtimeBegin, runtimeEnd, template, uses)
 import Keel.Lower
 import Keel.Syntax
 import Numeric (showOct)
@@ -123,7 +123,7 @@ address :: String -> String -> G ()
 address r sym = ins ("lea " ++ r ++ ", [rip + " ++ sym ++ "]")
 
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF _ layouts) = unlines (reverse (gsLines final))
+emitProgram decls mainTy (LProg funs statics mainF _ layouts) = unlines (pruneRuntime (reverse (gsLines final)))
   where
     final = execState gen (GS 0 [] M.empty S.empty layouts)
     printers = printerTypes decls mainTy
@@ -134,7 +134,9 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts) = unlines (reverse
       forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
       emitFun "_kf_main" mainF
       forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
-      emitRuntime
+      line runtimeBegin
+      emitRuntime (performedOps (mainF : M.elems funs))
+      line runtimeEnd
       line "\t.data"
       line "\t.p2align 3"
       forM_ statics $ \(i, name, fs) -> do
@@ -1026,8 +1028,9 @@ emitEntry printers t = do
 
 -- | The runtime, as in "Keel.AArch64" (spec/memory.md). Its routines take rax, rdi, rsi (Keel's
 -- convention) and keep the stack 16-byte aligned at their calls.
-emitRuntime :: G ()
-emitRuntime = do
+-- | The runtime; @used@: the built-in operations the program performs (no code for the rest).
+emitRuntime :: S.Set Int -> G ()
+emitRuntime used = do
   -- _keel_alloc: rax = payload words, rdi = header without its count → rax = payload.
   -- Clobbers rcx, rdx, rsi, rdi only.
   fn "_keel_alloc"
@@ -1639,9 +1642,10 @@ emitRuntime = do
   -- files (7–9); MMIO (3–6) needs a freestanding target.
   line ".L_perform_machine:"
   forM_ [("putc", "putc"), ("getc", "getc"), ("openFile", "open"), ("createFile", "create"), ("appendFile", "append"), ("readByte", "read"), ("closeFile", "close"), ("writeBytes", "write")] $ \(op, l) ->
-    ins ("cmp rax, " ++ show (opNumber op)) >> ins ("je .L_perform_" ++ l)
-  ins ("cmp rax, " ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
-  ins "jae .L_perform_net"
+    when (performs op) $ ins ("cmp rax, " ++ show (opNumber op)) >> ins ("je .L_perform_" ++ l)
+  when (any performs netOpNames) $ do
+    ins ("cmp rax, " ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
+    ins "jae .L_perform_net"
   ins "test rax, rax"
   ins "jnz _keel_panic_unhandled"
   ins "mov rsi, rdi"
@@ -1651,62 +1655,67 @@ emitRuntime = do
   ins "call printf"
   ins "xor eax, eax"
   ins "jmp .L_perform_ret"
-  line ".L_perform_putc:"
-  ins "call putchar"
-  ins "xor eax, eax"
-  ins "jmp .L_perform_ret"
-  line ".L_perform_getc:"
-  ins "call getchar" -- a byte, or EOF (-1)
-  ins "cdqe"
-  ins "jmp .L_perform_ret"
-  -- openFile, createFile, appendFile: rdi = the path, an Array u8 (owned). Copy it to the stack
-  -- with a NUL, fopen it to read, write (emptied) or append, and drop the array. The handle is
-  -- the FILE pointer, or -1. r12 holds the mode until then (the handlers were not touched: r12
-  -- is free here).
-  forM_ [("open", "rb"), ("create", "wb"), ("append", "ab")] $ \(l, m) -> do
-    line (".L_perform_" ++ l ++ ":")
-    mode <- str m
-    address "r12" mode
-    ins "jmp .L_open_path"
-  line ".L_open_path:"
-  ins "mov rbx, rdi"
-  ins "mov rcx, qword ptr [rdi]"
-  ins "mov r13, rsp"
-  ins "lea rdx, [rcx + 16]"
-  ins "and rdx, -16"
-  ins "sub rsp, rdx"
-  ins "xor edx, edx"
-  line ".L_open_copy:"
-  ins "cmp rdx, rcx"
-  ins "jae .L_open_copied"
-  ins "mov esi, dword ptr [rbx + rdx*4 + 16]" -- 4-byte elements
-  ins "mov byte ptr [rsp + rdx], sil"
-  ins "inc rdx"
-  ins "jmp .L_open_copy"
-  line ".L_open_copied:"
-  ins "mov byte ptr [rsp + rcx], 0"
-  ins "mov rdi, rsp"
-  ins "mov rsi, r12"
-  ins "call fopen"
-  ins "mov rsp, r13"
-  ins "test rax, rax"
-  ins "jnz .L_open_ok"
-  ins "mov rax, -1"
-  line ".L_open_ok:"
-  ins "mov r12, rax"
-  ins "mov rax, rbx"
-  ins "call _keel_drop"
-  ins "mov rax, r12"
-  ins "jmp .L_perform_ret"
-  line ".L_perform_read:"
-  ins "call fgetc" -- a byte, or EOF (-1)
-  ins "cdqe"
-  ins "jmp .L_perform_ret"
-  line ".L_perform_close:"
-  ins "call fclose"
-  ins "xor eax, eax"
-  ins "jmp .L_perform_ret"
-  netOps
+  when (performs "putc") $ do
+    line ".L_perform_putc:"
+    ins "call putchar"
+    ins "xor eax, eax"
+    ins "jmp .L_perform_ret"
+  when (performs "getc") $ do
+    line ".L_perform_getc:"
+    ins "call getchar" -- a byte, or EOF (-1)
+    ins "cdqe"
+    ins "jmp .L_perform_ret"
+  when (any performs ["openFile", "createFile", "appendFile"]) $ do
+    -- openFile, createFile, appendFile: rdi = the path, an Array u8 (owned). Copy it to the stack
+    -- with a NUL, fopen it to read, write (emptied) or append, and drop the array. The handle is
+    -- the FILE pointer, or -1. r12 holds the mode until then (the handlers were not touched: r12
+    -- is free here).
+    forM_ [("open", "rb"), ("create", "wb"), ("append", "ab")] $ \(l, m) -> do
+      line (".L_perform_" ++ l ++ ":")
+      mode <- str m
+      address "r12" mode
+      ins "jmp .L_open_path"
+    line ".L_open_path:"
+    ins "mov rbx, rdi"
+    ins "mov rcx, qword ptr [rdi]"
+    ins "mov r13, rsp"
+    ins "lea rdx, [rcx + 16]"
+    ins "and rdx, -16"
+    ins "sub rsp, rdx"
+    ins "xor edx, edx"
+    line ".L_open_copy:"
+    ins "cmp rdx, rcx"
+    ins "jae .L_open_copied"
+    ins "mov esi, dword ptr [rbx + rdx*4 + 16]" -- 4-byte elements
+    ins "mov byte ptr [rsp + rdx], sil"
+    ins "inc rdx"
+    ins "jmp .L_open_copy"
+    line ".L_open_copied:"
+    ins "mov byte ptr [rsp + rcx], 0"
+    ins "mov rdi, rsp"
+    ins "mov rsi, r12"
+    ins "call fopen"
+    ins "mov rsp, r13"
+    ins "test rax, rax"
+    ins "jnz .L_open_ok"
+    ins "mov rax, -1"
+    line ".L_open_ok:"
+    ins "mov r12, rax"
+    ins "mov rax, rbx"
+    ins "call _keel_drop"
+    ins "mov rax, r12"
+    ins "jmp .L_perform_ret"
+  when (performs "readByte") $ do
+    line ".L_perform_read:"
+    ins "call fgetc" -- a byte, or EOF (-1)
+    ins "cdqe"
+    ins "jmp .L_perform_ret"
+  when (performs "closeFile") $ do
+    line ".L_perform_close:"
+    ins "call fclose"
+    ins "xor eax, eax"
+    ins "jmp .L_perform_ret"
+  when (any performs ("writeBytes" : netOpNames)) netOps
   line ".L_perform_ret:"
   ins "pop r13"
   ins "pop r12"
@@ -1725,6 +1734,7 @@ emitRuntime = do
   panic "_keel_panic_oom" "panic: out of memory\n"
   panic "_keel_panic_rc" "panic: reference count error\n"
   where
+    performs op = opNumber op `S.member` used
     -- The Net operations (Keel.Syntax builtinEffects): rax = operation, rdi = argument (owned,
     -- kept in rbx; rbx, r12 and r13 survive calls). Locals at rbp - 8 … - 72; a sockaddr_in at
     -- rbp - 32. A pair or array argument is dropped at the end (.L_net_drop, result in rax).
