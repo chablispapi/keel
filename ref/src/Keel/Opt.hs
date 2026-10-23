@@ -325,6 +325,10 @@ simplify (Program decls main) = evalState go (0 :: Int)
         -- in order (the core forbids shadowing, so no component sees the new names).
         LetPair x y e b | Pair p q <- stripAt e -> pure (Let x p (Let y q b))
         Case e alts | Con c _ args <- stripAt e, Just (xs, b) <- lookup c [(c', (xs, b)) | (c', xs, b) <- alts] -> pure (foldr (uncurry Let) b (zip xs args))
+        -- … or by the default: the arguments are still evaluated, in order, and dropped.
+        Case e alts | Con c _ args <- stripAt e, Just b <- lookup "_" [(c', b) | (c', _, b) <- alts], c `notElem` [c' | (c', _, _) <- alts] -> do
+          xs <- mapM (const (freshName "unused")) args
+          pure (foldr (uncurry Let) b (zip xs args))
         _ -> pure tm'
 
     -- (λx. b) a ⇒ let x = a in b;  (let x = e in b) a ⇒ let x' = e in (b a). The floated

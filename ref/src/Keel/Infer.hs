@@ -335,18 +335,23 @@ caseOf env e alts mex = do
   (d, _, tys) <- conInfo env c0 []
   rel False te (TData d tys)
   resTy <- maybe freshTy pure mex
-  -- A last alternative _ -> e stands for every constructor not listed before it.
-  -- ponytail: e is copied into each; bind it to a function first if that gets big.
+  -- A last alternative _ -> e stands for every constructor not listed before it: it stays one
+  -- default alternative (spec/core.md §1.4), or is the alternative of the one constructor it
+  -- covers (which keeps that branch's fields, for reuse).
   let cons = maybe [] (\(_, _, cs) -> cs) (M.lookup d (sData (eSig env)))
+      rest' = [(c', fs) | (c', fs) <- cons, c' `notElem` [k | (k, _, _) <- alts]]
       unlisted (c, xs, b)
-        | c == "_" = [(c', map (const "_") fs, b) | (c', fs) <- cons, c' `notElem` [k | (k, _, _) <- alts]]
+        | c == "_", [(c', fs)] <- rest' = [(c', map (const "_") fs, b)]
+        | c == "_", null rest' = []
         | otherwise = [(c, xs, b)]
-  rs <- forM (concatMap unlisted alts) $ \(c, xs, b) -> do
-    (_, fields, _) <- conInfo env c []
-    when (length xs /= length fields) $ failWith Mismatch (c ++ ": wrong number of pattern variables")
-    (xs', env') <- binders env (zip xs (map (inst env c tys) fields))
-    (b', eb) <- check env' b resTy
-    pure ((c, xs', b'), eb)
+  rs <- forM (concatMap unlisted alts) $ \(c, xs, b) -> case c of
+    "_" -> (\(b', eb) -> (("_", [], b'), eb)) <$> check env b resTy
+    _ -> do
+     (_, fields, _) <- conInfo env c []
+     when (length xs /= length fields) $ failWith Mismatch (c ++ ": wrong number of pattern variables")
+     (xs', env') <- binders env (zip xs (map (inst env c tys) fields))
+     (b', eb) <- check env' b resTy
+     pure ((c, xs', b'), eb)
   pure (resTy, Case e' (map fst rs), S.unions (ee : map snd rs))
 
 binders :: Env -> [(String, Ty)] -> I ([String], Env)

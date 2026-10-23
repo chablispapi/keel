@@ -424,7 +424,7 @@ expr info env tm k = case tm of
     let tys = case typeOf info env e of
           TData _ as -> as
           _ -> []
-    bs <- forM alts $ \(c, xs, b) -> do
+    bs <- forM alts $ \(c, xs, b) -> if c == "_" then defaultAlt b else do
       (tag, d, fields) <- con c
       let ps = M.findWithDefault [] d (iParams info)
           inst = substTy (M.fromList (zip ps tys)) M.empty
@@ -442,6 +442,10 @@ expr info env tm k = case tm of
       body <- expr info env' b (pure . Ret)
       pure (lid, n, foldr (\(i, y) rest -> Bind y (read' i) rest) body (zip [0 ..] xs'))
     BindCase x ve (sortOn (\(t, _, _) -> t) bs) <$> k (AVar x)
+    where
+      -- The default: last (no layout id is this high), so it is the branch that falls through
+      -- without a test; its blocks have different sizes, so no reuse (-1 words).
+      defaultAlt b = (1024,-1,) <$> expr info env b (pure . Ret)
   Box e -> expr info env e k
   Unbox e -> expr info env e k
   Pair a b -> do
@@ -544,6 +548,7 @@ typeOf info env tm = case tm of
   Con c tys _ -> case M.lookup c (iCons info) of
     Just (_, d, _) -> TData d tys
     Nothing -> TUnit
+  Case _ (("_", _, b) : _) -> typeOf info env b
   Case e ((c, xs, b) : _) -> case (go e, M.lookup c (iCons info)) of
     (TData _ tys, Just (_, d, fields)) ->
       let inst = substTy (M.fromList (zip (M.findWithDefault [] d (iParams info)) tys)) M.empty

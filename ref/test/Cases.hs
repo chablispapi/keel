@@ -339,6 +339,10 @@ cases =
     , Rejects InfiniteSize
     )
   , ("non-exhaustive case", Program [intList] (Case (Con "Nil" [] []) [("Nil", [], int 0)]), Rejects NonExhaustive)
+  , ("default branch", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "C" [] [int 5]) [("A", [], int 1), ("_", [], int 2)]), ok (VInt i64 2))
+  , ("listed branch before a default", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "A" [] []) [("A", [], int 1), ("_", [], int 2)]), ok (VInt i64 1))
+  , ("default covering nothing", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "A" [] []) [("A", [], int 1), ("B", [], int 1), ("C", ["n"], Var "n"), ("_", [], int 2)]), Rejects NonExhaustive)
+  , ("default not last", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "A" [] []) [("_", [], int 2), ("A", [], int 1)]), Rejects NonExhaustive)
   , ("type mismatch", Program [] (add (int 1) (BoolLit True)), Rejects Mismatch)
   , ("shadowing", Program [] (Let "x" (int 1) (Let "x" (int 2) (Var "x"))), Rejects Shadowing)
   -- Stage 2 -------------------------------------------------------------------------------

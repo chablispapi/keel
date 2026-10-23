@@ -38,7 +38,7 @@ e ::= x | n | true | false
     | e e
     | let x = e in e
     | C(e₁, …, eₙ)                    constructor
-    | case e of { C(x₁, …, xₙ) → e ; … }
+    | case e of { C(x₁, …, xₙ) → e ; … [; _ → e] }   (a last _ covers the rest)
     | box e | unbox e
 
 decl    ::= [linear] data D = C₁(τ, …) | … | Cₙ(τ, …)
@@ -132,6 +132,11 @@ discipline.
  (Case) ─────────────────────────────────────────────────────────────────────────────────────
               Γ₁ ⋈ Γ₂ ⊢ case e of { C₁(x̄₁) → e₁ ; … ; Cₖ(x̄ₖ) → eₖ } : σ
 
+A case may instead list some of the constructors, each once, and end with a **default**
+`_ → e₀`, which binds nothing and is typed like the other branches (`Γ₂ ⊢ e₀ : σ`); it covers
+every constructor not listed, and at least one must be left for it. The surface language's
+`_ → e` becomes one, so its body is compiled once rather than copied into each constructor.
+
           Γ ⊢ e : τ                       Γ ⊢ e : Box τ
  (Box) ──────────────────       (Unbox) ─────────────────
         Γ ⊢ box e : Box τ                 Γ ⊢ unbox e : τ
@@ -195,6 +200,8 @@ an extension of ρ_Σ.
  ρ ⊢ eᵢ ⇓ vᵢ  (left to right)                 ρ ⊢ e ⇓ Cⱼ(v̄)    ρ, x̄ⱼ ↦ v̄ ⊢ eⱼ ⇓ v
  ────────────────────────────────              ──────────────────────────────────────────
   ρ ⊢ C(e₁, …, eₙ) ⇓ C(v₁, …, vₙ)               ρ ⊢ case e of { …; Cⱼ(x̄ⱼ) → eⱼ; … } ⇓ v
+
+(When no branch names `Cⱼ`, the default `_ → e₀` runs, with `ρ` unchanged.)
 
  ρ ⊢ e ⇓ v                   ρ ⊢ e ⇓ box v
  ─────────────────────        ──────────────────

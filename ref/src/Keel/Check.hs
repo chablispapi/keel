@@ -431,8 +431,16 @@ infer s rec ctx tm = case tm of
       TData d tys | Just (_, ps, cs) <- M.lookup d (sigData s) ->
         pure (cs, substTy (M.fromList (zip ps tys)) M.empty)
       _ -> err Mismatch ("case on non-data type " ++ prettyTy te)
-    unless (sort [c | (c, _, _) <- alts] == sort (map fst ctors)) $
-      err NonExhaustive ("case must match each of " ++ show (map fst ctors) ++ " exactly once")
+    -- Each constructor exactly once, or some of them and then a default _ (with no fields)
+    -- for the others.
+    let listed = [c | (c, _, _) <- alts, c /= "_"]
+        defaults = [xs | (c, xs, _) <- alts, c == "_"]
+        exact = sort listed == sort (map fst ctors)
+        covered = length (nub listed) == length listed && all (`elem` map fst ctors) listed && length listed < length ctors
+    case defaults of
+      [] -> unless exact $ err NonExhaustive ("case must match each of " ++ show (map fst ctors) ++ " exactly once")
+      [[]] | covered, [c | (c, _, _) <- alts] == listed ++ ["_"] -> pure ()
+      _ -> err NonExhaustive ("case must match some of " ++ show (map fst ctors) ++ " once each, then one default _ for the rest")
     rs <- forM alts $ \(c, xs, body) -> do
       let fields = fromMaybe [] (lookup c ctors) -- present: checked against ctors above
       when (length xs /= length fields) $ err Mismatch (c ++ ": wrong number of pattern variables")

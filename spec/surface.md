@@ -63,7 +63,7 @@ Arrows associate to the right. Effect variables start with `'`.
 | `var x = e in e`, `x := e`, `e; e` | mutable local, assignment, sequencing |
 | `if c then a else b` | conditional |
 | `case e of { Nil -> a \| Cons(x, rest) -> b }` | pattern matching |
-| `case t of { Node(l, x, r) -> x \| _ -> 0 }` | a last `_ -> e` (or `y -> e`, `y` being the scrutinee) covers the constructors not listed; its body is copied into each |
+| `case t of { Node(l, x, r) -> x \| _ -> 0 }` | a last `_ -> e` (or `y -> e`, `y` being the scrutinee) covers the constructors not listed (one default branch in Keel Core; a body covering a single constructor becomes that constructor's branch) |
 | `case c of { '(' -> 1 \| 42 -> 2 \| -1 -> 3 \| _ -> 0 }` | literal patterns: an `if` chain on `==`, which needs a last `_ -> e` or `y -> e` |
 | `cocase Ord { lt -> \p q. p < q }`, `e.lt` | codata value, observation |
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |

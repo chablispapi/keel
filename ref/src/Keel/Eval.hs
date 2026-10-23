@@ -145,7 +145,7 @@ eval hs env tm = case tm of
     v <- eval hs env e
     case v of
       VCon c vs
-        | (xs, body) : _ <- [(xs, body) | (c', xs, body) <- alts, c' == c] ->
+        | (xs, body) : _ <- [(xs, body) | (c', xs, body) <- alts, c' == c] ++ [([], body) | ("_", _, body) <- alts] ->
             eval hs (M.union (M.fromList (zip xs vs)) env) body
       _ -> stuck "case without a matching constructor"
   Box e -> VBox <$> eval hs env e
