@@ -1,0 +1,37 @@
+#!/usr/bin/env fish
+# Reinstall keelc in the background when a commit changes the compiler or the std library it
+# ships, so the keelc on PATH (and the language server editors and Claude Code run) stays
+# current. Enable once per clone: git config core.hooksPath .githooks
+#
+# A build already running picks the new commit up when it finishes (the pending file), so
+# commits in a row cost one or two installs. Log: .git/keelc-install.log
+
+set root (git rev-parse --show-toplevel)
+set gitdir (git rev-parse --absolute-git-dir)
+
+# The first commit has no parent to diff against: --root lists everything.
+if not git diff-tree --root --no-commit-id --name-only -r HEAD | string match -qr '^ref/(src|app|std)/|^ref/[^/]*\.cabal$'
+    exit 0
+end
+
+set lock $gitdir/keelc-install.lock
+set pending $gitdir/keelc-install.pending
+touch $pending
+# mkdir is atomic: only one install runs at a time.
+mkdir $lock 2>/dev/null; or exit 0
+
+env REF=$root/ref PENDING=$pending LOCK=$lock fish -c '
+    cd $REF
+    while test -e $PENDING
+        rm $PENDING
+        echo "== "(date "+%F %T")" "(git rev-parse --short HEAD)
+        cabal install -v0 exe:keelc --overwrite-policy=always 2>&1 | string match -v -r "^ld: warning"
+        if test $pipestatus[1] -eq 0
+            echo "installed:" (command -v keelc)
+        else
+            echo "install FAILED; the keelc on PATH is unchanged"
+        end
+    end
+    rmdir $LOCK
+' >>$gitdir/keelc-install.log 2>&1 </dev/null &
+disown

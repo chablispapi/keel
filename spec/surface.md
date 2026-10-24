@@ -238,6 +238,10 @@ expression without references.
   top-level name jumps to the top-level one, and prelude names go nowhere.
 
 Put `keelc` on your `PATH` (`cabal install exe:keelc` in `ref/`), then point the editor at it.
+To keep it current, enable the repository's hooks once per clone (`git config core.hooksPath
+.githooks`): after a commit that changes `ref/src`, `ref/app`, `ref/std` or the `.cabal` file,
+`.githooks/post-commit` reinstalls `keelc` in the background (about a minute; log in
+`.git/keelc-install.log`).
 For Neovim:
 
 ```lua
