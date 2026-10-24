@@ -537,8 +537,9 @@ private def constructor : List Token ->{Diverge, Panic} (Term, List Token) =
        let (xs, ts) = if symIs "(" ts then inside expr "," ")" (next ts) else (Nil, ts) in
        (ECon(c, box tys, box xs), ts))
 
--- Alternatives as written: constructor patterns, literals, and variables (or _).
-private data Pattern = PCon(List u8, List (List u8)) | PLit(Term) | PVar(List u8)
+-- Alternatives as written: constructors with patterns for their fields, pairs, literals,
+-- and variables (or _).
+private data Pattern = PCon(List u8, Box (List Pattern)) | PPair(Box Pattern, Box Pattern) | PLit(Term) | PVar(List u8)
 
 private def caseE : List Token ->{Diverge, Panic} (Term, List Token) =
   \ts.
@@ -550,10 +551,7 @@ private def caseE : List Token ->{Diverge, Panic} (Term, List Token) =
 private def altP : List Token ->{Diverge, Panic} ((Pattern, Term), List Token) =
   \ts.
     let (p, ts) =
-      if startsQualUpper ts then
-        (let (c, ts) = qualUpper ts in
-         let (xs, ts) = if symIs "(" ts then inside lower "," ")" (next ts) else (Nil, ts) in
-         (PCon(c, xs), ts))
+      if startsQualUpper ts || symIs "(" ts then patternP ts
       else case tok ts of
         { Char(c) -> (PLit(ENum(false, c as u64, "u8")), next ts)
         | Num(v, w) -> (PLit(ENum(false, v, w)), next ts)
@@ -564,10 +562,28 @@ private def altP : List Token ->{Diverge, Panic} ((Pattern, Term), List Token) =
     let (b, ts) = expr (expect "->" ts) in
     ((p, b), ts)
 
+private def patternP : List Token ->{Diverge, Panic} (Pattern, List Token) =
+  \ts.
+    if startsQualUpper ts then
+      (let (c, ts) = qualUpper ts in
+       let (ps, ts) = if symIs "(" ts then inside patternP "," ")" (next ts) else (Nil, ts) in
+       (PCon(c, box ps), ts))
+    else if symIs "(" ts then
+      (let (p, ts) = patternP (next ts) in
+       let (q, ts) = patternP (expect "," ts) in
+       (PPair(box p, box q), expect ")" ts))
+    else (let (x, ts) = lower ts in (PVar(x), ts))
+
 -- As keelc does: constructor alternatives make a case, maybe ending in a default (x -> e,
--- x being the scrutinee); literal alternatives make an if chain ending in one.
+-- x being the scrutinee); literal alternatives make an if chain ending in one. Nested
+-- patterns go through match.
 private def caseOf : Term -> List (Pattern, Term) -> List Token ->{Diverge, Panic} (Term, List Token) =
   \e alts ts.
+    if not (allFlat alts) then
+      (let (rows, ts) = nestedRows alts ts in
+       let (m, ts) = match (Cons("m%", box Nil)) rows None ts in
+       (ELet("m%", box e, box m), ts))
+    else
     let rev = reverse alts in
     let cons = conAlts alts in
     let n = length alts in
@@ -587,8 +603,120 @@ private def caseOf : Term -> List (Pattern, Term) -> List Token ->{Diverge, Pani
 private def conAlts : List (Pattern, Term) ->{Diverge} List Alt =
   \alts. case alts of
     { Nil -> Nil
-    | Cons(a, rest) -> let (p, b) = a in
-        case p of { PCon(c, xs) -> Cons(Alt(c, xs, b), box (conAlts (unbox rest))) | _ -> conAlts (unbox rest) } }
+    | Cons((PCon(c, ps), b), rest) -> Cons(Alt(c, varNames (unbox ps), b), box (conAlts (unbox rest)))
+    | Cons(_, rest) -> conAlts (unbox rest) }
+
+-- The names of patterns that are all variables (only called when they are).
+private def varNames : List Pattern ->{Diverge} List (List u8) =
+  \ps. case ps of { Cons(PVar(x), rest) -> Cons(x, box (varNames (unbox rest))) | _ -> Nil }
+
+-- Whether every constructor alternative's fields are variables, and there are no pairs.
+private def allFlat : List (Pattern, Term) ->{Diverge} Bool =
+  \alts. case alts of
+    { Nil -> true
+    | Cons((PCon(c, ps), b), rest) -> allVars (unbox ps) && allFlat (unbox rest)
+    | Cons((PPair(p, q), b), rest) -> false
+    | Cons(_, rest) -> allFlat (unbox rest) }
+
+private def allVars : List Pattern ->{Diverge} Bool =
+  \ps. case ps of { Nil -> true | Cons(PVar(x), rest) -> allVars (unbox rest) | _ -> false }
+
+private def nestedRows : List (Pattern, Term) -> List Token ->{Diverge, Panic} (List (List Pattern, Term), List Token) =
+  \alts ts. case alts of
+    { Nil -> (Nil, ts)
+    | Cons((PLit(l), b), rest) -> (Nil, fail "literal patterns can't be mixed with nested patterns" ts)
+    | Cons((p, b), rest) -> let (rows, ts) = nestedRows (unbox rest) ts in (Cons((Cons(p, box Nil), b), box rows), ts) }
+
+-- As keelc's match (ref/src/Keel/Parser.hs): nested patterns to flat cases, the first
+-- column's rows in runs of variables, constructors or pairs, each falling through to the
+-- next; fields are columns named after their path from the scrutinee.
+private def match : List (List u8) -> List (List Pattern, Term) -> Option Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \us rows d ts. case (us, rows) of
+    { (Nil, Cons((ps, e), _)) -> (e, ts)
+    | (Nil, Nil) -> orFail d ts
+    | (Cons(u, rest), _) -> runsFrom u (unbox rest) (runs rows) d ts }
+
+private def orFail : Option Term -> List Token -> (Term, List Token) =
+  \d ts. case d of { Some(e) -> (e, ts) | None -> (EUnit, fail "empty case" ts) }
+
+private def runsFrom : List u8 -> List (List u8) -> List (List (List Pattern, Term)) -> Option Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \u us rs d ts. case rs of
+    { Nil -> orFail d ts
+    | Cons(r, Nil) -> step u us r d ts
+    | Cons(r, more) -> let (d2, ts) = runsFrom u us (unbox more) d ts in step u us r (Some(d2)) ts }
+
+private def kindOf : List Pattern -> i64 =
+  \ps. case ps of { Cons(PVar(x), _) -> 0 | Cons(PCon(c, qs), _) -> 1 | Cons(PPair(p, q), _) -> 2 | _ -> 3 }
+
+private def runs : List (List Pattern, Term) ->{Diverge} List (List (List Pattern, Term)) =
+  \rows. case rows of
+    { Nil -> Nil
+    | Cons((ps, e), rest) -> case runs (unbox rest) of
+        { Cons(Cons((qs, f), more), others) ->
+            if kindOf ps == kindOf qs then Cons(Cons((ps, e), box Cons((qs, f), more)), others)
+            else Cons(Cons((ps, e), box Nil), box Cons(Cons((qs, f), more), others))
+        | rs -> Cons(Cons((ps, e), box Nil), box rs) } }
+
+private def step : List u8 -> List (List u8) -> List (List Pattern, Term) -> Option Term -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \u us run d ts. case run of
+    { Cons((Cons(PVar(x), _), _), _) -> match us (dropVars u run) d ts
+    | Cons((Cons(PPair(p, q), _), _), _) ->
+        let (a, b) = (field u 0, field u 1) in
+        let (m, ts) = match (Cons(a, box Cons(b, box us))) (splitPairs run) d ts in
+        (ELetPair(a, b, box EVar(u), box m), ts)
+    | _ ->
+        let (alts, ts) = conAlternatives u us run (heads run Nil) d ts in
+        (ECase(box EVar(u), box (case d of { Some(e) -> append alts (Cons(Alt("_", Nil, e), box Nil)) | None -> alts })), ts) }
+
+private def field : List u8 -> i64 ->{Diverge, Panic} List u8 = \u j. append u (Cons('_', box (string.fromInt j)))
+
+private def dropVars : List u8 -> List (List Pattern, Term) ->{Diverge} List (List Pattern, Term) =
+  \u run. case run of
+    { Cons((Cons(PVar(x), ps), e), rest) -> Cons((unbox ps, bindVar u x e), box (dropVars u (unbox rest)))
+    | _ -> Nil }
+
+private def bindVar : List u8 -> List u8 -> Term ->{Diverge} Term =
+  \u x e. if string.equal x "_" then e else ELet(x, box EVar(u), box e)
+
+private def splitPairs : List (List Pattern, Term) ->{Diverge} List (List Pattern, Term) =
+  \run. case run of
+    { Cons((Cons(PPair(p, q), ps), e), rest) -> Cons((Cons(unbox p, box Cons(unbox q, ps)), e), box (splitPairs (unbox rest)))
+    | _ -> Nil }
+
+-- The constructors in the first column, in the order they first appear.
+private def heads : List (List Pattern, Term) -> List (List u8) ->{Diverge} List (List u8) =
+  \run seen. case run of
+    { Nil -> reverse seen
+    | Cons((Cons(PCon(c, qs), _), _), rest) -> heads (unbox rest) (if member c seen then seen else Cons(c, box seen))
+    | Cons(_, rest) -> heads (unbox rest) seen }
+
+private def conAlternatives : List u8 -> List (List u8) -> List (List Pattern, Term) -> List (List u8) -> Option Term -> List Token ->{Diverge, Panic} (List Alt, List Token) =
+  \u us run cs d ts. case cs of
+    { Nil -> (Nil, ts)
+    | Cons(c, more) ->
+        let rows = rowsOf c run in
+        let n = case rows of { Cons((qs, (ps, e)), _) -> length qs | Nil -> 0 } in
+        let fields = fieldNames u 0 n in
+        let ts = if sameArity n rows then ts else fail (append c ": patterns with different numbers of fields") ts in
+        let (b, ts) = match (append fields us) (joinRows rows) d ts in
+        let (alts, ts) = conAlternatives u us run (unbox more) d ts in
+        (Cons(Alt(c, fields, b), box alts), ts) }
+
+private def rowsOf : List u8 -> List (List Pattern, Term) ->{Diverge} List (List Pattern, (List Pattern, Term)) =
+  \c run. case run of
+    { Nil -> Nil
+    | Cons((Cons(PCon(c2, qs), ps), e), rest) ->
+        if string.equal c c2 then Cons((unbox qs, (unbox ps, e)), box (rowsOf c (unbox rest))) else rowsOf c (unbox rest)
+    | Cons(_, rest) -> rowsOf c (unbox rest) }
+
+private def sameArity : i64 -> List (List Pattern, (List Pattern, Term)) ->{Diverge, Panic} Bool =
+  \n rows. case rows of { Nil -> true | Cons((qs, (ps, e)), rest) -> length qs == n && sameArity n (unbox rest) }
+
+private def joinRows : List (List Pattern, (List Pattern, Term)) ->{Diverge} List (List Pattern, Term) =
+  \rows. case rows of { Nil -> Nil | Cons((qs, (ps, e)), rest) -> Cons((append qs ps, e), box (joinRows (unbox rest))) }
+
+private def fieldNames : List u8 -> i64 -> i64 ->{Diverge, Panic} List (List u8) =
+  \u j n. if j == n then Nil else Cons(field u j, box (fieldNames u (j + 1) n))
 
 private def literals : List (Pattern, Term) ->{Diverge} Bool =
   \alts. case alts of

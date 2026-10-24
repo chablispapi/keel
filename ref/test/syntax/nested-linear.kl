@@ -1,0 +1,5 @@
+-- A nested pattern falling through on a linear value: rejected, with a message saying why.
+linear data L = E | C(i64, Box L)
+def free : L ->{Panic, Diverge} i64 = \l. case l of { E -> 0 | C(a, r) -> a + free (unbox r) }
+def f : L ->{Panic, Diverge} i64 = \l. case l of { C(a, C(b, r)) -> a + b + free (unbox r) | other -> free other }
+main = f (C(1, box E))

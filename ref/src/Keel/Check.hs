@@ -7,7 +7,7 @@
 module Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram, localTypes, recursiveGroups, typeOfClosed) where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
-import Data.List (nub, sort)
+import Data.List (isPrefixOf, nub, sort)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
@@ -534,4 +534,8 @@ infer s rec ctx tm = case tm of
       let both = S.intersection a b
        in if S.null both then pure (S.union a b) else err Duplicate (show (S.toList both) ++ " used twice")
 
-    branches a b = "branches use " ++ show (S.toList a) ++ " and " ++ show (S.toList b)
+    branches a b
+      -- m% and its fields are a nested case's scrutinee ("Keel.Parser"'s match).
+      | any ("m%" `isPrefixOf`) (S.toList (S.union a b)) =
+          "a nested pattern that fails falls through to the next alternative, which matches the value again; a linear value can't be matched twice, so cover each constructor at every level"
+      | otherwise = "branches use " ++ show (S.toList a) ++ " and " ++ show (S.toList b)

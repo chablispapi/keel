@@ -328,7 +328,9 @@ codataInfo env d = maybe (failWith Unbound ("codata " ++ d)) pure (M.lookup d (s
 -- | Infer a case expression; with an expected type, branches are checked against it.
 caseOf :: Env -> Term -> [(String, [String], Term)] -> Maybe Ty -> I (Ty, Term, Eff)
 caseOf env e alts mex = do
-  (e', te, ee) <- infer env e
+  (e0, te0, ee) <- infer env e
+  -- A case on a box is a case on its contents (how nested patterns look inside Box fields).
+  (e', te) <- shallow te0 >>= \t -> pure (case t of { TBox c -> (Unbox e0, c); _ -> (e0, te0) })
   (c0, _, _) <- case alts of
     a : _ -> pure a
     [] -> failWith NonExhaustive "empty case"

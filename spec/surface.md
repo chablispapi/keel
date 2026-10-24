@@ -64,8 +64,9 @@ Arrows associate to the right. Effect variables start with `'`.
 | `let x = e in e`, `let (x, y) = e in e` | let, pair destructuring |
 | `var x = e in e`, `x := e`, `e; e` | mutable local, assignment, sequencing |
 | `if c then a else b` | conditional |
-| `case e of { Nil -> a \| Cons(x, rest) -> b }` | pattern matching |
+| `case e of { Nil -> a \| Cons(x, rest) -> b }` | pattern matching (a case on a `Box` is a case on its contents) |
 | `case t of { Node(l, x, r) -> x \| _ -> 0 }` | a last `_ -> e` (or `y -> e`, `y` being the scrutinee) covers the constructors not listed (one default branch in Keel Core; a body covering a single constructor becomes that constructor's branch) |
+| `case xs of { Cons(a, Cons(b, _)) -> a + b \| Cons(a, Nil) -> a \| _ -> 0 }`, `case (p, q) of { (Some(x), Some(y)) -> … \| _ -> 0 }` | nested patterns (constructors, pairs, variables and `_` inside each other): flat cases, each alternative falling through to the next when an inner pattern fails. A field pattern looks inside a `Box` field; a variable still binds the box. The scrutinee is tested again on fallthrough, so a fallthrough needs a non-linear value. Literal patterns stay at the top level |
 | `case c of { '(' -> 1 \| 42 -> 2 \| -1 -> 3 \| _ -> 0 }` | literal patterns: an `if` chain on `==`, which needs a last `_ -> e` or `y -> e` |
 | `cocase Ord { lt -> \p q. p < q }`, `e.lt` | codata value, observation |
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |

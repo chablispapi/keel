@@ -1,0 +1,3 @@
+-- A nested pattern that misses a case: Cons(a, Nil) is not matched.
+
+main = case Cons(1, box Nil) of { Cons(a, Cons(b, _)) -> a | Nil -> 0 }

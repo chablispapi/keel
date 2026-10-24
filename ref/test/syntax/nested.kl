@@ -1,0 +1,55 @@
+-- Nested patterns: constructors inside constructors (looking through Box fields), pairs,
+-- variables and _ at any depth, and rows that fall through to the next one when an inner
+-- pattern fails.
+
+data T = Leaf | Node(Box T, i64, Box T)
+
+-- The first two elements, when the list has them; a later row covers what's left.
+def firstTwo : List i64 ->{Panic} i64 =
+  \xs. case xs of
+    { Cons(a, Cons(b, _)) -> a * 10 + b
+    | Cons(a, Nil) -> a
+    | Nil -> -1 }
+
+-- A list of exactly two falls through to the variable row otherwise.
+def classify : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of
+    { Cons(x, Cons(y, Nil)) -> x + y
+    | ys -> 100 + len ys }
+
+def len : List i64 ->{Panic, Diverge} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(_, rest) -> 1 + len (unbox rest) }
+
+-- Rotate a left-leaning node to the right; anything else unchanged.
+def rotate : T -> T =
+  \t. case t of
+    { Node(Node(a, x, b), y, c) -> Node(a, x, box Node(b, y, c))
+    | other -> other }
+
+def sum : T ->{Panic, Diverge} i64 =
+  \t. case t of { Leaf -> 0 | Node(l, x, r) -> sum (unbox l) + x + sum (unbox r) }
+
+-- Two scrutinees at once, as a unifier compares two types.
+def both : Option i64 -> Option i64 ->{Panic} i64 =
+  \a b. case (a, b) of
+    { (Some(x), Some(y)) -> x + y
+    | (Some(x), None) -> x
+    | (None, Some(y)) -> y
+    | (None, None) -> 0 }
+
+-- A case on a Box field, without unbox.
+def headOr : i64 -> List i64 ->{Panic} i64 =
+  \d xs. case xs of { Nil -> d | Cons(_, rest) -> case rest of { Nil -> d | Cons(y, _) -> y } }
+
+main =
+  let t = Node(box Node(box Leaf, 1, box Leaf), 2, box Leaf) in
+  out(firstTwo (Cons(4, box Cons(5, box Nil))));
+  out(firstTwo (Cons(7, box Nil)));
+  out(firstTwo Nil);
+  out(classify (Cons(1, box Cons(2, box Nil))));
+  out(classify (Cons(1, box Cons(2, box Cons(3, box Nil)))));
+  out(classify Nil);
+  out(sum (rotate t));
+  out(both (Some(1)) (Some(2)) + both (Some(3)) None + both (None) (Some(4)) + both None None);
+  out(headOr 9 (Cons(1, box Cons(2, box Nil))));
+  headOr 9 (Cons(1, box Nil))

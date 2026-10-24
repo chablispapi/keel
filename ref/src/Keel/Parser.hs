@@ -207,6 +207,60 @@ decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
 
 -- | A type, constructor or effect name, maybe qualified by an import: @Status@,
 -- @uart.Status@ (resolved by "Keel.Modules").
+-- | Patterns: a variable (or _), a constructor with patterns for its fields, a pair.
+data Pat = PVar String | PCon String [Pat] | PPair Pat Pat
+
+pattern :: Parser Pat
+pattern =
+  (PCon <$> qualUpper <*> option [] (parens (sepBy pattern comma)))
+    <|> (PVar <$> lower)
+    <|> parens (PPair <$> pattern <* comma <*> pattern)
+
+-- | Nested patterns to the core's flat cases (Wadler's match, in Peyton Jones, The
+-- Implementation of Functional Programming Languages, ch. 5): the first column's rows go in
+-- runs of variables, constructors or pairs, and each run falls through to the next one; a
+-- constructor's fields become columns, named after their path from the scrutinee. A case
+-- that falls through ends in _ -> (the next run), which "Keel.Infer" drops when the case
+-- lists every constructor; without a next run, the case must list them all.
+match :: [String] -> [([Pat], Term)] -> Maybe Term -> Parser Term
+match [] rows d = case rows of
+  (_, e) : _ -> pure e
+  [] -> maybe (fail "empty case") pure d
+match (u : us) rows d = go (runs rows)
+  where
+    go [] = maybe (fail "empty case") pure d
+    go [r] = step r d
+    go (r : rest) = go rest >>= step r . Just
+    runs = foldr (\x acc -> case acc of
+      (y : ys) : more | kind x == kind y -> (x : y : ys) : more
+      _ -> [x] : acc) []
+    kind (p : _, _) = case p of
+      PVar _ -> 0 :: Int
+      PCon _ _ -> 1
+      PPair _ _ -> 2
+    kind ([], _) = 3
+    step run d' = case run of
+      (PVar _ : _, _) : _ -> match us [(ps, bind x e) | (PVar x : ps, e) <- run] d'
+      (PPair _ _ : _, _) : _ ->
+        let (a, b) = (u ++ "_0", u ++ "_1")
+         in LetPair a b (Var u) <$> match (a : b : us) [(p : q : ps, e) | (PPair p q : ps, e) <- run] d'
+      _ -> do
+        let cs = foldr (\c acc -> c : filter (/= c) acc) [] [c | (PCon c _ : _, _) <- run]
+        alts <- mapM (alt d') cs
+        pure (Case (Var u) (alts ++ [("_", [], e) | Just e <- [d']]))
+      where
+        alt d'' c = do
+          let rows' = [(qs, ps, e) | (PCon c' qs : ps, e) <- run, c' == c]
+              n = case rows' of
+                (qs, _, _) : _ -> length qs
+                [] -> 0
+              fields = [u ++ "_" ++ show j | j <- [0 .. n - 1]]
+          if any (\(qs, _, _) -> length qs /= n) rows'
+            then fail (c ++ ": patterns with different numbers of fields")
+            else (c,fields,) <$> match (fields ++ us) [(qs ++ ps, e) | (qs, ps, e) <- rows'] d''
+    bind "_" e = e
+    bind x e = Let x (Var u) e
+
 qualUpper :: Parser String
 qualUpper = try (do q <- lower; op "."; (\n -> q ++ "." ++ n) <$> upper) <|> upper
 
@@ -448,17 +502,27 @@ atom =
       e <- expr
       reserved "of"
       -- (checked before the closing brace, so an error points there)
-      braces (sepBy1 alt (op "|") >>= \alts -> case (reverse alts, [() | Right _ <- alts]) of
-        (_, []) -> pure (Case e [a | Left a <- alts])
-        (Right (Left (x, d)) : rest@(Left _ : _), [_]) -> pure (defaultCase e [a | Left a <- reverse rest] x d)
-        _ -> literalCase e alts)
-    alt = (Left <$> ctorAlt) <|> (Right <$> litAlt)
-    ctorAlt = do
-      c <- qualUpper
-      xs <- option [] (parens (sepBy lower comma))
+      braces (sepBy1 alt (op "|") >>= \alts -> case mapM (either flat (Just . Right)) alts of
+        Just flats -> case (reverse flats, [() | Right _ <- flats]) of
+          (_, []) -> pure (Case e [a | Left a <- flats])
+          (Right (Left (x, d)) : rest@(Left _ : _), [_]) -> pure (defaultCase e [a | Left a <- reverse rest] x d)
+          _ -> literalCase e flats
+        Nothing -> nestedCase e alts)
+    alt = (Left <$> patAlt) <|> (Right <$> litAlt)
+    patAlt = do
+      p <- try (lookAhead (qualUpper <|> (op "(" $> ""))) >> pattern
       op "->"
       b <- expr
-      pure (c, xs, b)
+      pure (p, b)
+    -- A constructor whose fields are all variables: the core's own case alternative.
+    flat (PCon c ps, b) | Just xs <- mapM (\q -> case q of PVar x -> Just x; _ -> Nothing) ps = Just (Left (c, xs, b))
+    flat _ = Nothing
+    -- Nested patterns, and x -> d (or _ -> d) for everything else; no literals.
+    nestedCase e alts = do
+      rows <- mapM (either (\(p, b) -> pure ([p], b)) row) alts
+      Let "m%" e <$> match ["m%"] rows Nothing
+    row (Left (x, d)) = pure ([PVar x], d)
+    row (Right _) = fail "literal patterns can't be mixed with nested patterns"
     -- 'a' -> e, 42 -> e, -1 -> e; then x -> e (or _ -> e) for everything else.
     litAlt = do
       pat <- (Right <$> (charLit <|> number <|> try (op "-" >> negative <$> number))) <|> (Left <$> lower)

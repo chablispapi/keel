@@ -223,6 +223,7 @@ exampleFiles =
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
+  , ("test/syntax/nested.kl", (Just "9", "45\n7\n-1\n3\n103\n100\n3\n10\n2\n"))
   , ("test/syntax/known-con.kl", (Just "12057", "1234"))
   , ("test/syntax/known-con-panic.kl", (Nothing, "78"))
   , ("test/syntax/const-ops.kl", (Just "930031494736259442", ""))
@@ -340,6 +341,8 @@ compileErrors :: [(FilePath, String)]
 compileErrors =
   [ ("test/memory/arena-escape.kl", "arena: the result is a pointer (Tree)")
   , ("test/memory/arena-capture.kl", "arena: it uses t : Tree from outside")
+  , ("test/syntax/nested-missing.kl", "case must match each of")
+  , ("test/syntax/nested-linear.kl", "a linear value can't be matched twice")
   ]
 
 checkCompileError :: (FilePath, String) -> IO [String]
