@@ -223,6 +223,11 @@ exampleFiles =
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
+  -- The Keel skill's examples (.claude/skills/keel): what agents are told must compile.
+  , ("../.claude/skills/keel/examples/basics.kl", (Just "3", "24\n1,2\n"))
+  , ("../.claude/skills/keel/examples/state.kl", (Just "44", ""))
+  , ("../.claude/skills/keel/examples/collections.kl", (Just "2047", "3\n110\n"))
+  , ("../.claude/skills/keel/examples/effects.kl", (Just "2", "25\n"))
   , ("test/syntax/nested.kl", (Just "9", "45\n7\n-1\n3\n103\n100\n3\n10\n2\n"))
   , ("test/syntax/known-con.kl", (Just "12057", "1234"))
   , ("test/syntax/known-con-panic.kl", (Nothing, "78"))
@@ -293,6 +298,7 @@ lspChecks = do
   typeErr <- diagnose (edit "a + b" "a + true") util
   parseErr <- diagnose (edit "def double" "def double double") util
   h <- hover M.empty "examples/project/src/main.kl" 8 60
+  hc <- hover M.empty "test/syntax/nested.kl" 5 17
   let dir = "examples/project/src/"
   defs <- sequence [definition M.empty (dir ++ f) l c | (f, l, c) <- [("main.kl", 8, 32), ("main.kl", 8, 67), ("util.kl", 4, 40), ("main.kl", 6, 3)]]
   let json = "{\"a\":[1,-2.5,true,null,\"x\\n\\u00e9\"],\"b\":{}}"
@@ -304,6 +310,7 @@ lspChecks = do
         , (case parseErr of [Diag f 4 _ _] -> f == util; _ -> False, "parse error", show parseErr)
         , (defs == map Just [(dir ++ "drivers/led.kl", 1, 5), (dir ++ "util.kl", 4, 5), (dir ++ "util.kl", 2, 13), (dir ++ "drivers/led.kl", 1, 1)], "definition", show defs)
         , (h == Just "printInt : i64 →{Diverge, IO, Panic} Unit", "hover", show h)
+        , (hc == Just "Node(Box T, i64, Box T) : T", "hover on a constructor", show hc)
         , (fmap renderJson (parseJson json) == Just "{\"a\":[1,-2.5,true,null,\"x\\n\233\"],\"b\":{}}", "json", show (parseJson json))
         ]
     , not ok

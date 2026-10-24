@@ -1,0 +1,31 @@
+-- Data, recursion, nested patterns, Option, strings and printing.
+
+import std.string
+
+data Shape = Circle(i64) | Rect(i64, i64)
+
+-- Recursion needs Diverge; arithmetic that can overflow needs Panic.
+def area : Shape ->{Panic} i64 =
+  \s. case s of { Circle(r) -> 3 * r * r | Rect(w, h) -> w * h }
+
+def total : List Shape ->{Panic, Diverge} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(s, rest) -> area s + total (unbox rest) }
+
+-- Nested patterns; a variable bound to a Box field is still a box.
+def firstTwo : List i64 -> Option (i64, i64) =
+  \xs. case xs of { Cons(a, Cons(b, _)) -> Some((a, b)) | _ -> None }
+
+-- Two values at once: match on a pair.
+def larger : Option i64 -> Option i64 -> Option i64 =
+  \a b. case (a, b) of
+    { (Some(x), Some(y)) -> Some(if x < y then y else x)
+    | (Some(x), None) -> Some(x)
+    | (None, y) -> y }
+
+main =
+  let shapes = Cons(Circle(2), box Cons(Rect(3, 4), box Nil)) in
+  println (string.fromInt (total shapes));
+  (case firstTwo (Cons(1, box Cons(2, box Nil))) of
+    { Some((a, b)) -> println (string.join "," (Cons(string.fromInt a, box Cons(string.fromInt b, box Nil))))
+    | None -> println "short" });
+  case larger (Some(3)) (None) of { Some(n) -> n | None -> 0 }

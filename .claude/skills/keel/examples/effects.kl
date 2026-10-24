@@ -1,0 +1,23 @@
+-- User effects with handlers, and codata interfaces.
+
+-- A device the code talks to through an effect; the handler decides what it is.
+effect Sensor { sample : i64 => i64 }
+
+def average : i64 -> i64 ->{Sensor, Panic, Diverge} i64 =
+  \n acc. if n == 0 then acc / 4 else average (n - 1) (acc + sample(n))
+
+-- An interface: a record of functions. e.lt observes one.
+codata Order a { lt : a -> a -> Bool }
+
+def byValue : Order i64 = cocase Order[i64] { lt -> \a b. a < b }
+
+def smallest : Order i64 -> List i64 -> i64 ->{Diverge} i64 =
+  \o xs best. case xs of
+    { Nil -> best
+    | Cons(x, rest) -> smallest o (unbox rest) (if o.lt x best then x else best) }
+
+main =
+  -- The clause's value is the operation's result (no continuation is captured).
+  let avg = handle average 4 0 with Sensor { sample i -> i * 10 } in
+  out(avg);
+  smallest byValue (Cons(5, box Cons(2, box Cons(9, box Nil)))) 100

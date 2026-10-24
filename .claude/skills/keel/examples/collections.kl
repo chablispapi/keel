@@ -1,0 +1,33 @@
+-- Maps, arrays and arenas.
+
+import std.map
+import std.array
+import std.string
+
+-- Maps take the comparison at each call: compareInt, string.compare, or your own.
+def tally : List (List u8) -> map.Map (List u8) i64 ->{Diverge, Panic} map.Map (List u8) i64 =
+  \ws m. case ws of
+    { Nil -> m
+    | Cons(w, rest) ->
+        let n = case map.lookup string.compare w m of { None -> 0 | Some(k) -> k } in
+        tally (unbox rest) (map.insert string.compare w (n + 1) m) }
+
+-- Arrays are values; threading one through push updates it in place.
+def squares : i64 -> Array i64 ->{Panic, Diverge} Array i64 =
+  \i xs. if i == 0 then xs else squares (i - 1) (array.push xs (i * i))
+
+data Tree = Leaf | Node(Box Tree, Box Tree)
+
+def build : i64 ->{Panic, Diverge} Tree =
+  \d. if d == 0 then Leaf else Node(box (build (d - 1)), box (build (d - 1)))
+
+def size : Tree ->{Panic, Diverge} i64 =
+  \t. case t of { Leaf -> 1 | Node(l, r) -> 1 + size (unbox l) + size (unbox r) }
+
+main =
+  let m = tally (string.split ' ' "a b a c a") map.Tip in
+  printInt (case map.lookup string.compare "a" m of { None -> 0 | Some(n) -> n }); putc('\n');
+  let xs = squares 10 array.empty in
+  printInt (array.get xs 0 + array.length xs); putc('\n');
+  -- Everything build allocates is freed at once; the result must not be a pointer.
+  arena (\u. size (build 10))

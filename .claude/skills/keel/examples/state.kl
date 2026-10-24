@@ -1,0 +1,22 @@
+-- Threading state: a parser returns its result and the input left, as (result, rest).
+
+import std.string
+
+-- The digits at the front of s as a number, and what follows them.
+def number : List u8 -> i64 ->{Panic, Diverge} (i64, List u8) =
+  \s acc. case s of
+    { Cons(c, rest) -> if string.isDigit c then number (unbox rest) (acc * 10 + (c - '0') as i64) else (acc, s)
+    | Nil -> (acc, Nil) }
+
+-- Numbers separated by '+', summed: "12+30+0" is 42.
+def sum : List u8 ->{Panic, Diverge} i64 =
+  \s. let (n, rest) = number s 0 in
+      case rest of { Cons(c, more) -> if c == '+' then n + sum (unbox more) else n | Nil -> n }
+
+-- Mutable locals and &mut parameters: still pure underneath.
+def bump : &mut i64 ->{Panic} Unit = \&mut n. n := n + 1
+
+main =
+  var count = 0 in
+  bump(&mut count); bump(&mut count);
+  sum "12+30+0" + count
