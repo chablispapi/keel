@@ -263,6 +263,17 @@ roots = ["keel.project"]
 language-servers = ["keel"]
 ```
 
+For Claude Code, `editors/claude-code/` is a plugin with the language server and a skill for
+writing Keel (the workflow, common mistakes, and examples the test suite runs). The repository
+is its marketplace. Install it once for every project:
+
+```
+claude plugin marketplace add ~/playground/fp     # the repository root
+claude plugin install keel@keel
+```
+
+It loads in place from the repository, so edits to the skill apply in the next session.
+
 Syntax highlighting is a tree-sitter grammar in `editors/tree-sitter-keel/` (`grammar.js`,
 `queries/highlights.scm`). For Helix, build it into the runtime directory and link the queries:
 

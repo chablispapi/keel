@@ -1,0 +1,7 @@
+{
+  "keel": {
+    "command": "keelc",
+    "args": ["lsp"],
+    "extensionToLanguage": { ".kl": "keel" }
+  }
+}

@@ -1,6 +1,6 @@
 ---
 name: keel
-description: Write, fix or review Keel code (.kl files), the linear, effect-typed language in this repo. Use whenever a task touches a .kl file, the Keel std library, selfhost/, or asks for a program in Keel, even a small one: Keel is not in your training data, and guessing from Haskell or OCaml produces code that almost parses.
+description: Write, fix or review Keel code (.kl files), a linear, effect-typed language with its own compiler, keelc. Use whenever a task touches a .kl file, the Keel std library, or asks for a program in Keel, even a small one: Keel is not in your training data, and guessing from Haskell or OCaml produces code that almost parses.
 ---
 
 # Writing Keel
@@ -19,20 +19,28 @@ page; when they disagree, the compiler is right (and this page needs fixing).
    the same as `run`, and the stats line must say `live=0` (no leaks). A difference between the
    two is a compiler bug: report it, don't work around it.
 
-Inside this repo, `cd ref && cabal run -v0 exe:keelc -- check FILE.kl` uses the compiler as
-committed. An installed `keelc` (`~/.cabal/bin/keelc`) may be older. If it rejects syntax that
-the examples below use, reinstall it with `cd ref && cabal install exe:keelc --overwrite-policy=always`.
+`keelc` is the one on `PATH`, which is also what the language server runs. Its source is the
+Keel repository at `${CLAUDE_PLUGIN_ROOT}/../..` (called **the repo** below), and the installed
+binary can be older than the repo. If it rejects syntax that the examples use, reinstall it:
+`cd ${CLAUDE_PLUGIN_ROOT}/../../ref && cabal install exe:keelc --overwrite-policy=always`. When
+you're working on the compiler itself, inside the repo, use
+`cd ref && cabal run -v0 exe:keelc -- check FILE.kl` to test the uncommitted compiler.
+
+With the plugin enabled, the language server reports errors in a `.kl` file right after each
+edit. Fix them before moving on, the same as for `keelc check`.
 
 ## Where to look
 
-- `examples/*.kl`, next to this file: tested idioms (basics, state threading, collections,
-  effects). The test suite compiles and runs them, so they're correct for the current compiler.
-  Copy their shapes.
-- `spec/surface.md`: the full syntax table, the prelude, the std library and the modules.
-- `ref/std/*.kl`: the std library's source, and the most idiomatic Keel there is.
-- `ref/examples/`, `ref/test/`: more programs. `ref/test/syntax/grammar.kl` has every construct.
-- `spec/core.md`: what linearity, effects and references mean, when an error message
-  isn't enough.
+- `${CLAUDE_PLUGIN_ROOT}/skills/keel/examples/*.kl`: tested idioms (basics, state threading,
+  collections, effects). The repo's test suite compiles and runs them, so they're correct for
+  the current compiler. Copy their shapes.
+- In the repo, `spec/surface.md`: the full syntax table, the prelude, the std library and the
+  modules.
+- In the repo, `ref/std/*.kl`: the std library's source, and the most idiomatic Keel there is.
+- In the repo, `ref/examples/` and `ref/test/`: more programs. `ref/test/syntax/grammar.kl` has
+  every construct.
+- In the repo, `spec/core.md`: what linearity, effects and references mean, when an error
+  message isn't enough.
 
 ## Shape of a program
 
@@ -107,5 +115,7 @@ Each of these has tripped up someone who had the spec open:
 
 - `keelc check` is clean, and `run` and the native build print the same output with `live=0`.
 - If you learned something that would have saved you time, and it's true of the current
-  compiler, add it to the table above. If it needs an example, add one to `examples/`, and
-  register it in `ref/test/Native.hs` next to the other skill examples, so it stays true.
+  compiler, add it to the table above (this file is
+  `${CLAUDE_PLUGIN_ROOT}/skills/keel/SKILL.md`). If it needs an example, add one to
+  `examples/` next to it, and register it in the repo's `ref/test/Native.hs` next to the other
+  skill examples, so it stays true.

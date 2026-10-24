@@ -1,0 +1,8 @@
+{
+  "name": "keel",
+  "description": "Keel's Claude Code plugin, from the Keel repository.",
+  "owner": { "name": "Lorenzo Gennari" },
+  "plugins": [
+    { "name": "keel", "source": "./editors/claude-code", "description": "The keelc language server and the Keel skill." }
+  ]
+}

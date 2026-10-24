@@ -1,0 +1,5 @@
+{
+  "name": "keel",
+  "description": "Write correct, idiomatic Keel: the keelc language server for .kl files (diagnostics after every edit) and a skill with the workflow, the common mistakes and tested examples.",
+  "author": { "name": "Lorenzo Gennari" }
+}
