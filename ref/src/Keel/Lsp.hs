@@ -17,7 +17,7 @@ import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as BC
 import Data.Char (chr, isAlphaNum, isDigit, isSpace, ord)
 import Data.IORef
-import Data.List (isPrefixOf)
+import Data.List (intercalate, isPrefixOf)
 import Data.Maybe (listToMaybe)
 import Data.Set qualified as S
 import Data.Map.Strict qualified as M
@@ -223,7 +223,7 @@ hover overlay file line col = do
     describe w decls =
       listToMaybe $
         [w ++ " : " ++ prettyTy t | Def f t _ <- decls, named w f]
-          ++ [ w ++ " : " ++ (if null fs then "" else unwords (map prettyTy fs) ++ " → ") ++ prettyTy (TData d (map TVar ps))
+          ++ [ w ++ (if null fs then "" else "(" ++ intercalate ", " (map prettyTy fs) ++ ")") ++ " : " ++ prettyTy (TData d (map TVar ps))
              | Data _ d ps cs <- decls
              , (c, fs) <- cs
              , named w c
