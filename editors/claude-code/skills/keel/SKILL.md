@@ -20,18 +20,26 @@ page; when they disagree, the compiler is right (and this page needs fixing).
    two is a compiler bug: report it, don't work around it.
 
 `keelc` is the one on `PATH`, which is also what the language server runs. Its source is the
-Keel repository at `${CLAUDE_PLUGIN_ROOT}/../..` (called **the repo** below), and the installed
-binary can be older than the repo. If it rejects syntax that the examples use, reinstall it:
-`cd ${CLAUDE_PLUGIN_ROOT}/../../ref && cabal install exe:keelc --overwrite-policy=always`. When
+Keel repository, called **the repo** below: this file lives at
+`<repo>/editors/claude-code/skills/keel/SKILL.md`, so the repo is four directories up from its
+real path. Resolve symlinks first (`realpath`), because this file is often reached through a
+link. The installed binary can be older than the repo. A git hook in the repo reinstalls it in
+the background (about a minute) after every commit that changes the compiler, so first look at the end of
+`<repo>/.git/keelc-install.log`. If an install is running (the directory
+`.git/keelc-install.lock` exists next to the log), wait for it. Don't start a second one: the
+two would share a build directory. Reinstall it yourself only when the log is missing, is
+older than the compiler change, or ends in `install FAILED`:
+`cd <repo>/ref && cabal install exe:keelc --overwrite-policy=always`. When
 you're working on the compiler itself, inside the repo, use
 `cd ref && cabal run -v0 exe:keelc -- check FILE.kl` to test the uncommitted compiler.
 
-With the plugin enabled, the language server reports errors in a `.kl` file right after each
-edit. Fix them before moving on, the same as for `keelc check`.
+In Claude Code with the keel plugin, the language server reports errors in a `.kl` file right
+after each edit. Fix them before moving on, the same as for `keelc check`. Other agents don't
+get these diagnostics, so run `keelc check` yourself after each edit.
 
 ## Where to look
 
-- `${CLAUDE_PLUGIN_ROOT}/skills/keel/examples/*.kl`: tested idioms (basics, state threading,
+- `examples/*.kl`, next to this file: tested idioms (basics, state threading,
   collections, effects). The repo's test suite compiles and runs them, so they're correct for
   the current compiler. Copy their shapes.
 - In the repo, `spec/surface.md`: the full syntax table, the prelude, the std library and the
@@ -115,7 +123,7 @@ Each of these has tripped up someone who had the spec open:
 
 - `keelc check` is clean, and `run` and the native build print the same output with `live=0`.
 - If you learned something that would have saved you time, and it's true of the current
-  compiler, add it to the table above (this file is
-  `${CLAUDE_PLUGIN_ROOT}/skills/keel/SKILL.md`). If it needs an example, add one to
+  compiler, add it to the table above (in this file, at its real path in the repo). If it needs
+  an example, add one to
   `examples/` next to it, and register it in the repo's `ref/test/Native.hs` next to the other
   skill examples, so it stays true.

@@ -278,6 +278,11 @@ claude plugin install keel@keel
 
 It loads in place from the repository, so edits to the skill apply in the next session.
 
+Codex reads the same skill from `~/.agents/skills/`. Link it there once:
+`ln -s ~/playground/fp/editors/claude-code/skills/keel ~/.agents/skills/keel`. Inside the
+repository, Codex also reads `AGENTS.md`. Codex has no language-server support, so the skill
+tells it to run `keelc check` after each edit instead.
+
 Syntax highlighting is a tree-sitter grammar in `editors/tree-sitter-keel/` (`grammar.js`,
 `queries/highlights.scm`). For Helix, build it into the runtime directory and link the queries:
 
