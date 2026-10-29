@@ -1,6 +1,6 @@
 ---
 name: keel
-description: Write, fix or review Keel code (.kl files), a linear, effect-typed language with its own compiler, keelc. Use whenever a task touches a .kl file, the Keel std library, or asks for a program in Keel, even a small one: Keel is not in your training data, and guessing from Haskell or OCaml produces code that almost parses.
+description: "Write, fix or review Keel code (.kl files), a linear, effect-typed language with its own compiler, keelc. Use whenever a task touches a .kl file, the Keel std library, or asks for a program in Keel, even a small one: Keel is not in your training data, and guessing from Haskell or OCaml produces code that almost parses."
 ---
 
 # Writing Keel
