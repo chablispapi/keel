@@ -27,8 +27,9 @@ The RISC-V target needs Homebrew's `llvm`, `lld` and `qemu`. It is freestanding:
 system and no C library. Output goes through the board's 16550 UART, and the program exits
 through its test device (status 101 on a panic).
 
-`riscv32` and `rp2350` are 32-bit: `usize` is `u32` there (and in `keelc run --target …`), and
-`i64` and `u64` are not supported yet (register pairs are planned). The Pico 2 has no console
+`riscv32` and `rp2350` are 32-bit: `usize` is `u32` there (and in `keelc run --target …`).
+`i64` and `u64` mean the same as everywhere, overflow included; they take two registers, so
+they cost more there than `i32`, `u32` and `usize`. The Pico 2 has no console
 yet: output goes nowhere, and when `main` returns or the program panics, the core sleeps.
 `ref/examples/firmware/pico/blink.kl` blinks its LED.
 

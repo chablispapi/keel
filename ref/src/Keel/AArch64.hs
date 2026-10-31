@@ -414,6 +414,7 @@ uses e = case e of
       RConv _ a -> av a
       RArray _ _ as -> concatMap av as
       RIndex a i _ -> av a ++ av i
+      RJoin a b -> av a ++ av b
       RArena _ -> []
 
 -- | Variables bound in a body.
@@ -1041,6 +1042,7 @@ headerRead sgn d = if sgn then "ldrsw " ++ d else "ldr w" ++ drop 1 d
 -- | Compute a right-hand side into x0.
 rhsCode :: Slots -> Rhs -> G ()
 rhsCode slots rhs = case rhs of
+  RJoin {} -> error "RJoin: only 32-bit targets lower to it"
   RAtom a -> atom slots "x0" a
   RPrim op it a b -> do
     atom slots "x9" a

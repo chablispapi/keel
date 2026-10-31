@@ -578,6 +578,7 @@ alloc fields lid = do
 
 rhsCode :: Slots -> Rhs -> G ()
 rhsCode slots rhs = case rhs of
+  RJoin {} -> error "RJoin: only 32-bit targets lower to it"
   RAtom a -> atom slots "rax" a
   RPrim op it a b -> do
     atom slots "r11" a

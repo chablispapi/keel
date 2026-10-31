@@ -223,6 +223,7 @@ exampleFiles =
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
+  , ("test/memory/wide.kl", (Just "-446744079709551416", "8589934591\n-4294980180901883\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n9223372036854775807\n-1\n21474836480\n-7692307692\n-11\n-7692307692\n11\n2635249153387078802\n-1311768467463790471\n1\n1\n0\n3320009719690\n9223372036854775000\n5\n4294967305\n17179869186\n-1\n4000000000\n-3\n"))
   -- The Keel skill's examples (editors/claude-code/skills/keel): what agents are told must compile.
   , ("../editors/claude-code/skills/keel/examples/basics.kl", (Just "3", "24\n1,2\n"))
   , ("../editors/claude-code/skills/keel/examples/state.kl", (Just "44", ""))
@@ -412,14 +413,10 @@ main = do
             bad = fs ++ fw
         mapM_ putStrLn bad
         putStrLn (show (n - length bad) ++ "/" ++ show n ++ " RISC-V cases passed (QEMU virt)")
-        -- RV32: the cases without 64-bit integers, until register pairs come.
-        rv32 <- forM (zip [0 :: Int ..] programs) $ \(i, (name, prog)) -> case compileRiscVAt 32 prog of
-          Left e | "not supported yet on riscv32" `isInfixOf` e -> pure Nothing
-          _ -> Just <$> runRiscV tools 32 dir i (name, prog)
-        let ran = [r | Just r <- rv32]
-            bad32 = concat ran
+        -- RV32: the same cases, with 64-bit integers in register pairs.
+        bad32 <- concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runRiscV tools 32 dir))
         mapM_ putStrLn bad32
-        putStrLn (show (length ran - length bad32) ++ "/" ++ show (length ran) ++ " RV32 cases passed (QEMU virt); " ++ show (length programs - length ran) ++ " skipped: they use 64-bit integers")
+        putStrLn (show (length programs - length bad32) ++ "/" ++ show (length programs) ++ " RV32 cases passed (QEMU virt)")
         pure (bad ++ bad32)
   x86Fails <- x86Failures dir programs
   unless (null allFailures && null rvFailures && null x86Fails) exitFailure
@@ -530,6 +527,7 @@ firmwareExamples =
   [ ("examples/firmware/hello.kl", Virt 64, "", "Hi!\nresult: ()\n")
   , ("examples/firmware/hello.kl", Virt 32, "", "Hi!\nresult: ()\n")
   , ("examples/firmware/echo.kl", Virt 64, "hiq", "hiqresult: 3\n")
+  , ("examples/firmware/echo.kl", Virt 32, "hiq", "hiqresult: 3\n")
   , ("examples/firmware/pico/blink.kl", Pico2, "", "")
   ]
 

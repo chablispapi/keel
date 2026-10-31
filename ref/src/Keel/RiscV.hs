@@ -6,7 +6,14 @@
 -- captured values, handler frames and array elements are 4 bytes each. A block keeps its 8-byte
 -- header, so the runtime reads headers as on RV64; stack slots, the free-list table and the
 -- runtime's own variables stay 8 bytes apart and use their low word. 'ins' turns the 64-bit
--- instructions into their RV32 ones. A 64-bit integer (i64, u64) isn't supported there yet.
+-- instructions into their RV32 ones.
+--
+-- A 64-bit integer (i64, u64; 'lWide') takes two words on RV32: in a block, Lower splits it
+-- into its halves ('RJoin' joins them again); a variable lives in an 8-byte stack slot, low
+-- word first. A result is a0 (low) and a1 (high). Arguments still go in a1–a7, and the high
+-- half of argument k in word k of _keel_hi, which the callee reads on entry. An array of them
+-- has 8-byte elements (kind 1, EWord). Multiplication, division and variable shifts are runtime
+-- routines.
 --
 -- Freestanding: no operating system and no C library. The runtime prints through the board's
 -- 16550 UART (0x1000_0000), exits through its test device (0x10_0000), and performs unhandled
@@ -50,11 +57,6 @@ compileRiscVFor :: Board -> Program -> Either String String
 compileRiscVFor board p = do
   let xlen = boardXlen board
   (decls, t, lp) <- prepareAt xlen False p
-  -- ponytail: register pairs for i64 and u64 on RV32 come next.
-  let wide = not (S.null (lWide lp)) || t `elem` [TInt (IntTy sgn 64) | sgn <- [False, True]]
-        || or [n < -(2 ^ (31 :: Int)) || n >= 2 ^ (32 :: Int) | (_, h, as) <- lConsts lp, AInt n <- maybe [] pure h ++ as]
-  when (xlen == 32 && wide) $
-    Left "not supported yet on riscv32: 64-bit integers (i64, u64); use i32, u32 or usize"
   emitProgram board decls t lp
 
 -- | The heap's and the stack's sizes in bytes. The Pico 2 has 520 KB of SRAM, which also holds
@@ -96,7 +98,8 @@ linkerScript b = unlines $ case b of
     ]
 
 -- | gsWord: the word's size in bytes, 8 (RV64) or 4 (RV32).
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer, gsWord :: Int, gsBoard :: Board}
+-- gsWide: the variables holding a 64-bit integer in two words (RV32 only).
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer, gsWord :: Int, gsBoard :: Board, gsWide :: S.Set String}
 
 type G = State GS
 
@@ -204,10 +207,10 @@ jumpIf cond operands target = do
       _ -> error ("jumpIf: " ++ c)
 
 emitProgram :: Board -> [Decl] -> Ty -> LProg -> Either String String
-emitProgram board decls mainTy (LProg funs statics mainF _ layouts consts _) = Right (unlines (pruneRuntime (reverse (gsLines final))))
+emitProgram board decls mainTy (LProg funs statics mainF _ layouts consts wide) = Right (unlines (pruneRuntime (reverse (gsLines final))))
   where
     w = boardXlen board `div` 8
-    final = execState gen (GS 0 [] M.empty S.empty layouts w board)
+    final = execState gen (GS 0 [] M.empty S.empty layouts w board (if w == 4 then wide else S.empty))
     printers = printerTypes decls mainTy
     gen = do
       line "\t.section .text.start, \"ax\""
@@ -254,6 +257,8 @@ emitProgram board decls mainTy (LProg funs statics mainF _ layouts consts _) = R
       ins ".zero 32"
       line "_keel_handlers:"
       ins ".zero 8"
+      line "_keel_hi:" -- RV32: the high halves of 64-bit arguments, word k for argument k
+      ins ".zero 32"
       line "\t.bss"
       line "\t.p2align 4"
       line "_keel_heap:"
@@ -275,7 +280,13 @@ data Slots = Slots {fLocs :: M.Map String Loc, fSaved :: [(String, Int)], fLoop 
 
 emitFun :: String -> Fun -> G ()
 emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
-  let (locs, saved, frame) = allocate ["s" ++ show r | r <- [1 .. 11 :: Int]] f (params ++ env ++ bound body)
+  wide <- gets gsWide
+  -- A 64-bit variable on RV32 gets an 8-byte slot after the others, never a register.
+  let vars = params ++ env ++ bound body
+      (locs0, saved, frame0) = allocate ["s" ++ show r | r <- [1 .. 11 :: Int]] f (filter (`S.notMember` wide) vars)
+      wides = S.toList (S.fromList vars `S.intersection` wide)
+      locs = M.union locs0 (M.fromList (zip wides (map InSlot [frame0 `div` 8 ..])))
+      frame = 16 * ((frame0 + 8 * length wides + 15) `div` 16)
       slots = Slots locs saved (if null env && not dropsSelf then Just lbl else Nothing)
   line "\t.p2align 2"
   line (lbl ++ ":\t\t\t# " ++ name)
@@ -286,11 +297,15 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   when (frame > 0) $ if frame <= 2048 then ins ("addi sp, sp, -" ++ show frame) else li "t3" (toInteger frame) >> ins "sub sp, sp, t3"
   forM_ saved $ \(r, off) -> slot off >>= \s -> ins ("sd " ++ r ++ ", " ++ s)
   w <- wordSize
-  forM_ (zip [base ..] env) $ \(j, v) -> do
+  offs <- wordOffsets base env
+  forM_ (zip offs env) $ \(j, v) -> do
     ins ("ld t0, " ++ show (w * j) ++ "(a0)")
     store slots "t0" v
+    whenWide v $ ins ("lw t0, " ++ show (w * (j + 1)) ++ "(a0)") >> storeHi slots "t0" v
   line ("L" ++ lbl ++ "_loop:")
-  forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("a" ++ show r) p
+  forM_ (zip [1 :: Int ..] params) $ \(r, p) -> do
+    store slots ("a" ++ show r) p
+    whenWide p $ ins "la t6, _keel_hi" >> ins ("lw t5, " ++ show (4 * r) ++ "(t6)") >> storeHi slots "t5" p
   forM_ envPtrs $ \v -> dup slots v
   when dropsSelf $ ins "call _keel_drop"
   expr slots Nothing body
@@ -322,6 +337,70 @@ load' slots r v = case fLocs slots M.! v of
   InReg x -> unless (x == r) $ ins ("mv " ++ r ++ ", " ++ x)
   InSlot i -> slot (8 * i) >>= \s -> ins ("ld " ++ r ++ ", " ++ s)
 
+-- RV32's 64-bit variables ----------------------------------------------------------------
+
+whenWide :: String -> G () -> G ()
+whenWide v g = gets (S.member v . gsWide) >>= \yes -> when yes g
+
+-- | Whether an atom may be a 64-bit value on RV32: a 64-bit variable, or a constant (which
+-- could be one; its high half costs an instruction).
+mayBeWide :: Atom -> G Bool
+mayBeWide a = case a of
+  AVar v -> gets (S.member v . gsWide)
+  AInt _ -> (== 4) <$> wordSize
+  _ -> pure False
+
+-- | The word offsets of a block's values from @base@: a 64-bit variable takes two on RV32.
+wordOffsets :: Int -> [String] -> G [Int]
+wordOffsets base vs = do
+  wide <- gets gsWide
+  pure (scanl (\j v -> j + if v `S.member` wide then 2 else 1) base vs)
+
+-- | A 64-bit variable's high half (the second word of its slot).
+storeHi, loadHi :: Slots -> String -> String -> G ()
+storeHi slots r v = case fLocs slots M.! v of
+  InSlot i -> slot (8 * i + 4) >>= \s' -> ins ("sw " ++ r ++ ", " ++ s')
+  InReg _ -> error ("storeHi: " ++ v ++ " is in a register")
+loadHi slots r v = case fLocs slots M.! v of
+  InSlot i -> slot (8 * i + 4) >>= \s' -> ins ("lw " ++ r ++ ", " ++ s')
+  InReg _ -> error ("loadHi: " ++ v ++ " is in a register")
+
+-- | An atom's high half into r (RV32): a 64-bit variable's, a constant's, else the sign of a
+-- narrow value (so widening is this and the value itself).
+atomHi :: Slots -> String -> Atom -> G ()
+atomHi slots r a = case a of
+  AInt n -> li r (n `div` (2 ^ (32 :: Int)))
+  AVar v -> gets (S.member v . gsWide) >>= \yes ->
+    if yes then loadHi slots r v else load' slots r v >> ins ("srai " ++ r ++ ", " ++ r ++ ", 31")
+  _ -> li r 0
+
+-- | A value into a0, and its high half into a1 when it may be 64 bits on RV32.
+atomRes :: Slots -> Atom -> G ()
+atomRes slots a = do
+  atom slots "a0" a
+  wideish <- mayBeWide a
+  when wideish $ atomHi slots "a1" a
+
+-- | Store a result (a0, and a1 for a 64-bit variable on RV32) to a variable.
+storeRes :: Slots -> String -> G ()
+storeRes slots x = store slots "a0" x >> whenWide x (storeHi slots "a1" x)
+
+-- | Argument k into register ak, its high half into _keel_hi when it may be 64 bits on RV32.
+arg :: Slots -> Int -> Atom -> G ()
+arg slots k a = do
+  atom slots ("a" ++ show k) a
+  wideish <- mayBeWide a
+  when wideish $ do
+    atomHi slots "t5" a
+    ins "la t6, _keel_hi"
+    ins ("sw t5, " ++ show (4 * k) ++ "(t6)")
+
+-- | Panic (out of bounds) unless an index's or a length's high half is 0 (RV32).
+hiZero :: Slots -> Atom -> G ()
+hiZero slots a = do
+  wideish <- mayBeWide a
+  when wideish $ atomHi slots "t5" a >> jumpIf "bnez" ["t5"] "_keel_panic_bounds"
+
 atom :: Slots -> String -> Atom -> G ()
 atom slots r a = case a of
   AInt n -> li r n
@@ -348,14 +427,14 @@ dup slots v = do
 expr :: Slots -> Maybe (String, String) -> Expr -> G ()
 expr slots join e = case e of
   Ret a -> do
-    atom slots "a0" a
+    atomRes slots a
     case join of
       Nothing -> leave slots >> ins "ret"
-      Just (v, lbl) -> store slots "a0" v >> ins ("j " ++ lbl)
+      Just (v, lbl) -> storeRes slots v >> ins ("j " ++ lbl)
   Bind x rhs (Ret (AVar y)) | x == y, Nothing <- join, Just tc <- tailCall rhs -> tc
   Bind x rhs rest -> do
     rhsCode slots rhs
-    store slots "a0" x
+    storeRes slots x
     expr slots join rest
   BindIf x c a b rest -> do
     let tailPos = isNothingJ && returns x rest
@@ -408,12 +487,12 @@ expr slots join e = case e of
     tailCall rhs = case rhs of
       RCall f a -> Just $ do
         atom slots "a0" f
-        atom slots "a1" a
+        arg slots 1 a
         ins "ld t6, 0(a0)"
         leave slots
         ins "jr t6"
       RCallKnown i as -> Just $ do
-        forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
+        forM_ (zip [1 :: Int ..] as) $ uncurry (arg slots)
         if fLoop slots == Just ("_kf_" ++ show i)
           then ins ("j L_kf_" ++ show i ++ "_loop")
           else leave slots >> ins ("tail _kf_" ++ show i)
@@ -425,6 +504,154 @@ expr slots join e = case e of
         leave slots
         ins "jr t6"
       _ -> Nothing
+
+-- | Arithmetic or a comparison on operands that fit a register (t0, t1), into a0.
+prim64 :: Slots -> Prim -> IntTy -> Atom -> Atom -> G ()
+prim64 slots op it a b = do
+  atom slots "t0" a
+  atom slots "t1" b
+  case op of
+    Eq -> ins "xor a0, t0, t1" >> ins "seqz a0, a0"
+    Lt -> ins ((if signed it then "slt" else "sltu") ++ " a0, t0, t1")
+    Arith _ aop | aop `elem` [Div, Rem] -> divide it aop
+    Arith ov aop -> arith it ov aop
+    Bits bop -> bitwise it bop
+
+-- | The same on 64-bit operands on RV32: a in (t0, t1), b in (t2, t3), low half first; a
+-- 64-bit result in (a0, a1).
+primWide :: Slots -> Prim -> IntTy -> Atom -> Atom -> G ()
+primWide slots op it@(IntTy sgn _) a b = do
+  atom slots "t0" a
+  atomHi slots "t1" a
+  atom slots "t2" b
+  atomHi slots "t3" b
+  case op of
+    Eq -> mapM_ ins ["xor a0, t0, t2", "xor a1, t1, t3", "or a0, a0, a1", "seqz a0, a0"]
+    Lt -> do
+      lDone <- newLabel
+      ins ((if sgn then "slt" else "sltu") ++ " a0, t1, t3")
+      ins ("bne t1, t3, " ++ lDone)
+      ins "sltu a0, t0, t2"
+      line (lDone ++ ":")
+    Arith _ aop | aop `elem` [Div, Rem] -> do
+      ins "or a2, t2, t3"
+      jumpIf "beqz" ["a2"] "_keel_panic_div"
+      when (sgn && aop == Div) $ do -- the minimum / -1
+        lOk <- newLabel
+        ins "li a2, -1"
+        ins ("bne t2, a2, " ++ lOk)
+        ins ("bne t3, a2, " ++ lOk)
+        ins ("bnez t0, " ++ lOk)
+        li "a2" 0x80000000
+        jumpIf "beq" ["t1", "a2"] "_keel_panic_overflow"
+        line (lOk ++ ":")
+      operands
+      ins (if sgn then "call _keel_sdivmod64" else "call _keel_udivmod64")
+      when (aop == Rem) $ ins "mv a0, a2" >> ins "mv a1, a3"
+    Arith ov aop -> arithWide it ov aop
+    Bits bop -> case bop of
+      And -> ins "and a0, t0, t2" >> ins "and a1, t1, t3"
+      Or -> ins "or a0, t0, t2" >> ins "or a1, t1, t3"
+      Xor -> ins "xor a0, t0, t2" >> ins "xor a1, t1, t3"
+      _ -> case b of
+        AInt k -> shiftBy bop (if sgn && k < 0 then 0 else k)
+        _ -> shiftVar bop
+  where
+    operands = mapM_ ins ["mv a0, t0", "mv a1, t1", "mv a2, t2", "mv a3, t3"]
+    -- As on RV64: a negative amount (signed) shifts by 0, one beyond 63 shifts everything out.
+    shiftBy bop k
+      | k == 0 = ins "mv a0, t0" >> ins "mv a1, t1"
+      | k > 63 = out
+      | bop == Shl, k < 32 = mapM_ ins ["slli a1, t1, " ++ show k, "srli a2, t0, " ++ show (32 - k), "or a1, a1, a2", "slli a0, t0, " ++ show k]
+      | bop == Shl = ins ("slli a1, t0, " ++ show (k - 32)) >> ins "li a0, 0"
+      | k < 32 = mapM_ ins ["srli a0, t0, " ++ show k, "slli a2, t1, " ++ show (32 - k), "or a0, a0, a2", right ++ " a1, t1, " ++ show k]
+      | otherwise = ins (right ++ " a0, t1, " ++ show (k - 32)) >> fill
+    right = if sgn then "srai" else "srli"
+    fill = if sgn then ins "srai a1, t1, 31" else ins "li a1, 0"
+    out = case op of
+      Bits Shl -> ins "li a0, 0" >> ins "li a1, 0"
+      _ -> fill >> ins "mv a0, a1"
+    shiftVar bop = do
+      lPos <- newLabel
+      lBig <- newLabel
+      lDone <- newLabel
+      when sgn $ do
+        ins ("bgez t3, " ++ lPos)
+        ins "li t2, 0"
+        ins "li t3, 0"
+      line (lPos ++ ":")
+      ins ("bnez t3, " ++ lBig)
+      ins "li a2, 63"
+      ins ("bgtu t2, a2, " ++ lBig)
+      ins "mv a0, t0"
+      ins "mv a1, t1"
+      ins "mv a2, t2"
+      ins (case bop of Shl -> "call _keel_shl64"; _ | sgn -> "call _keel_sra64"; _ -> "call _keel_shr64")
+      ins ("j " ++ lDone)
+      line (lBig ++ ":")
+      out
+      line (lDone ++ ":")
+
+-- | Add, subtract or multiply 64-bit operands on RV32, (t0, t1) and (t2, t3), into (a0, a1),
+-- in an overflow mode (as 'arith').
+arithWide :: IntTy -> Overflow -> ArithOp -> G ()
+arithWide it@(IntTy sgn _) ov aop = do
+  lOvf <- if ov == Checked then pure "_keel_panic_overflow" else newLabel
+  case aop of
+    Add -> do
+      mapM_ ins ["add a0, t0, t2", "sltu a2, a0, t0", "add a1, t1, t3", "add a1, a1, a2"]
+      unless (ov == Wrap) $
+        if sgn
+          then mapM_ ins ["xor a2, t1, a1", "xor a3, t3, a1", "and a2, a2, a3"] >> jumpIf "bltz" ["a2"] lOvf
+          else below "a1" "a0" "t1" "t0" lOvf -- the sum below an operand: it carried out
+    Sub -> do
+      unless (ov == Wrap || sgn) $ below "t1" "t0" "t3" "t2" lOvf
+      mapM_ ins ["sltu a2, t0, t2", "sub a0, t0, t2", "sub a1, t1, t3", "sub a1, a1, a2"]
+      when (ov /= Wrap && sgn) $
+        mapM_ ins ["xor a2, t1, t3", "xor a3, t1, a1", "and a2, a2, a3"] >> jumpIf "bltz" ["a2"] lOvf
+    _ -> do
+      mapM_ ins ["mv a0, t0", "mv a1, t1", "mv a2, t2", "mv a3, t3"]
+      ins (if sgn && ov /= Wrap then "call _keel_muls64" else "call _keel_mulu64") -- keep t1, t3
+      unless (ov == Wrap) $ jumpIf "bnez" ["a2"] lOvf
+  case ov of
+    Saturate -> do
+      lDone <- newLabel
+      ins ("j " ++ lDone)
+      line (lOvf ++ ":")
+      if not sgn
+        then if aop == Sub then ins "li a0, 0" >> ins "li a1, 0" else ins "li a0, -1" >> ins "li a1, -1"
+        else do
+          lEnd <- newLabel
+          if aop == Mul then ins "xor t4, t1, t3" else ins "mv t4, t1"
+          ins "li a0, -1"
+          li "a1" 0x7fffffff
+          ins ("bgez t4, " ++ lEnd)
+          ins "li a0, 0"
+          li "a1" 0x80000000
+          line (lEnd ++ ":")
+      line (lDone ++ ":")
+    Optional -> do
+      lDone <- newLabel
+      (none, some) <- gets (\st -> optionLayouts (gsLayouts st) it)
+      -- Some's low half is in the header, its high half its word.
+      ins "mv t2, a0"
+      ins "mv t3, a1"
+      alloc 1 some
+      ins "sw t2, -4(a0)"
+      ins "sw t3, 0(a0)"
+      ins ("j " ++ lDone)
+      line (lOvf ++ ":")
+      atom (Slots M.empty [] Nothing) "a0" (ANullary none)
+      line (lDone ++ ":")
+    _ -> pure ()
+  where
+    -- Jump to l when (xh, xl) < (yh, yl), unsigned.
+    below xh xl yh yl l = do
+      lNo <- newLabel
+      jumpIf "bltu" [xh, yh] l
+      ins ("bne " ++ xh ++ ", " ++ yh ++ ", " ++ lNo)
+      jumpIf "bltu" [xl, yl] l
+      line (lNo ++ ":")
 
 -- | Allocate a block into a0 (header written). Clobbers a0, a1, t4–t6, a6 only (and a2 on
 -- RV32, which passes the header's high half there).
@@ -440,23 +667,17 @@ alloc fields lid = do
 
 rhsCode :: Slots -> Rhs -> G ()
 rhsCode slots rhs = case rhs of
-  RAtom a -> atom slots "a0" a
-  RPrim op it a b -> do
-    atom slots "t0" a
-    atom slots "t1" b
-    case op of
-      Eq -> ins "xor a0, t0, t1" >> ins "seqz a0, a0"
-      Lt -> ins ((if signed it then "slt" else "sltu") ++ " a0, t0, t1")
-      Arith _ aop | aop `elem` [Div, Rem] -> divide it aop
-      Arith ov aop -> arith it ov aop
-      Bits bop -> bitwise it bop
+  RAtom a -> atomRes slots a
+  RJoin lo hi -> atom slots "a0" lo >> atom slots "a1" hi
+  RPrim op it a b | bits it == 64 -> wordSize >>= \w -> if w == 4 then primWide slots op it a b else prim64 slots op it a b
+  RPrim op it a b -> prim64 slots op it a b
   RCall f a -> do
     atom slots "a0" f
-    atom slots "a1" a
+    arg slots 1 a
     ins "ld t6, 0(a0)"
     ins "jalr t6"
   RCallKnown i as -> do
-    forM_ (zip [1 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
+    forM_ (zip [1 :: Int ..] as) $ uncurry (arg slots)
     ins ("call _kf_" ++ show i)
   RClosure i fvs lid -> do
     alloc (1 + length fvs) lid
@@ -527,15 +748,19 @@ rhsCode slots rhs = case rhs of
     ins "call _keel_drop"
     ins "li a0, 0"
   RPerform n a -> do
-    atom slots "a1" a
+    arg slots 1 a
     li "a0" (toInteger n)
     ins "call _keel_perform"
+  -- On RV32 a 64-bit result is the value and its high half (a narrow value's sign, or the
+  -- high half it had); a narrow one is the low word, re-extended.
+  RConv to a | bits to == 64 -> wordSize >>= \w -> atom slots "a0" a >> when (w == 4) (atomHi slots "a1" a)
   RConv to a -> atom slots "a0" a >> canonical to
   -- Arrays: as in "Keel.AArch64".
   RArena True -> ins "call _keel_arena_open"
   RArena False -> ins "call _keel_arena_close"
-  RArray ALength _ [a] -> atom slots "t0" a >> ins "ld a0, 0(t0)"
+  RArray ALength _ [a] -> atom slots "t0" a >> ins "ld a0, 0(t0)" >> wordSize >>= \w -> when (w == 4) (ins "li a1, 0")
   RArray AGet e [a, i] -> do
+    hiZero slots i
     atom slots "t0" a
     atom slots "t1" i
     ins "ld t2, 0(t0)"
@@ -544,6 +769,17 @@ rhsCode slots rhs = case rhs of
   RIndex a i e -> atom slots "t0" a >> atom slots "t1" i >> element e
   RArray op e as -> do
     forM_ (zip [0 :: Int ..] as) $ \(r, a) -> atom slots ("a" ++ show r) a
+    -- RV32: an index or a length is 64 bits (its high half must be 0), and an 8-byte element's
+    -- high half goes in the next register after the arguments.
+    w <- wordSize
+    when (w == 4) $ do
+      case (op, as) of
+        (ANew, n : _) -> hiZero slots n
+        (ASet, [_, i, _]) -> hiZero slots i
+        _ -> pure ()
+      when (e == EWord && op `elem` [ANew, ASet, APush]) $ do
+        let r = if op == ANew then 3 else length as
+        atomHi slots ("a" ++ show r) (last as)
     case op of
       AEmpty -> li "a0" 0 >> li "a1" (elemKind e) >> ins "call _keel_array_alloc"
       ANew -> li "a2" (elemKind e) >> ins "call _keel_array_new"
@@ -552,10 +788,13 @@ rhsCode slots rhs = case rhs of
       _ -> ins "call _keel_array_pop"
   where
     storeAll :: Int -> [String] -> G ()
-    storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
-      load' slots "t2" v
+    storeAll from vs = do
       w <- wordSize
-      ins ("sd t2, " ++ show (w * j) ++ "(a0)")
+      offs <- wordOffsets from vs
+      forM_ (zip offs vs) $ \(j, v) -> do
+        load' slots "t2" v
+        ins ("sd t2, " ++ show (w * j) ++ "(a0)")
+        whenWide v $ loadHi slots "t2" v >> ins ("sw t2, " ++ show (w * (j + 1)) ++ "(a0)")
     -- A packed layout's pointers go in 4-byte slots after its words, relative to the block.
     fields :: Integer -> Maybe Atom -> [Atom] -> G ()
     fields lid h as = do
@@ -572,14 +811,15 @@ rhsCode slots rhs = case rhs of
             ins "srai t2, t2, 3"
             ins ("sw t2, " ++ show (4 * (nw + j)) ++ "(a0)")
 
--- | Load element t1 of array t0 into a0. Elements follow the length and the capacity, and on
--- RV32 every kind is 4 bytes.
+-- | Load element t1 of array t0 into a0. Elements follow the length and the capacity. On RV32
+-- a pointer is 4 bytes, and a word element (a 64-bit integer) 8: its high half into a1.
 element :: Elem -> G ()
 element e = do
   w <- wordSize
-  ins ("slli t1, t1, " ++ (case e of ENarrow _ -> "2"; _ -> if w == 8 then "3" else "2"))
+  ins ("slli t1, t1, " ++ (case e of ENarrow _ -> "2"; EPtr | w == 4 -> "2"; _ -> "3"))
   ins "add t0, t0, t1"
   ins ((case e of ENarrow True -> "lw"; ENarrow False -> "lwu"; _ -> "ld") ++ " a0, " ++ show (2 * w) ++ "(t0)")
+  when (w == 4 && e == EWord) $ ins "lw a1, 12(t0)"
 
 -- | Checked division (t0 / t1 into a0), as in "Keel.AArch64": RISC-V doesn't trap on a zero
 -- divisor or on min / -1, so both are checked.
@@ -742,8 +982,10 @@ emitPrinter decls printers lbl t = do
   ins "mv s0, sp"
   ins "addi sp, sp, -16"
   ins "sd a0, 0(sp)" -- the value
+  w <- wordSize
+  let phys = physicalIndices (8 * w)
   case t of
-    TInt (IntTy sgn _) -> ins (if sgn then "call _keel_print_i64" else "call _keel_print_u64")
+    TInt (IntTy sgn n) -> ins ("call _keel_print_" ++ (if sgn then "i64" else "u64") ++ (if w == 4 && n == 64 then "w" else ""))
     TBool -> do
       lFalse <- newLabel
       lDone <- newLabel
@@ -754,12 +996,15 @@ emitPrinter decls printers lbl t = do
       printStr "false"
       line (lDone ++ ":")
     TUnit -> printStr "()"
-    TBox a -> printStr "box " >> field (Right (-1, False)) a
+    TBox a -> printStr "box " >> field [Right (-1, False)] a
     TPair a b -> do
+      let (pa, pb) = case phys [a, b] of
+            [x, y] -> (x, y)
+            _ -> ([0], [1])
       printStr "("
-      field (Right (0, False)) a
+      field [Right (i, False) | i <- pa] a
       printStr ", "
-      field (Right (1, False)) b
+      field [Right (i, False) | i <- pb] b
       printStr ")"
     TData d tys | Just (ps, cs) <- dataOf decls d -> do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
@@ -781,13 +1026,15 @@ emitPrinter decls printers lbl t = do
         printStr c
         unless (null fts) $ do
           printStr "("
-          forM_ (zip [0 :: Int ..] fts) $ \(i, ft) -> do
-            when (i > 0) $ printStr ", "
-            let w = fromMaybe i (elemIndex i ws)
-                rel = case keyOf layouts lid of
-                  Just (_, _, bm) | Just nw <- packedFrom bm (length ws), w >= nw -> Just (nw + w)
-                  _ -> Nothing
-            field (if h == Just i then Left (case ft of TInt it -> signed it; _ -> False) else Right (maybe (w, False) (,True) rel)) ft
+          forM_ (zip3 [0 :: Int ..] fts (phys fts)) $ \(k, ft, is) -> do
+            when (k > 0) $ printStr ", "
+            let place i =
+                  let j = fromMaybe i (elemIndex i ws)
+                      rel = case keyOf layouts lid of
+                        Just (_, _, bm) | Just nw <- packedFrom bm (length ws), j >= nw -> Just (nw + j)
+                        _ -> Nothing
+                   in if h == Just i then Left (case ft of TInt it -> signed it && length is == 1; _ -> False) else Right (maybe (j, False) (,True) rel)
+            field (map place is) ft
           printStr ")"
         ins ("j " ++ lDone)
       line (lDone ++ ":")
@@ -821,17 +1068,29 @@ emitPrinter decls printers lbl t = do
   ins "ret"
   where
     -- Word i of the block (-1: the value itself; with True, packed pointer slot i), or its
-    -- header field (Left: whether signed).
-    field :: Either Bool (Int, Bool) -> Ty -> G ()
-    field place ft = do
+    -- header field (Left: whether signed); a 64-bit value on RV32 is two such places, its
+    -- high half into a1.
+    field :: [Either Bool (Int, Bool)] -> Ty -> G ()
+    field places ft = do
       ins "ld a0, 0(sp)"
-      case place of
-        Left sgn -> ins ((if sgn then "lw" else "lwu") ++ " a0, -4(a0)")
-        Right (i, True) -> ins ("lw t0, " ++ show (4 * i) ++ "(a0)") >> ins "slli t0, t0, 3" >> ins "add a0, a0, t0"
-        Right (i, _) -> when (i >= 0) $ wordSize >>= \w -> ins ("ld a0, " ++ show (w * i) ++ "(a0)")
+      case places of
+        [lo, hi] -> fetch "a1" hi >> fetch "a0" lo
+        _ -> mapM_ (fetch "a0") places
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("call " ++ l)
         Nothing -> printStr "..."
+    -- From the block in a0.
+    fetch d place = case place of
+      Left sgn -> ins ((if sgn then "lw" else "lwu") ++ " " ++ d ++ ", -4(a0)")
+      Right (i, True) -> ins ("lw t0, " ++ show (4 * i) ++ "(a0)") >> ins "slli t0, t0, 3" >> ins ("add " ++ d ++ ", a0, t0")
+      Right (i, _) -> when (i >= 0) $ wordSize >>= \w -> ins ("ld " ++ d ++ ", " ++ show (w * i) ++ "(a0)")
+
+-- | The words of a block holding values of these types, for each, at this word size in bits:
+-- one each, except a 64-bit integer on a 32-bit target, two.
+physicalIndices :: Int -> [Ty] -> [[Int]]
+physicalIndices word ts = [[j .. j + n - 1] | (j, n) <- zip (scanl (+) 0 sizes) sizes]
+  where
+    sizes = map (length . physical word . pure) ts
 
 -- | The Pico 2's entry point, at the image's first byte: past the IMAGE_DEF block that marks
 -- the image as an RP2350 RISC-V executable (picobin, datasheet §5.9; within the first 4 KB),
@@ -882,8 +1141,11 @@ emitStart printers t = do
   ins "call _kf_main"
   ins "addi sp, sp, -16"
   ins "sd a0, 0(sp)"
+  rv32 <- (== 4) <$> wordSize
+  when rv32 $ ins "sw a1, 8(sp)" -- a 64-bit result's high half
   printStr "result: "
   ins "ld a0, 0(sp)"
+  when rv32 $ ins "lw a1, 8(sp)"
   forM_ (M.lookup (prettyTy t) printers) $ \(_, l) -> ins ("call " ++ l)
   printStr "\n"
   when (isPtr t) $ ins "ld a0, 0(sp)" >> ins "call _keel_drop"
@@ -1169,6 +1431,7 @@ emitRuntime = do
   ins "sd a1, 0(sp)"
   ins "sd a2, 8(sp)"
   ins "sd a0, 16(sp)"
+  when rv32 $ ins "sw a3, 24(sp)" -- an 8-byte element's high half
   ins "mv a1, a2"
   ins "call _keel_array_alloc"
   ins "ld t0, 16(sp)"
@@ -1177,6 +1440,7 @@ emitRuntime = do
   ins "sd t0, 0(a0)"
   ins "li t3, 0"
   ins "beqz t2, .L_anew_fill4"
+  when rv32 $ ins "li t4, 1" >> ins "lw t5, 24(sp)" >> ins "beq t2, t4, .L_anew_fill8"
   line ".L_anew_fill:"
   ins "bgeu t3, t0, .L_anew_filled"
   ins ("slli t4, t3, " ++ show sh)
@@ -1191,6 +1455,15 @@ emitRuntime = do
   ins ("sw t1, " ++ wd 2 ++ "(t4)")
   ins "addi t3, t3, 1"
   ins "j .L_anew_fill4"
+  when rv32 $ do
+    line ".L_anew_fill8:"
+    ins "bgeu t3, t0, .L_anew_filled"
+    ins "slli t4, t3, 3"
+    ins "add t4, t4, a0"
+    ins "sw t1, 8(t4)"
+    ins "sw t5, 12(t4)"
+    ins "addi t3, t3, 1"
+    ins "j .L_anew_fill8"
   line ".L_anew_filled:"
   ins "li t3, 2"
   ins "bne t2, t3, .L_anew_ret"
@@ -1303,10 +1576,12 @@ emitRuntime = do
   ins "beq t1, t2, .L_aset_store"
   ins "sd a1, 0(sp)"
   ins "sd a2, 8(sp)"
+  when rv32 $ ins "sw a3, 16(sp)"
   ins ("ld a1, " ++ wd 1 ++ "(a0)")
   ins "call _keel_array_clone"
   ins "ld a1, 0(sp)"
   ins "ld a2, 8(sp)"
+  when rv32 $ ins "lw a3, 16(sp)"
   line ".L_aset_store:"
   ins "lw t2, -8(a0)"
   ins "andi t2, t2, 0x3ff"
@@ -1317,6 +1592,15 @@ emitRuntime = do
   ins ("sw a2, " ++ wd 2 ++ "(t0)")
   ins "j .L_aset_ret"
   line ".L_aset_word:"
+  when rv32 $ do -- RV32: 8-byte elements (kind 1) in a2, a3
+    ins "li t4, 1"
+    ins "bne t2, t4, .L_aset_w4"
+    ins "slli t0, a1, 3"
+    ins "add t0, t0, a0"
+    ins "sw a2, 8(t0)"
+    ins "sw a3, 12(t0)"
+    ins "j .L_aset_ret"
+    line ".L_aset_w4:"
   ins ("slli t0, a1, " ++ show sh)
   ins "add t0, t0, a0"
   ins ("ld t1, " ++ wd 2 ++ "(t0)")
@@ -1337,6 +1621,7 @@ emitRuntime = do
   ins "addi sp, sp, -32"
   ins "sd ra, 24(sp)"
   ins "sd a1, 0(sp)"
+  when rv32 $ ins "sw a2, 8(sp)"
   ins "ld t0, 0(a0)"
   ins ("ld t1, " ++ wd 1 ++ "(a0)")
   ins "bgeu t0, t1, .L_apush_grow"
@@ -1366,6 +1651,16 @@ emitRuntime = do
   ins ("sw a1, " ++ wd 2 ++ "(t1)")
   ins "j .L_apush_count"
   line ".L_apush_word:"
+  when rv32 $ do -- RV32: 8-byte elements (kind 1), the high half saved at 8(sp)
+    ins "li t4, 1"
+    ins "bne t2, t4, .L_apush_w4"
+    ins "slli t1, t0, 3"
+    ins "add t1, t1, a0"
+    ins "sw a1, 8(t1)"
+    ins "lw a2, 8(sp)"
+    ins "sw a2, 12(t1)"
+    ins "j .L_apush_count"
+    line ".L_apush_w4:"
   ins ("slli t1, t0, " ++ show sh)
   ins "add t1, t1, a0"
   ins ("sd a1, " ++ wd 2 ++ "(t1)")
@@ -1517,7 +1812,9 @@ emitRuntime = do
   ins "bgeu a0, t0, .L_no_net"
   ins "bnez a0, .L_perform_unhandled"
   ins "mv a0, a1"
-  ins "call _keel_print_i64"
+  if rv32
+    then ins "la t0, _keel_hi" >> ins "lw a1, 4(t0)" >> ins "call _keel_print_i64w"
+    else ins "call _keel_print_i64"
   ins "li a0, 10"
   ins "call _keel_putc"
   ins "li a0, 0"
@@ -1589,6 +1886,7 @@ emitRuntime = do
   ins "call _keel_drop"
   ins "li a0, 0"
   line ".L_machine_ret:"
+  when rv32 $ ins "srai a1, a0, 31" -- a 64-bit result's high half: they are all small
   ins "ld ra, 24(sp)"
   ins "addi sp, sp, 32"
   ins "ret"
@@ -1699,6 +1997,8 @@ emitRuntime = do
   line ".L_exit_hang:"
   ins "j .L_exit_hang"
 
+  when rv32 wideRuntime
+
   panic "_keel_panic_unhandled" "panic: unhandled operation\n"
   panic "_keel_panic_csr" "panic: csrRead or csrSet of a CSR other than mstatus, mie, mcause, mip\n"
   panic "_keel_panic_div" "panic: division by zero\n"
@@ -1708,6 +2008,96 @@ emitRuntime = do
   panic "_keel_panic_rc" "panic: reference count error\n"
   where
     fn lbl = line "\t.p2align 2" >> line (lbl ++ ":")
+    -- RV32's 64-bit arithmetic and printing; a 64-bit value is (low, high) in a register pair.
+    wideRuntime = do
+      -- (a0, a1) · (a2, a3) → (a0, a1), and a2 = 1 when the product doesn't fit 64 bits
+      -- (unsigned). Keeps t1, t3.
+      fn "_keel_mulu64"
+      mapM_ ins
+        [ "mul a4, a0, a2", "mulhu a5, a0, a2", "mul a6, a0, a3", "mulhu a7, a0, a3"
+        , "mul t4, a1, a2", "mulhu t5, a1, a2"
+        , "snez t6, a1", "snez t0, a3", "and t6, t6, t0", "or t6, t6, a7", "or t6, t6, t5"
+        , "add a5, a5, a6", "sltu t0, a5, a6", "or t6, t6, t0"
+        , "add a5, a5, t4", "sltu t0, a5, t4", "or t6, t6, t0"
+        , "mv a0, a4", "mv a1, a5", "snez a2, t6", "ret" ]
+      -- The same, signed: multiply the magnitudes, then check and apply the sign. Keeps t1, t3.
+      fn "_keel_muls64"
+      mapM_ ins ["addi sp, sp, -16", "sw ra, 12(sp)", "xor t2, a1, a3", "sw t2, 0(sp)", "bgez a1, .L_muls_a"]
+      negate "a0" "a1"
+      line ".L_muls_a:"
+      ins "bgez a3, .L_muls_b"
+      negate "a2" "a3"
+      line ".L_muls_b:"
+      mapM_ ins ["call _keel_mulu64", "lw t2, 0(sp)", "bltz t2, .L_muls_neg", "srli t0, a1, 31", "or a2, a2, t0", "j .L_muls_ret"]
+      line ".L_muls_neg:" -- the magnitude may be 2⁶³ at most
+      li "t0" 0x80000000
+      mapM_ ins ["bltu t0, a1, .L_muls_ovf", "bne a1, t0, .L_muls_negate", "beqz a0, .L_muls_negate"]
+      line ".L_muls_ovf:"
+      ins "li a2, 1"
+      line ".L_muls_negate:"
+      negate "a0" "a1"
+      line ".L_muls_ret:"
+      mapM_ ins ["lw ra, 12(sp)", "addi sp, sp, 16", "ret"]
+      -- (a0, a1) / (a2, a3), unsigned → the quotient (a0, a1), the remainder (a2, a3); the
+      -- divisor isn't 0. Shift and subtract, a bit at a time.
+      fn "_keel_udivmod64"
+      mapM_ ins ["li a4, 0", "li a5, 0", "li t6, 64"]
+      line ".L_udiv_loop:"
+      mapM_ ins
+        [ "srli t1, a5, 31" -- the remainder's bit shifted out: it is then above the divisor
+        , "slli a5, a5, 1", "srli t0, a4, 31", "or a5, a5, t0"
+        , "slli a4, a4, 1", "srli t0, a1, 31", "or a4, a4, t0"
+        , "slli a1, a1, 1", "srli t0, a0, 31", "or a1, a1, t0", "slli a0, a0, 1"
+        , "bnez t1, .L_udiv_sub", "bltu a5, a3, .L_udiv_next", "bne a5, a3, .L_udiv_sub", "bltu a4, a2, .L_udiv_next" ]
+      line ".L_udiv_sub:"
+      mapM_ ins ["sltu t0, a4, a2", "sub a4, a4, a2", "sub a5, a5, a3", "sub a5, a5, t0", "ori a0, a0, 1"]
+      line ".L_udiv_next:"
+      mapM_ ins ["addi t6, t6, -1", "bnez t6, .L_udiv_loop", "mv a2, a4", "mv a3, a5", "ret"]
+      -- Signed, truncating: the remainder takes the dividend's sign.
+      fn "_keel_sdivmod64"
+      mapM_ ins ["addi sp, sp, -16", "sw ra, 12(sp)", "sw a1, 0(sp)", "xor t0, a1, a3", "sw t0, 4(sp)", "bgez a1, .L_sdiv_a"]
+      negate "a0" "a1"
+      line ".L_sdiv_a:"
+      ins "bgez a3, .L_sdiv_b"
+      negate "a2" "a3"
+      line ".L_sdiv_b:"
+      mapM_ ins ["call _keel_udivmod64", "lw t0, 4(sp)", "bgez t0, .L_sdiv_q"]
+      negate "a0" "a1"
+      line ".L_sdiv_q:"
+      mapM_ ins ["lw t0, 0(sp)", "bgez t0, .L_sdiv_r"]
+      negate "a2" "a3"
+      line ".L_sdiv_r:"
+      mapM_ ins ["lw ra, 12(sp)", "addi sp, sp, 16", "ret"]
+      -- (a0, a1) shifted by a2, from 0 to 63 (0 returns it: a shift by 32 - 0 would be by 0).
+      fn "_keel_shl64"
+      mapM_ ins ["beqz a2, .L_shl_ret", "li t0, 32", "bgeu a2, t0, .L_shl_big", "sub t0, t0, a2", "sll a1, a1, a2", "srl t4, a0, t0", "or a1, a1, t4", "sll a0, a0, a2", "ret"]
+      line ".L_shl_big:"
+      mapM_ ins ["addi a2, a2, -32", "sll a1, a0, a2", "li a0, 0"]
+      line ".L_shl_ret:"
+      ins "ret"
+      forM_ [("_keel_shr64", "srl", "li a1, 0"), ("_keel_sra64", "sra", "srai a1, a1, 31")] $ \(l, op, fill) -> do
+        fn l
+        mapM_ ins ["beqz a2, " ++ l ++ "_ret", "li t0, 32", "bgeu a2, t0, " ++ l ++ "_big", "sub t0, t0, a2", "srl a0, a0, a2", "sll t4, a1, t0", "or a0, a0, t4", op ++ " a1, a1, a2", "ret"]
+        line (l ++ "_big:")
+        mapM_ ins ["addi a2, a2, -32", op ++ " a0, a1, a2", fill]
+        line (l ++ "_ret:")
+        ins "ret"
+      -- Print (a0, a1) in decimal: digits backwards from 40(sp), the pointer at 44(sp).
+      fn "_keel_print_u64w"
+      mapM_ ins ["addi sp, sp, -64", "sw ra, 60(sp)", "addi t0, sp, 40", "sb zero, 0(t0)", "sw t0, 44(sp)"]
+      line ".L_u64w_loop:"
+      mapM_ ins
+        [ "li a2, 10", "li a3, 0", "call _keel_udivmod64", "lw t0, 44(sp)", "addi t0, t0, -1"
+        , "addi a2, a2, 48", "sb a2, 0(t0)", "sw t0, 44(sp)", "or t1, a0, a1", "bnez t1, .L_u64w_loop"
+        , "mv a0, t0", "call _keel_print_str", "lw ra, 60(sp)", "addi sp, sp, 64", "ret" ]
+      fn "_keel_print_i64w"
+      ins "bgez a1, .L_i64w_pos"
+      mapM_ ins ["addi sp, sp, -16", "sw ra, 12(sp)", "sw a0, 0(sp)", "sw a1, 4(sp)", "li a0, 45", "call _keel_putc", "lw a0, 0(sp)", "lw a1, 4(sp)", "lw ra, 12(sp)", "addi sp, sp, 16"]
+      negate "a0" "a1"
+      line ".L_i64w_pos:"
+      ins "tail _keel_print_u64w"
+    -- Negate the pair (lo, hi) (uses t0).
+    negate lo hi = mapM_ ins ["snez t0, " ++ lo, "neg " ++ lo ++ ", " ++ lo, "neg " ++ hi ++ ", " ++ hi, "sub " ++ hi ++ ", " ++ hi ++ ", t0"]
     -- Increment the statistics counter at this byte offset (uses t4–t6 only... minus the
     -- registers the caller still needs: t6 and a6 hold nothing live at these points).
     stat :: Int -> G ()
@@ -1717,8 +2107,8 @@ emitRuntime = do
       ins "addi a6, a6, 1"
       ins ("sd a6, " ++ show off ++ "(t6)")
     -- An array's payload words for n elements of a kind (2 + the elements, rounded up to words;
-    -- on RV32 every element is a word).
-    elemWords d n kind tmp = wordSize >>= \w -> if w == 4 then ins ("addi " ++ d ++ ", " ++ n ++ ", 2") else do
+    -- on RV32 an element is a word, or two for kind 1).
+    elemWords d n kind tmp = wordSize >>= \w -> if w == 4 then mapM_ ins ["addi " ++ tmp ++ ", " ++ kind ++ ", -1", "seqz " ++ tmp ++ ", " ++ tmp, "sll " ++ d ++ ", " ++ n ++ ", " ++ tmp, "addi " ++ d ++ ", " ++ d ++ ", 2"] else do
       ins ("snez " ++ tmp ++ ", " ++ kind)
       ins ("addi " ++ tmp ++ ", " ++ tmp ++ ", 2") -- log2 of the element size
       ins ("sll " ++ d ++ ", " ++ n ++ ", " ++ tmp)

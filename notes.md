@@ -857,11 +857,15 @@ through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
   TinyUSB). Possible later, but a large project.
 
 **Work needed:**
-1. **32-bit RISC-V output (RV32).** Done without 64-bit integers: `--target riscv32` (QEMU) and
-   `--target rp2350`. Lower takes a word size; on RV32 a block's words are 4 bytes and packing
-   is off, but the header stays 8 bytes, so the runtime reads it as on RV64 (ponytail: 4 bytes
-   a block; a 4-byte header with a layout table if SRAM gets tight). The test suite runs every
-   case without `i64` on `qemu-system-riscv32`. Next: `i64`/`u64` in register pairs.
+1. **32-bit RISC-V output (RV32).** Done: `--target riscv32` (QEMU) and `--target rp2350`.
+   Lower takes a word size; on RV32 a block's words are 4 bytes and packing is off, but the
+   header stays 8 bytes, so the runtime reads it as on RV64 (ponytail: 4 bytes a block; a
+   4-byte header with a layout table if SRAM gets tight). `i64`/`u64` are register pairs: a
+   64-bit variable lives in an 8-byte stack slot, Lower splits a 64-bit field into two words
+   (`RJoin` joins them), arguments' high halves pass through `_keel_hi`, and multiplication,
+   division and variable shifts are runtime routines. The whole test suite runs on
+   `qemu-system-riscv32` (`test/memory/wide.kl` aims at the pairs). Later: let `Keel.Range`
+   narrow 64-bit variables it proves fit in 32 bits, and give them registers.
 2. **Boot image:** done. `keelc flash` loads the ELF with `picotool load -x` (no UF2 needed).
 3. **Startup code:** release peripherals from reset, configure clocks, select the pin functions
    for UART0, set the baud rate. Ordinary `MMIO` register writes, a natural first Keel driver.

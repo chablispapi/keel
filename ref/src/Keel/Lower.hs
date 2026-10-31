@@ -13,7 +13,7 @@
 -- block's layout (which constructor, how many words, which are pointers) in its low half, and
 -- a data block's first narrow field (an integer of at most 32 bits, or a Bool) in its high
 -- half (spec/memory.md). @Box@ is the identity, since data is already behind a pointer.
-module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, packedBit, packedFrom, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
+module Keel.Lower (Atom (..), Rhs (..), Expr (..), Fun (..), LProg (..), lower, isPtr, wideAt, physical, packedBit, packedFrom, reachableFuns, closureRefs, subExprs, arrayLayout, fieldLayouts, optionLayouts, conNumbers, dataLayoutKey, Elem (..), elemKind, elemOf) where
 
 import Control.Applicative ((<|>))
 import Control.Monad (foldM, forM, forM_, unless, when)
@@ -58,6 +58,18 @@ narrowTy t = case t of
   TBool -> Just False
   _ -> Nothing
 
+-- | Whether a value of this type takes two words at this word size: a 64-bit integer on a
+-- 32-bit target.
+wideAt :: Int -> Ty -> Bool
+wideAt word t = word == 32 && case t of
+  TInt it -> bits it == 64
+  _ -> False
+
+-- | The types of a block's words holding values of these types, in order: a 64-bit integer
+-- takes two on a 32-bit target, its low half first.
+physical :: Int -> [Ty] -> [Ty]
+physical word = concatMap (\t -> if wideAt word t then [TInt u32, TInt u32] else [t])
+
 -- | Bitmaps mark which payload words hold pointers (bit i = word i); the runtime uses them to
 -- drop children when a block is freed.
 data Rhs
@@ -80,6 +92,7 @@ data Rhs
   | RArray ArrayOp Elem [Atom]          -- ^ an array operation, by how the array holds its elements
   | RArena Bool                         -- ^ open (True) or close the innermost arena
   | RIndex Atom Atom Elem               -- ^ element i of an array, known to be in bounds ("Keel.Range")
+  | RJoin Atom Atom                     -- ^ a 64-bit integer from its low and high halves (32-bit targets)
   deriving (Show)
 
 data Expr
@@ -228,8 +241,9 @@ fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, isJust (narrowTy t)] of
 -- | A data block's layout at these (instantiated) field types: its id, its header field and
 -- its fields in payload order.
 dataLayout :: Info -> Integer -> [Ty] -> M (Integer, Maybe Int, [Int])
-dataLayout info tag fts = do
-  let ((_, n, bm), h, ws) = dataLayoutKey (iWord info) tag fts
+dataLayout info tag fts0 = do
+  let fts = physical (iWord info) fts0
+      ((_, n, bm), h, ws) = dataLayoutKey (iWord info) tag fts
   -- Unpacked, rejects maps beyond 16 words (so bit 16 marks only packed layouts).
   unless (packable (iWord info) fts) $ () <$ bitmap 0 [isPtr (fts !! i) | i <- ws]
   lid <- layoutId (isJust h) tag n bm
@@ -249,13 +263,15 @@ packedFrom bm nfields
 
 -- | The key of a constructor's layout ('lLayouts') at these field types, its header field and
 -- its fields in payload order. A constructor with two or more pointer fields (all within 16
--- slots) is packed: its word fields first, then its pointers in 4-byte slots. At this word size.
+-- slots) is packed: its word fields first, then its pointers in 4-byte slots. At this word size,
+-- with its fields' words ('physical'): the indices are those of the words.
 dataLayoutKey :: Int -> Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
-dataLayoutKey word tag fts
+dataLayoutKey word tag fts0
   | packable word fts =
       ((tag, nw + (length ptrs + 1) `div` 2, foldl setBit 0 (packedBit : [2 * nw + k | k <- [0 .. length ptrs - 1]])), h, wordFields ++ ptrs)
   | otherwise = ((tag, length ws, foldl setBit 0 [j | (j, i) <- zip [0 ..] ws, isPtr (fts !! i)]), h, ws)
   where
+    fts = physical word fts0
     (h, ws) = fieldSlots fts
     ptrs = filter (isPtr . (fts !!)) ws
     wordFields = filter (not . isPtr . (fts !!)) ws
@@ -387,7 +403,11 @@ expr info env tm k = case tm of
         _ -> pure ()
       sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
-  Convert to e -> sub e $ \v -> bindRhs (RConv to v)
+  -- A u32 widened on a 32-bit target: the back end extends a narrow word by its sign, so the
+  -- high half is given (the other narrow types are sign-extended in their word, or positive).
+  Convert to e
+    | wideAt (iWord info) (TInt to), TInt (IntTy False 32) <- typeOf info env e -> sub e $ \v -> bindRhs (RJoin v (AInt 0))
+    | otherwise -> sub e $ \v -> bindRhs (RConv to v)
   -- arena f: f () between opening and closing an arena, which frees everything allocated in
   -- between at once. So nothing allocated inside may escape: the result and every local f
   -- captures are not pointers, and f performs only built-in effects (a handler's clause could
@@ -442,8 +462,9 @@ expr info env tm k = case tm of
   Con c _ [] -> con c >>= \(tag, _, _) -> layoutId False tag 0 0 >>= k . ANullary
   Con c _ args -> do
     (tag, _, _) <- con c
-    (lid, h, ws) <- dataLayout info tag (map (typeOf info env) args)
-    subs args $ \vs ->
+    let fts = map (typeOf info env) args
+    (lid, h, ws) <- dataLayout info tag fts
+    subs args $ \vs0 -> halves (zip fts vs0) $ \vs ->
       let (h', ws') = ((vs !!) <$> h, map (vs !!) ws)
        in if all constant vs then constBlock lid h' ws' >>= k else bindRhs (RAlloc lid h' ws')
   Case e alts -> sub e $ \ve -> do
@@ -459,15 +480,16 @@ expr info env tm k = case tm of
       when (length ps /= length tys) $ unsupported ("case on " ++ prettyTy (typeOf info env e))
       (lid, h, ws) <- dataLayout info tag fts
       let ((_, n, bm), _, _) = dataLayoutKey (iWord info) tag fts
+          pfts = physical (iWord info) fts
       xs' <- mapM (uncurry newVar) (zip xs fts)
       let env' = M.union (M.fromList (zip xs (zip xs' fts))) env
           read' i = case (h, elemIndex i ws) of
-            (Just j, _) | j == i -> RHeader ve (case fts !! i of TInt it -> signed it; _ -> False)
+            (Just j, _) | j == i -> RHeader ve (case pfts !! i of TInt it -> signed it; _ -> False)
             (_, Just w) | Just nw <- packedFrom bm (length ws), w >= nw -> RRel ve (nw + w)
             (_, Just w) -> RField ve w
             _ -> RField ve i
       body <- expr info env' b (pure . Ret)
-      pure (lid, n, foldr (\(i, y) rest -> Bind y (read' i) rest) body (zip [0 ..] xs'))
+      (lid,n,) <$> fieldReads info read' (zip xs' fts) body
     BindCase x ve (sortOn (\(t, _, _) -> t) bs) <$> k (AVar x)
     where
       -- The default: last (no layout id is this high), so it is the branch that falls through
@@ -476,9 +498,11 @@ expr info env tm k = case tm of
   Box e -> expr info env e k
   Unbox e -> expr info env e k
   Pair a b -> do
-    bm <- bitmap 0 (map (isPtr . typeOf info env) [a, b])
-    lid <- layoutId False (-1) 2 bm
-    subs [a, b] $ \vs -> bindRhs (RAlloc lid Nothing vs)
+    let ts = map (typeOf info env) [a, b]
+        pts = physical (iWord info) ts
+    bm <- bitmap 0 (map isPtr pts)
+    lid <- layoutId False (-1) (length pts) bm
+    subs [a, b] $ \vs0 -> halves (zip ts vs0) $ \vs -> bindRhs (RAlloc lid Nothing vs)
   LetPair x y e b -> sub e $ \ve -> do
     let (tx, tyy) = case typeOf info env e of
           TPair p q -> (p, q)
@@ -486,7 +510,7 @@ expr info env tm k = case tm of
     x' <- newVar x tx
     y' <- newVar y tyy
     rest <- expr info (M.insert x (x', tx) (M.insert y (y', tyy) env)) b k
-    pure (Bind x' (RField ve 0) (Bind y' (RField ve 1) rest))
+    fieldReads info (RField ve) [(x', tx), (y', tyy)] rest
   Cocase d _ bs -> do
     let obs = M.findWithDefault [] d (iObs info)
         ordered = [fromMaybe UnitLit (lookup o bs) | (o, _) <- obs]
@@ -497,7 +521,8 @@ expr info env tm k = case tm of
     is <- forM (zip obs ordered) $ \((o, _), e) -> do
       body <- expr info envB e (pure . Ret)
       liftFun info (Fun (d ++ "." ++ o) ["%self"] base fvs (ptrsOf captured) True body)
-    lid <- bitmap base [isPtr t | (_, _, t) <- captured] >>= layoutId False (-1) (base + length fvs)
+    let envTs = physical (iWord info) [t | (_, _, t) <- captured]
+    lid <- bitmap base (map isPtr envTs) >>= layoutId False (-1) (base + length envTs)
     bindRhs (RCodata is fvs lid)
   Proj e o -> sub e $ \ve -> case typeOf info env e of
     TData d _ | Just i <- elemIndex o (map fst (M.findWithDefault [] d (iObs info))) -> bindRhs (RProj ve i)
@@ -534,6 +559,22 @@ expr info env tm k = case tm of
       modify (\s -> s {lsLocs = maybe id (M.insert x) (lsPos s) (lsLocs s)})
       Bind x rhs <$> k (AVar x)
 
+    -- A block's words for these typed values (continuation-passing, like subs): on a 32-bit
+    -- target a 64-bit integer splits into its low and high halves.
+    halves tvs kk = go tvs []
+      where
+        go [] acc = kk (concat (reverse acc))
+        go ((t, v) : more) acc = case (t, v) of
+          (TInt it, _) | wideAt (iWord info) t -> case v of
+            AInt n -> let u = n `mod` (2 ^ (64 :: Int)) in go more ([AInt (u `mod` (2 ^ (32 :: Int))), AInt (u `div` (2 ^ (32 :: Int)))] : acc)
+            _ -> do
+              lo <- newVar "lo" (TInt u32)
+              sh <- newVar "hi" t
+              hi <- newVar "hi" (TInt u32)
+              rest <- go more ([AVar lo, AVar hi] : acc)
+              pure (Bind lo (RConv u32 v) (Bind sh (RPrim (Bits Shr) it v (AInt 32)) (Bind hi (RConv u32 (AVar sh)) rest)))
+          _ -> go more ([v] : acc)
+
     constant a = case a of
       AInt _ -> True
       ANullary _ -> True
@@ -552,9 +593,24 @@ expr info env tm k = case tm of
       let env' = M.insert x (x', t) (M.fromList [(v, (ir, vt)) | (v, ir, vt) <- captured])
       body <- expr info env' b (pure . Ret)
       i <- liftFun info (Fun ("λ" ++ x) [x'] 1 fvs (ptrsOf captured) True body)
-      lid <- bitmap 1 [isPtr vt | (_, _, vt) <- captured] >>= layoutId False (-1) (1 + length fvs)
+      let envTs = physical (iWord info) [vt | (_, _, vt) <- captured]
+      lid <- bitmap 1 (map isPtr envTs) >>= layoutId False (-1) (1 + length envTs)
       c <- newVar "clo" (TFun t S.empty TUnit)
       Bind c (RClosure i fvs lid) <$> kk (AVar c)
+
+-- | Bind each variable to its field, given how to read word i: in order, a word each, except
+-- that on a 32-bit target a 64-bit integer is two (its halves, joined).
+fieldReads :: Info -> (Int -> Rhs) -> [(String, Ty)] -> Expr -> M Expr
+fieldReads info read' vts rest = go 0 vts
+  where
+    go _ [] = pure rest
+    go p ((y, t) : more)
+      | wideAt (iWord info) t = do
+          lo <- newVar "lo" (TInt u32)
+          hi <- newVar "hi" (TInt u32)
+          e <- go (p + 2) more
+          pure (Bind lo (read' p) (Bind hi (read' (p + 1)) (Bind y (RJoin (AVar lo) (AVar hi)) e)))
+      | otherwise = Bind y (read' p) <$> go (p + 1) more
 
 -- | The type of a well-typed term (effects omitted: lowering doesn't need them).
 typeOf :: Info -> Env -> Term -> Ty
@@ -854,6 +910,7 @@ exprAtoms e = case e of
       RConv _ a -> [a]
       RArray _ _ as -> as
       RIndex a i _ -> [a, i]
+      RJoin a b -> [a, b]
       _ -> []
 
 -- | Variables returned (Ret consumes its atom).
