@@ -287,7 +287,7 @@ checked arithmetic, and recursion becomes the visible effect `Diverge`.
 ### 2.1 Syntax (additions and changes)
 
 ```
-ι ::= i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64     integer types
+ι ::= i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64 | usize     integer types
 ε ::= { l₁, …, lₙ }                                     effects: finite sets of labels
 τ ::= Unit | Bool | ι | τ →ε τ | τ ⊸ε τ | D | Box τ     Int of §1 is now i64
 
@@ -959,12 +959,17 @@ shift amount below 0 counts as 0, and 64 or more shifts everything out.
 truncation or extension, like Rust's `as`): if `Γ ⊢ e : ι ! ε` then `Γ ⊢ e as ι' : ι' ! ε`, and
 the value is `lo + (n − lo) mod (hi − lo + 1)` for the range `[lo, hi]` of ι'.
 
+**`usize`** is a distinct integer type while type checking: it never unifies with `u32` or
+`u64`, so a program that mixes them is rejected on every target. After type checking the
+target gives it its width (`u64` on 64-bit targets, `u32` on 32-bit ones), and evaluation
+and lowering see only that width. Until then its literals must fit `u64`.
+
 **MMIO.** A built-in effect label with four operations:
 
 | Operation | Type |
 |---|---|
-| `read8`, `read32` | `u64 ⇒ u8`, `u64 ⇒ u32` |
-| `write8`, `write32` | `u64 ⊗ u8 ⇒ Unit`, `u64 ⊗ u32 ⇒ Unit` |
+| `read8`, `read32` | `usize ⇒ u8`, `usize ⇒ u32` |
+| `write8`, `write32` | `usize ⊗ u8 ⇒ Unit`, `usize ⊗ u32 ⇒ Unit` |
 
 `main` may leave `MMIO` unhandled, like `IO`: the machine then performs the operations on device
 memory. In the reference evaluator, which has no device memory, an unhandled MMIO operation

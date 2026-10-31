@@ -92,8 +92,12 @@ evalProgramOn :: Machine -> Program -> (Outcome, String)
 evalProgramOn m p = let (o, out, _) = runProgramOn m p in (o, out)
 
 -- | Also the files the program wrote, with their contents at the end (keelc run saves them).
+-- ponytail: a 64-bit machine (usize is u64); a word size in Machine when 32-bit targets come.
 runProgramOn :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
-runProgramOn (Machine input files hosted) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)), fromMaybe M.empty (wWritten w))
+runProgramOn m p = runResolved m (resolveWord 64 p)
+
+runResolved :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
+runResolved (Machine input files hosted) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)), fromMaybe M.empty (wWritten w))
   where
     (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if hosted then Just M.empty else Nothing) M.empty (if hosted then Just (Net M.empty M.empty 3 49152 0) else Nothing))
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).

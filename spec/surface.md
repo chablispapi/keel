@@ -45,7 +45,7 @@ type variables, operations and observations.
 
 | Syntax | Meaning |
 |---|---|
-| `i8` … `i64`, `u8` … `u64`, `Bool`, `Unit` | base types |
+| `i8` … `i64`, `u8` … `u64`, `usize`, `Bool`, `Unit` | base types; `usize` is as wide as an address on the target (32 or 64 bits) |
 | `a -> b`, `a ->{Panic, 'e} b` | function, with effects |
 | `a -o b`, `a -o{IO} b` | linear (one-shot) function |
 | `&a -> b`, `&mut a -> b` | reference parameters (only as a parameter) |
@@ -348,8 +348,8 @@ its `Send` queues what a connection can't take yet (`examples/bulk.kl`).
 
 | Operation | Type |
 |---|---|
-| `read8(addr)`, `read32(addr)` | `u64 => u8`, `u64 => u32` |
-| `write8(addr, v)`, `write32(addr, v)` | `(u64, u8) => Unit`, `(u64, u32) => Unit` |
+| `read8(addr)`, `read32(addr)` | `usize => u8`, `usize => u32` |
+| `write8(addr, v)`, `write32(addr, v)` | `(usize, u8) => Unit`, `(usize, u32) => Unit` |
 
 Unhandled, the machine performs them as real (volatile) memory accesses: only on the
 freestanding RISC-V target; on the Mac and in the evaluator an unhandled MMIO operation panics.
@@ -361,8 +361,8 @@ MMIO mocks stay exhaustive:
 
 | Operation | Type |
 |---|---|
-| `csrRead(csr)` | `u64 => u64` |
-| `csrSet(csr, bits)` | `(u64, u64) => Unit`: sets the given bits |
+| `csrRead(csr)` | `usize => usize` |
+| `csrSet(csr, bits)` | `(usize, usize) => Unit`: sets the given bits |
 | `wfi()` | `Unit => Unit`: sleeps until an interrupt enabled in `mie` is pending |
 
 Unhandled, they are the instructions `csrr`, `csrs` and `wfi`, on the freestanding RISC-V

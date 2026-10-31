@@ -297,7 +297,7 @@ private def atomTy : List Token ->{Diverge, Panic} (Ty, List Token) =
       | _ -> (TUnit, fail "expected a type" ts) }
 
 private def isIntTy : List u8 ->{Diverge} Bool =
-  \n. member n (string.split ' ' "i8 i16 i32 i64 u8 u16 u32 u64")
+  \n. member n (string.split ' ' "i8 i16 i32 i64 u8 u16 u32 u64 usize")
 
 -- Expressions ------------------------------------------------------------------------------
 

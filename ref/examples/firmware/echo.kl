@@ -11,27 +11,27 @@
 --   keelc qemu examples/firmware/echo.kl      (type, then q; Ctrl-A x quits early)
 
 -- CSRs, and their interrupt bits: machine timer (7) and machine external (11).
-def mie : u64 = 0x304
-def mip : u64 = 0x344
-def timerBit : u64 = 0x80
-def externalBit : u64 = 0x800
+def mie : usize = 0x304
+def mip : usize = 0x344
+def timerBit : usize = 0x80
+def externalBit : usize = 0x800
 
 -- 16550 UART: receive/transmit register, interrupt enable (bit 0: data received), line status.
-def uartData : u64 = 0x1000_0000
-def uartIer : u64 = 0x1000_0001
-def uartLsr : u64 = 0x1000_0005
+def uartData : usize = 0x1000_0000
+def uartIer : usize = 0x1000_0001
+def uartLsr : usize = 0x1000_0005
 bitdata LineStatus : u8 { data_ready @ 0 ; thr_empty @ 5 }
 
 -- PLIC, hart 0 in machine mode: the UART is source 10.
 def uartIrq : u32 = 10
-def plicPriority : u64 = 0x0C00_0028
-def plicEnable : u64 = 0x0C00_2000
-def plicThreshold : u64 = 0x0C20_0000
-def plicClaim : u64 = 0x0C20_0004
+def plicPriority : usize = 0x0C00_0028
+def plicEnable : usize = 0x0C00_2000
+def plicThreshold : usize = 0x0C20_0000
+def plicClaim : usize = 0x0C20_0004
 
 -- CLINT: mtime counts at 10 MHz.
-def mtime : u64 = 0x0200_BFF8
-def mtimecmp : u64 = 0x0200_4000
+def mtime : usize = 0x0200_BFF8
+def mtimecmp : usize = 0x0200_4000
 def tick : u32 = 1_000_000
 
 def putc : u8 ->{MMIO, Diverge} Unit =

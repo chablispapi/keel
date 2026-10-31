@@ -290,7 +290,9 @@ lower (Program userDecls main) = do
           , iObs = M.fromList [(d, os) | Codata d _ os <- decls]
           , iOps = M.fromList [(op, (n, a, r)) | (n, (op, a, r)) <- zip [0 ..] allOps]
           }
-      allOps = concat (map snd builtinEffects) ++ [o | Effect _ os <- decls, o <- os]
+      -- ponytail: usize in the built-in operations is u64; Lower's word size replaces 64
+      -- when 32-bit targets come.
+      allOps = [(o, resolveTyWord 64 a, resolveTyWord 64 r) | (_, os) <- builtinEffects, (o, a, r) <- os] ++ [o | Effect _ os <- decls, o <- os]
       -- Definitions taking several parameters (λx y. …) also get an uncurried entry point,
       -- numbered right after the definitions, so full applications need no closures.
       uncurried =

@@ -14,7 +14,7 @@ import Data.Set qualified as S
 data IntTy = IntTy {signed :: Bool, bits :: Int}
   deriving (Eq, Ord, Show)
 
-i8, i16, i32, i64, u8, u16, u32, u64 :: IntTy
+i8, i16, i32, i64, u8, u16, u32, u64, usize :: IntTy
 i8 = IntTy True 8
 i16 = IntTy True 16
 i32 = IntTy True 32
@@ -24,8 +24,14 @@ u16 = IntTy False 16
 u32 = IntTy False 32
 u64 = IntTy False 64
 
+-- | @usize@: as wide as an address on the target, 32 or 64 bits. Until 'resolveWord' gives it
+-- the target's width it has width 0, so it is a type of its own (mixing it with u32 or u64 is
+-- an error on every target), and its literals must fit 64 bits.
+usize = IntTy False 0
+
 -- | Smallest and largest value of an integer type.
 intRange :: IntTy -> (Integer, Integer)
+intRange (IntTy sgn 0) = intRange (IntTy sgn 64)
 intRange (IntTy sgn n)
   | sgn = (-(2 ^ (n - 1)), 2 ^ (n - 1) - 1)
   | otherwise = (0, 2 ^ n - 1)
@@ -272,12 +278,52 @@ substTerm tv ev = go
       Cocase d ts bs -> Cocase d (map st ts) bs
       _ -> tm
 
+-- | Give @usize@ the target's word size, in bits, everywhere in a program: after type checking
+-- and optimization, before evaluation or lowering, which then see only fixed widths.
+resolveWord :: Int -> Program -> Program
+resolveWord w (Program decls main) = Program (map decl decls) (term main)
+  where
+    ty = resolveTyWord w
+    it i = if i == usize then IntTy False w else i
+    decl d = case d of
+      Data lin n ps cs -> Data lin n ps [(c, map ty fs) | (c, fs) <- cs]
+      Codata n ps os -> Codata n ps [(o, ty t) | (o, t) <- os]
+      Effect l os -> Effect l [(o, ty a, ty r) | (o, a, r) <- os]
+      Def f t e -> Def f (ty t) (term e)
+      Bitdata n i fs -> Bitdata n (it i) fs
+    term tm = descend term $ case tm of
+      IntLit i n -> IntLit (it i) n
+      Convert i e -> Convert (it i) e
+      Lam x t b -> Lam x (ty t) b
+      LLam x t b -> LLam x (ty t) b
+      Con c ts as -> Con c (map ty ts) as
+      ArrayPrim op t as -> ArrayPrim op (ty t) as
+      TyApp f ts es -> TyApp f (map ty ts) es
+      Cocase d ts bs -> Cocase d (map ty ts) bs
+      _ -> tm
+
+resolveTyWord :: Int -> Ty -> Ty
+resolveTyWord w t = case t of
+  TInt i | i == usize -> TInt (IntTy False w)
+  TFun a e b -> TFun (go a) e (go b)
+  TLFun a e b -> TLFun (go a) e (go b)
+  TData d as -> TData d (map go as)
+  TBox a -> TBox (go a)
+  TPair a b -> TPair (go a) (go b)
+  TRef a -> TRef (go a)
+  TMut a -> TMut (go a)
+  TForall vs es b -> TForall vs es (go b)
+  _ -> t
+  where
+    go = resolveTyWord w
+
 -- Printing --------------------------------------------------------------------------------
 
 prettyTy :: Ty -> String
 prettyTy t = case t of
   TUnit -> "Unit"
   TBool -> "Bool"
+  TInt (IntTy False 0) -> "usize"
   TInt (IntTy s n) -> (if s then "i" else "u") ++ show n
   TFun a e b -> paren a ++ " →" ++ prettyEff e ++ " " ++ prettyTy b
   TLFun a e b -> paren a ++ " ⊸" ++ prettyEff e ++ " " ++ prettyTy b
@@ -344,15 +390,15 @@ builtinEffects =
   [ (ioE, [("out", TInt i64, TUnit), ("putc", TInt u8, TUnit)])
   , (inputE, [("getc", TUnit, TInt i64)])
   , ( mmioE
-    , [ ("read8", TInt u64, TInt u8)
-      , ("read32", TInt u64, TInt u32)
-      , ("write8", TPair (TInt u64) (TInt u8), TUnit)
-      , ("write32", TPair (TInt u64) (TInt u32), TUnit)
+    , [ ("read8", TInt usize, TInt u8)
+      , ("read32", TInt usize, TInt u32)
+      , ("write8", TPair (TInt usize) (TInt u8), TUnit)
+      , ("write32", TPair (TInt usize) (TInt u32), TUnit)
       ]
     )
   , ( hartE
-    , [ ("csrRead", TInt u64, TInt u64)
-      , ("csrSet", TPair (TInt u64) (TInt u64), TUnit)
+    , [ ("csrRead", TInt usize, TInt usize)
+      , ("csrSet", TPair (TInt usize) (TInt usize), TUnit)
       , ("wfi", TUnit, TUnit)
       ]
     )

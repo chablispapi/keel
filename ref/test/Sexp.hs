@@ -24,7 +24,7 @@ decl d = case d of
   Bitdata n it fs -> list (["bitdata", n, intTy it] ++ [list [f, show lo, show w] | (f, lo, w) <- fs])
 
 intTy :: IntTy -> String
-intTy (IntTy s n) = (if s then "i" else "u") ++ show n
+intTy it = prettyTy (TInt it)
 
 ty :: Ty -> String
 ty t = case t of

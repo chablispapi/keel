@@ -75,7 +75,7 @@ private def suffix : u64 -> i64 -> List u8 -> i64 -> i64 -> i64 ->{Diverge, Pani
       case w of
         { Nil -> emit line col (Num(v, Nil)) more width
         | Cons(x, xs) ->
-            if member w (string.split ' ' "i8 i16 i32 i64 u8 u16 u32 u64")
+            if member w (string.split ' ' "i8 i16 i32 i64 u8 u16 u32 u64 usize")
             then emit line col (Num(v, w)) more (width + length w)
             else stop line (col + width) "unexpected letter after a number" }
 

@@ -52,11 +52,12 @@ prepare = prepareWith False
 
 prepareWith :: Bool -> Program -> Either String ([Decl], Ty, LProg)
 prepareWith debug p = do
-  mono <- either (Left . show) Right (compileWith debug p)
-  (t, _) <- either (Left . show) Right (checkProgram mono)
+  checked <- either (Left . show) Right (compileWith debug p)
+  (t, _) <- either (Left . show) Right (checkProgram checked)
+  let mono = resolveWord 64 checked
   lp <- ranges <$> lower mono
   let Program decls _ = mono
-  pure (optionDecl : decls, t, lp)
+  pure (optionDecl : decls, resolveTyWord 64 t, lp)
 
 heapSize :: Integer
 heapSize = 64 * 1024 * 1024

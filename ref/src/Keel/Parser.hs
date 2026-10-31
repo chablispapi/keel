@@ -106,7 +106,7 @@ hole :: Ty
 hole = TMeta (-1)
 
 intTypes :: [(String, IntTy)]
-intTypes = [("i8", i8), ("i16", i16), ("i32", i32), ("i64", i64), ("u8", u8), ("u16", u16), ("u32", u32), ("u64", u64)]
+intTypes = [("i8", i8), ("i16", i16), ("i32", i32), ("i64", i64), ("u8", u8), ("u16", u16), ("u32", u32), ("u64", u64), ("usize", usize)]
 
 -- | @42@ (width inferred), @250u8@, @0x1000_0000@. Underscores separate digits. A negative
 -- literal is @-@ before a number at the start of an operand (see 'appE'), so @n -1@ still
