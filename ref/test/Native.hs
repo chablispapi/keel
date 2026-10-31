@@ -21,13 +21,13 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram)
 import Keel.Elab (elaborate)
-import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn)
+import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn, runProgramAt)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
 import Keel.Lower qualified as L
 import Keel.Parser (parseModule)
-import Keel.RiscV (compileRiscV)
+import Keel.RiscV (Board (..), compileRiscVAt, compileRiscVFor)
 import Keel.X86 (compileX86)
 import Keel.Toolchain (RiscVTools, buildNative, buildRiscV, findRiscVTools, runQemu)
 import Keel.Mono (compile)
@@ -406,13 +406,21 @@ main = do
     findRiscVTools >>= \case
       Nothing -> putStrLn "RISC-V: llvm, lld or qemu not found; skipped" >> pure []
       Just tools -> do
-        fs <- concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runRiscV tools dir))
+        fs <- concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runRiscV tools 64 dir))
         fw <- firmware tools dir
-        let n = length programs + 1
+        let n = length programs + length firmwareExamples
             bad = fs ++ fw
         mapM_ putStrLn bad
         putStrLn (show (n - length bad) ++ "/" ++ show n ++ " RISC-V cases passed (QEMU virt)")
-        pure bad
+        -- RV32: the cases without 64-bit integers, until register pairs come.
+        rv32 <- forM (zip [0 :: Int ..] programs) $ \(i, (name, prog)) -> case compileRiscVAt 32 prog of
+          Left e | "not supported yet on riscv32" `isInfixOf` e -> pure Nothing
+          _ -> Just <$> runRiscV tools 32 dir i (name, prog)
+        let ran = [r | Just r <- rv32]
+            bad32 = concat ran
+        mapM_ putStrLn bad32
+        putStrLn (show (length ran - length bad32) ++ "/" ++ show (length ran) ++ " RV32 cases passed (QEMU virt); " ++ show (length programs - length ran) ++ " skipped: they use 64-bit integers")
+        pure (bad ++ bad32)
   x86Fails <- x86Failures dir programs
   unless (null allFailures && null rvFailures && null x86Fails) exitFailure
 
@@ -477,46 +485,53 @@ x86Failures dir programs =
         _ -> (\e -> ["FAIL [x86] " ++ name ++ ": gcc failed:\n" ++ take 2000 e]) <$> file ".ccerr"
 
 -- | Compile for RISC-V, boot in QEMU, and compare with the reference evaluator.
-runRiscV :: RiscVTools -> FilePath -> Int -> (String, Program) -> IO [String]
-runRiscV tools dir i (name, prog) = case (compile prog, compileRiscV prog) of
+runRiscV :: RiscVTools -> Int -> FilePath -> Int -> (String, Program) -> IO [String]
+runRiscV tools xlen dir i (name, prog) = case (compile prog, compileRiscVAt xlen prog) of
   (Left e, _) -> pure [failMsg ("does not type-check: " ++ show e)]
   (_, Left e) -> pure [failMsg e]
   (Right mono, Right asm) ->
-    buildRiscV tools (dir </> ("rv" ++ show i)) asm >>= \case
+    buildRiscV tools (Virt xlen) (dir </> ("rv" ++ show xlen ++ "-" ++ show i)) asm >>= \case
       Left e -> pure [failMsg e]
       Right elf -> do
-        (code, uart) <- runQemu tools elf ""
+        (code, uart) <- runQemu tools xlen elf ""
         -- The UART carries everything: the program's output, then a panic message or the
         -- result and statistics lines.
         let (body, stats) = case breakLast "keel-stats:" uart of
               Just (before, after) -> (before, parseStats ("keel-stats:" ++ after))
               Nothing -> (maybe uart fst (breakLast "panic: " uart), Nothing)
             native = parseRun code body
-            reference = reduce (evalProgram mono)
+            reference = reduce (let (o, out, _) = runProgramAt xlen (Machine "" (const Nothing) False) mono in (o, out))
         pure $
           [failMsg ("RISC-V " ++ show native ++ ", reference " ++ show reference) | native /= Just reference]
             ++ [failMsg ("leak: " ++ show stats) | code == ExitSuccess, fmap live stats /= Just 0]
   where
-    failMsg msg = "FAIL [riscv] " ++ name ++ ": " ++ msg
+    failMsg msg = "FAIL [riscv" ++ (if xlen == 32 then "32" else "") ++ "] " ++ name ++ ": " ++ msg
 
--- | The firmware examples drive the board themselves: (file, what is typed into the UART, the
--- start of what it must print).
+-- | The firmware examples drive the board themselves: (file, board, what is typed into the
+-- UART, the start of what it must print). The Pico 2's are only built: QEMU has no RP2350.
 firmware :: RiscVTools -> FilePath -> IO [String]
-firmware tools dir = fmap concat $ forM (zip [0 :: Int ..] examples) $ \(i, (path, input, expected)) -> do
+firmware tools dir = fmap concat $ forM (zip [0 :: Int ..] firmwareExamples) $ \(i, (path, board, input, expected)) -> do
   loaded <- loadModules path
-  case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileRiscV of
-    Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
+  case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileRiscVFor board of
+    Left e -> pure [failMsg path e]
     Right asm ->
-      buildRiscV tools (dir </> ("firmware" ++ show i)) asm >>= \case
-        Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
-        Right elf -> do
-          (code, uart) <- runQemu tools elf input
-          pure ["FAIL [riscv] " ++ path ++ ": got " ++ show (code, uart) | code /= ExitSuccess || not (expected `isPrefixOf` uart)]
+      buildRiscV tools board (dir </> ("firmware" ++ show i)) asm >>= \case
+        Left e -> pure [failMsg path e]
+        Right elf -> case board of
+          Virt xlen -> do
+            (code, uart) <- runQemu tools xlen elf input
+            pure [failMsg path ("RV" ++ show xlen ++ " got " ++ show (code, uart)) | code /= ExitSuccess || not (expected `isPrefixOf` uart)]
+          Pico2 -> pure []
   where
-    examples =
-      [ ("examples/firmware/hello.kl", "", "Hi!\nresult: ()\n")
-      , ("examples/firmware/echo.kl", "hiq", "hiqresult: 3\n")
-      ]
+    failMsg path e = "FAIL [riscv] " ++ path ++ ": " ++ e
+
+firmwareExamples :: [(FilePath, Board, String, String)]
+firmwareExamples =
+  [ ("examples/firmware/hello.kl", Virt 64, "", "Hi!\nresult: ()\n")
+  , ("examples/firmware/hello.kl", Virt 32, "", "Hi!\nresult: ()\n")
+  , ("examples/firmware/echo.kl", Virt 64, "hiq", "hiqresult: 3\n")
+  , ("examples/firmware/pico/blink.kl", Pico2, "", "")
+  ]
 
 -- | Focused instruction-selection checks, plus native comparisons with the optimization
 -- disabled. The latter require identical output, exit status and every allocator counter.
@@ -562,8 +577,8 @@ reuseChecks dir = do
     reuse mask = L.DropReuse "p" mask "token" (L.Ret (L.AInt 0))
     branch tag b = L.BindCase "r" (L.AVar "p") [(tag, 2, b)] (L.Ret (L.AInt 0))
     body e = unlines . takeWhile (not . isPrefixOf "\t.globl _main") . lines $
-      emitProgram [] TUnit (L.LProg M.empty [] (L.Fun "probe" ["p"] 1 [] [] False e) M.empty layouts [])
-    headerProbe = emitProgram [] tI $ L.LProg (M.singleton 0 probe) [] mainF M.empty (M.singleton (0, 1, 0) 1) []
+      emitProgram [] TUnit (L.LProg M.empty [] (L.Fun "probe" ["p"] 1 [] [] False e) M.empty layouts [] S.empty)
+    headerProbe = emitProgram [] tI $ L.LProg (M.singleton 0 probe) [] mainF M.empty (M.singleton (0, 1, 0) 1) [] S.empty
       where
         probe = L.Fun "probe" ["p"] 1 [] [] False $
           L.BindCase "r" (L.AVar "p") [(1, 1, L.DropReuse "p" 0 "tok" $

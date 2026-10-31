@@ -9,12 +9,14 @@ keelc new NAME                 create a project: NAME/keel.project, NAME/src/mai
 keelc check [FILE.kl]          type-check; print main's type and effects
 keelc run   [FILE.kl]          run with the reference evaluator
 keelc asm   [FILE.kl] [-g]     print the ARM64 assembly
-keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]
+keelc build [FILE.kl] [-o OUT] [--target native|riscv64|riscv32|rp2350|x86_64] [-g]
                                native executable (assembled by Homebrew's LLVM clang if
                                installed, else the system cc; linked by cc), a freestanding
-                               RISC-V image for QEMU's virt board, or x86-64 Linux assembly;
+                               RISC-V image for QEMU's virt board (RV64 or RV32) or for the
+                               Raspberry Pi Pico 2's RISC-V cores, or x86-64 Linux assembly;
                                -g adds debug info
-keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
+keelc qemu  [FILE.kl]          build for RISC-V (--target riscv32 for RV32) and boot it in QEMU
+keelc flash [FILE.kl]          build for the Pico 2 and load it with picotool (BOOTSEL mode)
 keelc lsp                      the language server, over stdin/stdout
 ```
 
@@ -24,6 +26,11 @@ modules" below).
 The RISC-V target needs Homebrew's `llvm`, `lld` and `qemu`. It is freestanding: no operating
 system and no C library. Output goes through the board's 16550 UART, and the program exits
 through its test device (status 101 on a panic).
+
+`riscv32` and `rp2350` are 32-bit: `usize` is `u32` there (and in `keelc run --target …`), and
+`i64` and `u64` are not supported yet (register pairs are planned). The Pico 2 has no console
+yet: output goes nowhere, and when `main` returns or the program panics, the core sleeps.
+`ref/examples/firmware/pico/blink.kl` blinks its LED.
 
 ## Programs
 
@@ -141,7 +148,7 @@ to use it`), and qualified uses of private or missing names.
 ```
 name = modules           # output: build/modules
 main = src/main.kl       # the entry file
-target = native          # or riscv64
+target = native          # or riscv64, riscv32, rp2350
 ```
 
 In a project directory, `keelc run`, `keelc check`, `keelc build` and `keelc qemu` need no file

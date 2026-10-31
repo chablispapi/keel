@@ -1,0 +1,36 @@
+-- Blink the Raspberry Pi Pico 2's LED (GP25) from its RISC-V cores. MMIO isn't handled, so its
+-- operations reach the machine: real loads and stores to the RP2350's registers (notes.md §18).
+--
+--   keelc flash examples/firmware/pico/blink.kl    (plug the board in holding BOOTSEL first)
+
+-- RESETS: take IO_BANK0 (bit 6) and PADS_BANK0 (bit 9) out of reset. Writing to a register's
+-- address + 0x3000 clears the bits written.
+def resetsClear : usize = 0x4002_3000
+def resetDone : usize = 0x4002_0008
+def banks : u32 = 0x240
+
+-- GPIO25's pad (clear its isolation and output-disable bits, 8 and 7) and its function
+-- (5: SIO, plain software control).
+def pad25Clear : usize = 0x4003_b068
+def gpio25Ctrl : usize = 0x4002_80cc
+
+-- SIO: set bits of the output enable, flip bits of the output.
+def oeSet : usize = 0xd000_0038
+def outXor : usize = 0xd000_0028
+def led : u32 = 0x0200_0000
+
+def waitReset : Unit ->{MMIO, Diverge} Unit =
+  \u. if read32(resetDone) land banks == banks then () else waitReset ()
+
+def setup : Unit ->{MMIO, Diverge} Unit =
+  \u. write32(resetsClear, banks); waitReset ();
+      write32(pad25Clear, 0x180); write32(gpio25Ctrl, 5); write32(oeSet, led)
+
+-- About half a second at the clock the boot ROM leaves running.
+def delay : u32 ->{Panic, Diverge} Unit =
+  \n. if n == 0 then () else delay (n - 1)
+
+def blink : Unit ->{MMIO, Panic, Diverge} Unit =
+  \u. write32(outXor, led); delay 500_000; blink ()
+
+main = setup (); blink ()

@@ -4,11 +4,17 @@
 -- > keelc check [FILE.kl]          type-check, print main's type and effects
 -- > keelc run   [FILE.kl]          run with the reference evaluator
 -- > keelc asm   [FILE.kl] [-g]     print the ARM64 assembly
--- > keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]
--- >                                compile (native: via the system cc; riscv64: a freestanding
--- >                                image for QEMU's virt board; x86_64: OUT.s for x86-64 Linux,
--- >                                linked there by gcc); -g adds debug info (native)
--- > keelc qemu  [FILE.kl]          build for RISC-V and boot it in QEMU
+-- > keelc build [FILE.kl] [-o OUT] [--target native|riscv64|riscv32|x86_64] [-g]
+-- >                                compile (native: via the system cc; riscv64, riscv32: a
+-- >                                freestanding image for QEMU's virt board; x86_64: OUT.s for
+-- >                                x86-64 Linux, linked there by gcc); -g adds debug info (native)
+-- > keelc qemu  [FILE.kl] [--target riscv32]
+-- >                                build for RISC-V (RV64 unless riscv32) and boot it in QEMU
+-- > keelc flash [FILE.kl]          build for the Raspberry Pi Pico 2 (--target rp2350: its
+-- >                                RISC-V cores) and load it with picotool; the board must be
+-- >                                in BOOTSEL mode
+--
+-- @run@ takes --target too: usize is u32 for riscv32 and rp2350, u64 otherwise.
 -- > keelc lsp                      the language server, over stdin/stdout ("Keel.Lsp")
 --
 -- Without a file, the commands use the project in the current directory (keel.project): its
@@ -24,7 +30,7 @@ import Keel.Check (TypeError (..), checkProgram)
 import Control.Exception (IOException, try)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as BC
-import Keel.Eval (Machine (..), Outcome (..), runProgramOn)
+import Keel.Eval (Machine (..), Outcome (..), runProgramAt)
 import System.IO.Unsafe (unsafePerformIO)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (serve)
@@ -32,10 +38,10 @@ import Keel.Modules (loadModules)
 import Keel.Mono (compile)
 import Keel.X86 (compileX86, linkCommand)
 import System.Info qualified as Info
-import Keel.RiscV (compileRiscV)
+import Keel.RiscV (Board (..), compileRiscVFor)
 import Keel.Syntax (Program, prettyEff, prettyTy)
-import Keel.Toolchain (RiscVTools (..), buildNative, buildRiscV, findRiscVTools, qemuArgs)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
+import Keel.Toolchain (buildNative, buildRiscV, findRiscVTools, qemuArgs, qemuFor, RiscVTools)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, findExecutable, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath (dropExtension, takeDirectory, takeFileName, (<.>), (</>))
@@ -46,13 +52,13 @@ usage :: String
 usage =
   unlines
     [ "usage: keelc new NAME"
-    , "       keelc (check | run | asm | qemu) [FILE.kl]"
-    , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]"
+    , "       keelc (check | run | asm | qemu | flash) [FILE.kl]"
+    , "       keelc build [FILE.kl] [-o OUT] [--target native|riscv64|riscv32|rp2350|x86_64] [-g]"
     , "       keelc lsp"
     , "Without FILE.kl, keelc uses keel.project in the current directory."
     ]
 
-data Target = Native | RiscV64 | X86_64
+data Target = Native | RiscV64 | RiscV32 | RP2350 | X86_64
   deriving (Eq)
 
 -- | What to build: the entry file, the target, the output path, and whether to add debug info.
@@ -64,7 +70,7 @@ main = do
   case args of
     ["new", name] -> newProject name
     ["lsp"] -> serve stdin stdout
-    cmd : rest | cmd `elem` ["check", "run", "asm", "qemu", "build"] -> do
+    cmd : rest | cmd `elem` ["check", "run", "asm", "qemu", "flash", "build"] -> do
       job <- jobFor rest
       case cmd of
         "check" -> do
@@ -80,7 +86,7 @@ main = do
           hSetBinaryMode stdin True
           hSetBinaryMode stdout True
           input <- getContents
-          let (outcome, output, written) = runProgramOn (Machine input readBytes True) mono
+          let (outcome, output, written) = runProgramAt (wordOf (jobTarget job)) (Machine input readBytes True) mono
           putStr output
           -- The evaluator keeps written files to itself until the end (pure): save them now.
           forM_ (M.toList written) $ \(path, bytes) -> B.writeFile path (BC.pack bytes)
@@ -91,12 +97,20 @@ main = do
           (_, core) <- load (jobEntry job)
           putStr =<< orDie (compileNativeWith (jobDebug job) core)
         "qemu" -> do
-          (tools, elf) <- buildRv (jobEntry job) (jobOut job)
+          let xlen = if jobTarget job == RiscV32 then 32 else 64
+          (tools, elf) <- buildRv (Virt xlen) (jobEntry job) (jobOut job)
           -- The terminal is the UART, both ways: firmware can read what you type (Ctrl-A x quits).
-          exitWith =<< rawSystem (toolQemu tools) (qemuArgs elf)
+          exitWith =<< rawSystem (qemuFor tools xlen) (qemuArgs elf)
+        "flash" -> do
+          (_, elf) <- buildRv Pico2 (jobEntry job) (jobOut job)
+          picotool <- maybe (die "flashing needs picotool: brew install picotool") pure =<< findExecutable "picotool"
+          -- -x: run it once loaded.
+          exitWith =<< rawSystem picotool ["load", "-x", "-t", "elf", elf]
         _ -> case jobTarget job of
           Native -> build job
-          RiscV64 -> () <$ buildRv (jobEntry job) (jobOut job)
+          RiscV64 -> () <$ buildRv (Virt 64) (jobEntry job) (jobOut job)
+          RiscV32 -> () <$ buildRv (Virt 32) (jobEntry job) (jobOut job)
+          RP2350 -> () <$ buildRv Pico2 (jobEntry job) (jobOut job)
           X86_64 -> buildX86 job
     _ -> die usage
 
@@ -116,6 +130,8 @@ jobFor args = do
           let name = M.findWithDefault "main" "name" m
               target' = case M.lookup "target" m of
                 Just "riscv64" -> RiscV64
+                Just "riscv32" -> RiscV32
+                Just "rp2350" -> RP2350
                 Just "x86_64" -> X86_64
                 _ -> Native
           pure (Job (M.findWithDefault "src/main.kl" "main" m) target' ("build" </> name) ("-g" `elem` args))
@@ -123,8 +139,10 @@ jobFor args = do
     Nothing -> pure (jobTarget base)
     Just "native" -> pure Native
     Just "riscv64" -> pure RiscV64
+    Just "riscv32" -> pure RiscV32
+    Just "rp2350" -> pure RP2350
     Just "x86_64" -> pure X86_64
-    Just other -> die ("unknown target " ++ other ++ " (native, riscv64 or x86_64)")
+    Just other -> die ("unknown target " ++ other ++ " (native, riscv64, riscv32, rp2350 or x86_64)")
   let job = base {jobTarget = t, jobOut = maybe (jobOut base) id out}
   createDirectoryIfMissing True (takeDirectory (jobOut job))
   pure job
@@ -157,7 +175,7 @@ newProject name = do
     then die (name ++ " already exists")
     else do
       createDirectoryIfMissing True (name </> "src")
-      writeFile (name </> "keel.project") (unlines ["name = " ++ name, "main = src/main.kl", "# native, or riscv64 for QEMU's virt board", "target = native"])
+      writeFile (name </> "keel.project") (unlines ["name = " ++ name, "main = src/main.kl", "# native, or riscv64 or riscv32 for QEMU's virt board", "target = native"])
       writeFile (name </> "src" </> "main.kl") (unlines ["-- " ++ name, "", "main = println \"Hello from " ++ name ++ "!\""])
       writeFile (name </> ".gitignore") "build/\n"
       putStrLn ("created " ++ name ++ "/ (keel.project, src/main.kl); cd " ++ name ++ " && keelc run")
@@ -204,13 +222,17 @@ buildX86 job = do
         ExitFailure _ -> hPutStr stderr err >> die "gcc failed"
     else putStrLn ("wrote " ++ s ++ "; on x86-64 Linux: " ++ unwords (uncurry (:) (linkCommand (takeFileName s) (takeFileName out))))
 
-buildRv :: FilePath -> FilePath -> IO (RiscVTools, FilePath)
-buildRv f out = do
+-- | The word size in bits that a target's usize has.
+wordOf :: Target -> Int
+wordOf t = if t `elem` [RiscV32, RP2350] then 32 else 64
+
+buildRv :: Board -> FilePath -> FilePath -> IO (RiscVTools, FilePath)
+buildRv board f out = do
   (_, core) <- load f
-  asm <- orDie (compileRiscV core)
+  asm <- orDie (compileRiscVFor board core)
   tools <- maybe (die "RISC-V needs Homebrew's llvm, lld and qemu: brew install llvm lld qemu") pure =<< findRiscVTools
-  elf <- orDie =<< buildRiscV tools out asm
-  hPutStrLn stderr ("built " ++ elf ++ " (RISC-V, QEMU virt)")
+  elf <- orDie =<< buildRiscV tools board out asm
+  hPutStrLn stderr ("built " ++ elf ++ (case board of Virt n -> " (RV" ++ show n ++ ", QEMU virt)"; Pico2 -> " (RP2350, RISC-V)"))
   pure (tools, elf)
 
 -- | @file:line:col: error [Kind]: message@, then the source line with a caret under the column.

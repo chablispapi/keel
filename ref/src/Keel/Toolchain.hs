@@ -2,17 +2,18 @@
 -- QEMU (Apple's clang only targets ARM and x86, so these come from Homebrew: @brew install llvm
 -- lld qemu@); for native builds, the system cc, with that LLVM clang as the assembler when it
 -- is there.
-module Keel.Toolchain (RiscVTools (..), findRiscVTools, buildRiscV, runQemu, qemuArgs, buildNative) where
+module Keel.Toolchain (RiscVTools (..), findRiscVTools, buildRiscV, runQemu, qemuFor, qemuArgs, buildNative) where
 
 import Control.Monad (filterM)
-import Keel.RiscV (linkerScript)
+import Keel.RiscV (Board, boardXlen, linkerScript)
 import Control.Exception (IOException, catch)
 import System.Directory (doesFileExist, findExecutable, removeFile)
 import System.Exit (ExitCode (..))
 import System.FilePath ((<.>))
 import System.Process (readProcessWithExitCode)
 
-data RiscVTools = RiscVTools {toolClang, toolLld, toolQemu :: FilePath}
+-- | toolQemu boots RV64 images, toolQemu32 RV32 ones.
+data RiscVTools = RiscVTools {toolClang, toolLld, toolQemu, toolQemu32 :: FilePath}
 
 -- | Look on PATH and in Homebrew's keg locations.
 findRiscVTools :: IO (Maybe RiscVTools)
@@ -20,7 +21,8 @@ findRiscVTools = do
   clang <- llvmClang
   lld <- firstOf "ld.lld" ["/opt/homebrew/opt/lld/bin/ld.lld", "/opt/homebrew/opt/llvm/bin/ld.lld", "/opt/homebrew/bin/ld.lld"]
   qemu <- firstOf "qemu-system-riscv64" ["/opt/homebrew/bin/qemu-system-riscv64", "/usr/local/bin/qemu-system-riscv64"]
-  pure (RiscVTools <$> clang <*> lld <*> qemu)
+  qemu32 <- firstOf "qemu-system-riscv32" ["/opt/homebrew/bin/qemu-system-riscv32", "/usr/local/bin/qemu-system-riscv32"]
+  pure (RiscVTools <$> clang <*> lld <*> qemu <*> qemu32)
   where
     firstOf name ps = do
       onPath <- findExecutable name
@@ -60,15 +62,18 @@ buildNative debug s out = do
     Nothing -> readProcessWithExitCode "cc" (g ++ ["-o", out, s]) ""
   pure (if code == ExitSuccess then Right () else Left err)
 
--- | Assemble and link a RISC-V program: @out.s@ → @out@ (an ELF image for QEMU's virt board).
-buildRiscV :: RiscVTools -> FilePath -> String -> IO (Either String FilePath)
-buildRiscV tools out asm = do
+-- | Assemble and link a RISC-V program for a board: @out.s@ → @out@ (an ELF image).
+buildRiscV :: RiscVTools -> Board -> FilePath -> String -> IO (Either String FilePath)
+buildRiscV tools board out asm = do
   let s = out <.> "s"
       o = out <.> "o"
       ld = out <.> "ld"
+      arch
+        | boardXlen board == 32 = ["--target=riscv32-unknown-elf", "-march=rv32imac", "-mabi=ilp32"]
+        | otherwise = ["--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64"]
   writeFile s asm
-  writeFile ld linkerScript
-  (c1, _, e1) <- readProcessWithExitCode (toolClang tools) ["--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64", "-mno-relax", "-c", s, "-o", o] ""
+  writeFile ld (linkerScript board)
+  (c1, _, e1) <- readProcessWithExitCode (toolClang tools) (arch ++ ["-mno-relax", "-c", s, "-o", o]) ""
   case c1 of
     ExitFailure _ -> pure (Left ("assembler failed:\n" ++ e1))
     ExitSuccess -> do
@@ -79,10 +84,14 @@ buildRiscV tools out asm = do
 
 -- | Boot the image on QEMU's virt board with @input@ typed into the UART; the UART is stdout.
 -- Returns the exit status (from the board's test device) and the output.
-runQemu :: RiscVTools -> FilePath -> String -> IO (ExitCode, String)
-runQemu tools elf input = do
-  (code, out, _) <- readProcessWithExitCode (toolQemu tools) (qemuArgs elf) input
+runQemu :: RiscVTools -> Int -> FilePath -> String -> IO (ExitCode, String)
+runQemu tools xlen elf input = do
+  (code, out, _) <- readProcessWithExitCode (qemuFor tools xlen) (qemuArgs elf) input
   pure (code, out)
+
+-- | The QEMU for RV64 or RV32 images.
+qemuFor :: RiscVTools -> Int -> FilePath
+qemuFor tools xlen = if xlen == 32 then toolQemu32 tools else toolQemu tools
 
 -- | QEMU's arguments for the image: the virt board, the UART on stdin and stdout.
 qemuArgs :: FilePath -> [String]

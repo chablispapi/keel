@@ -123,7 +123,7 @@ address :: String -> String -> G ()
 address r sym = ins ("lea " ++ r ++ ", [rip + " ++ sym ++ "]")
 
 emitProgram :: [Decl] -> Ty -> LProg -> String
-emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = unlines (pruneRuntime (reverse (gsLines final)))
+emitProgram decls mainTy (LProg funs statics mainF _ layouts consts _) = unlines (pruneRuntime (reverse (gsLines final)))
   where
     final = execState gen (GS 0 [] M.empty S.empty layouts)
     printers = printerTypes decls mainTy
@@ -147,7 +147,7 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = unlines (
       forM_ (S.toList tags) $ \t -> do
         ins (".quad " ++ show (header layouts t .|. 0x80000000) ++ "\t\t# header: immortal, layout " ++ show t)
         line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with this layout")
-      mapM_ line (constData (".quad", ".long", ".L") layouts consts)
+      mapM_ line (constData (".quad", ".quad", ".long", ".L") layouts consts)
       -- The words and pointer map of each layout whose header holds a field (spec/memory.md).
       line "\t.p2align 2"
       line "_keel_layouts:"
@@ -899,7 +899,7 @@ emitPrinter decls printers lbl t = do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- As in "Keel.AArch64": constructors never built at this type have no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey 64 (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins ("mov r11, " ++ mem "rsp" 0)

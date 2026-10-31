@@ -5,8 +5,9 @@
 -- λ / λ°, application, recursive top-level definitions, data and case, Box, pairs, codata,
 -- effect handlers and operations (M3).
 --
--- Representation: every value is one 64-bit word. Integers are sign- or zero-extended to
--- 64 bits by their type; Bool and Unit are 0/1 and 0. Data values, pairs, closures and codata
+-- Representation: every value is one machine word (64 or 32 bits: 'lower' takes the word
+-- size). Integers are sign- or zero-extended to the word by their type, and on 32-bit targets
+-- an i64 or u64 takes two ('lWide'); Bool and Unit are 0/1 and 0. Data values, pairs, closures and codata
 -- values are pointers to heap blocks: @[fields…]@, @[code, captured…]@ and
 -- @[code₁, …, codeₙ, captured…]@, each preceded by a header word: the reference count and the
 -- block's layout (which constructor, how many words, which are pointers) in its low half, and
@@ -117,7 +118,8 @@ data Fun = Fun
 -- the block layouts, (constructor or -1, words, pointer map) ↦ id. @lConsts@ are the blocks
 -- whose fields are all constants (string literals, say), numbered for 'AStatic': layout,
 -- header field and words, as for 'RAlloc'; their pointers are other constant blocks.
-data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos, lLayouts :: M.Map (Integer, Int, Integer) Integer, lConsts :: [(Integer, Maybe Atom, [Atom])]}
+-- @lWide@ are the variables holding a 64-bit integer, which take two words on 32-bit targets.
+data LProg = LProg {lFuns :: M.Map Int Fun, lStatics :: [(Int, String, [Int])], lMain :: Fun, lLocs :: M.Map String Pos, lLayouts :: M.Map (Integer, Int, Integer) Integer, lConsts :: [(Integer, Maybe Atom, [Atom])], lWide :: S.Set String}
   deriving (Show)
 
 -- | What lowering needs to know about declarations.
@@ -129,6 +131,7 @@ data Info = Info
   , iParams :: M.Map String [String]              -- ^ data / codata name ↦ parameters
   , iObs :: M.Map String [(String, Ty)]           -- ^ codata name ↦ observations in order
   , iOps :: M.Map String (Int, Ty, Ty)            -- ^ operation ↦ (number, argument, result)
+  , iWord :: Int                                  -- ^ the word size in bits: 64 or 32
   }
 
 -- | Values that live on the heap and are reference counted.
@@ -142,20 +145,21 @@ isPtr t = case t of
   _ -> False
 
 -- | lsPos is the innermost source position around the term being lowered.
-data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer, lsConsts :: M.Map (Integer, Maybe Atom, [Atom]) Int}
+data LS = LS {lsNext :: Int, lsFuns :: M.Map Int Fun, lsPtrs :: S.Set String, lsWide :: S.Set String, lsPos :: Maybe Pos, lsLocs :: M.Map String Pos, lsLayouts :: M.Map (Integer, Int, Integer) Integer, lsConsts :: M.Map (Integer, Maybe Atom, [Atom]) Int}
 
 type M = StateT LS (Either String)
 
 unsupported :: String -> M a
 unsupported what = lift (Left ("not supported yet: " ++ what))
 
--- | A fresh name, recorded as a pointer if its type is one. Every IR variable is unique, so
--- a name has one type across the program.
+-- | A fresh name, recorded as a pointer or a 64-bit integer if its type is one. Every IR
+-- variable is unique, so a name has one type across the program.
 newVar :: String -> Ty -> M String
 newVar base t = do
   s <- get
   let x = base ++ "%" ++ show (lsNext s)
-  put s {lsNext = lsNext s + 1, lsPtrs = if isPtr t then S.insert x (lsPtrs s) else lsPtrs s}
+      add yes set = if yes then S.insert x set else set
+  put s {lsNext = lsNext s + 1, lsPtrs = add (isPtr t) (lsPtrs s), lsWide = add (case t of TInt it -> bits it == 64; _ -> False) (lsWide s)}
   pure x
 
 -- | Register a lifted function and return its index (after all definition indices).
@@ -223,11 +227,11 @@ fieldSlots ts = case [i | (i, t) <- zip [0 ..] ts, isJust (narrowTy t)] of
 
 -- | A data block's layout at these (instantiated) field types: its id, its header field and
 -- its fields in payload order.
-dataLayout :: Integer -> [Ty] -> M (Integer, Maybe Int, [Int])
-dataLayout tag fts = do
-  let ((_, n, bm), h, ws) = dataLayoutKey tag fts
+dataLayout :: Info -> Integer -> [Ty] -> M (Integer, Maybe Int, [Int])
+dataLayout info tag fts = do
+  let ((_, n, bm), h, ws) = dataLayoutKey (iWord info) tag fts
   -- Unpacked, rejects maps beyond 16 words (so bit 16 marks only packed layouts).
-  unless (packable fts) $ () <$ bitmap 0 [isPtr (fts !! i) | i <- ws]
+  unless (packable (iWord info) fts) $ () <$ bitmap 0 [isPtr (fts !! i) | i <- ws]
   lid <- layoutId (isJust h) tag n bm
   pure (lid, h, ws)
 
@@ -245,10 +249,10 @@ packedFrom bm nfields
 
 -- | The key of a constructor's layout ('lLayouts') at these field types, its header field and
 -- its fields in payload order. A constructor with two or more pointer fields (all within 16
--- slots) is packed: its word fields first, then its pointers in 4-byte slots.
-dataLayoutKey :: Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
-dataLayoutKey tag fts
-  | packable fts =
+-- slots) is packed: its word fields first, then its pointers in 4-byte slots. At this word size.
+dataLayoutKey :: Int -> Integer -> [Ty] -> ((Integer, Int, Integer), Maybe Int, [Int])
+dataLayoutKey word tag fts
+  | packable word fts =
       ((tag, nw + (length ptrs + 1) `div` 2, foldl setBit 0 (packedBit : [2 * nw + k | k <- [0 .. length ptrs - 1]])), h, wordFields ++ ptrs)
   | otherwise = ((tag, length ws, foldl setBit 0 [j | (j, i) <- zip [0 ..] ws, isPtr (fts !! i)]), h, ws)
   where
@@ -257,9 +261,10 @@ dataLayoutKey tag fts
     wordFields = filter (not . isPtr . (fts !!)) ws
     nw = length wordFields
 
--- | Whether a constructor at these field types gets a packed layout.
-packable :: [Ty] -> Bool
-packable fts = length ptrs >= 2 && 2 * (length ws - length ptrs) + length ptrs <= 16
+-- | Whether a constructor at these field types gets a packed layout: only with 64-bit words,
+-- since a 32-bit pointer is already a 4-byte slot.
+packable :: Int -> [Ty] -> Bool
+packable word fts = word == 64 && length ptrs >= 2 && 2 * (length ws - length ptrs) + length ptrs <= 16
   where
     (_, ws) = fieldSlots fts
     ptrs = filter (isPtr . (fts !!)) ws
@@ -275,9 +280,10 @@ optionLayouts layouts it = (look 0 0, look 1 (if bits it <= 32 then 0 else 1))
   where
     look tag n = M.findWithDefault (-1) (tag, n, 0) layouts
 
--- | Lower a monomorphic core program (the output of "Keel.Mono".compile).
-lower :: Program -> Either String LProg
-lower (Program userDecls main) = do
+-- | Lower a monomorphic core program (the output of "Keel.Mono".compile, 'resolveWord'
+-- applied) for a word size in bits.
+lower :: Int -> Program -> Either String LProg
+lower word (Program userDecls main) = do
   let decls = optionDecl : arrayDecl : userDecls
       defs = [(f, t, e) | Def f t e <- decls]
       info =
@@ -289,10 +295,9 @@ lower (Program userDecls main) = do
           , iParams = M.fromList ([(d, ps) | Data _ d ps _ <- decls] ++ [(d, ps) | Codata d ps _ <- decls])
           , iObs = M.fromList [(d, os) | Codata d _ os <- decls]
           , iOps = M.fromList [(op, (n, a, r)) | (n, (op, a, r)) <- zip [0 ..] allOps]
+          , iWord = word
           }
-      -- ponytail: usize in the built-in operations is u64; Lower's word size replaces 64
-      -- when 32-bit targets come.
-      allOps = [(o, resolveTyWord 64 a, resolveTyWord 64 r) | (_, os) <- builtinEffects, (o, a, r) <- os] ++ [o | Effect _ os <- decls, o <- os]
+      allOps = [(o, resolveTyWord word a, resolveTyWord word r) | (_, os) <- builtinEffects, (o, a, r) <- os] ++ [o | Effect _ os <- decls, o <- os]
       -- Definitions taking several parameters (λx y. …) also get an uncurried entry point,
       -- numbered right after the definitions, so full applications need no closures.
       uncurried =
@@ -320,14 +325,14 @@ lower (Program userDecls main) = do
           m <- expr info M.empty main (pure . Ret)
           pure (statics, Fun "main" [] 1 [] [] False m)
       )
-      (LS 0 M.empty S.empty Nothing M.empty M.empty M.empty)
+      (LS 0 M.empty S.empty S.empty Nothing M.empty M.empty M.empty)
   let ptrs = lsPtrs s
       -- A block's words, by its layout (packed layouts have fewer than fields).
       wordsOf = M.fromList [(lid, n) | ((_, n, _), lid) <- M.toList (lsLayouts s)]
       blockWords lid as = M.findWithDefault (length as) lid wordsOf
       sigs = borrowSigs blockWords ptrs (lsFuns s) statics mainF
   let counted sig f = let f' = refcount blockWords ptrs sigs sig f in f' {funBody = fuseFields (funBody f')}
-  pure (LProg (M.mapWithKey (\i -> counted (M.lookup i sigs)) (lsFuns s)) statics (counted Nothing mainF) (lsLocs s) (lsLayouts s) (map fst (sortOn snd (M.toList (lsConsts s)))))
+  pure (LProg (M.mapWithKey (\i -> counted (M.lookup i sigs)) (lsFuns s)) statics (counted Nothing mainF) (lsLocs s) (lsLayouts s) (map fst (sortOn snd (M.toList (lsConsts s)))) (lsWide s))
   where
     isLam e = case e of
       Lam {} -> True
@@ -378,7 +383,7 @@ expr info env tm k = case tm of
     TInt it -> do
       -- @+?@'s None and Some, which the back ends build
       case op of
-        Arith Optional _ -> mapM_ (\(tag, fts) -> dataLayout tag fts) [(0, []), (1, [TInt it])]
+        Arith Optional _ -> mapM_ (\(tag, fts) -> dataLayout info tag fts) [(0, []), (1, [TInt it])]
         _ -> pure ()
       sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
@@ -437,7 +442,7 @@ expr info env tm k = case tm of
   Con c _ [] -> con c >>= \(tag, _, _) -> layoutId False tag 0 0 >>= k . ANullary
   Con c _ args -> do
     (tag, _, _) <- con c
-    (lid, h, ws) <- dataLayout tag (map (typeOf info env) args)
+    (lid, h, ws) <- dataLayout info tag (map (typeOf info env) args)
     subs args $ \vs ->
       let (h', ws') = ((vs !!) <$> h, map (vs !!) ws)
        in if all constant vs then constBlock lid h' ws' >>= k else bindRhs (RAlloc lid h' ws')
@@ -452,8 +457,8 @@ expr info env tm k = case tm of
           inst = substTy (M.fromList (zip ps tys)) M.empty
           fts = map inst fields
       when (length ps /= length tys) $ unsupported ("case on " ++ prettyTy (typeOf info env e))
-      (lid, h, ws) <- dataLayout tag fts
-      let ((_, n, bm), _, _) = dataLayoutKey tag fts
+      (lid, h, ws) <- dataLayout info tag fts
+      let ((_, n, bm), _, _) = dataLayoutKey (iWord info) tag fts
       xs' <- mapM (uncurry newVar) (zip xs fts)
       let env' = M.union (M.fromList (zip xs (zip xs' fts))) env
           read' i = case (h, elemIndex i ws) of

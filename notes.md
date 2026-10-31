@@ -857,11 +857,12 @@ through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
   TinyUSB). Possible later, but a large project.
 
 **Work needed:**
-1. **32-bit RISC-V output (RV32).** The back end is RV64, and Keel assumes 64-bit values. On
-   RV32, either implement `i64` with register pairs and 32-bit heap words, or start with `i64`
-   unsupported. This is the largest piece.
-2. **Boot image:** the RP2350 boot ROM needs an image definition block, packaged as UF2; flash by
-   copying to the BOOTSEL drive or with `picotool` (`brew install picotool`).
+1. **32-bit RISC-V output (RV32).** Done without 64-bit integers: `--target riscv32` (QEMU) and
+   `--target rp2350`. Lower takes a word size; on RV32 a block's words are 4 bytes and packing
+   is off, but the header stays 8 bytes, so the runtime reads it as on RV64 (ponytail: 4 bytes
+   a block; a 4-byte header with a layout table if SRAM gets tight). The test suite runs every
+   case without `i64` on `qemu-system-riscv32`. Next: `i64`/`u64` in register pairs.
+2. **Boot image:** done. `keelc flash` loads the ELF with `picotool load -x` (no UF2 needed).
 3. **Startup code:** release peripherals from reset, configure clocks, select the pin functions
    for UART0, set the baud rate. Ordinary `MMIO` register writes, a natural first Keel driver.
 4. **Tests:** run the native test programs on the board over serial, like the QEMU runs.
@@ -879,7 +880,9 @@ through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
   instruction loop toggle about once or twice a second.
 - Back to BOOTSEL: replug holding the button (the image has no USB, so picotool can't reset it).
 
-**First target:** blink GP25 from Keel on the Pico 2, flashed over USB (BOOTSEL + `picotool`). Reading
+**First target:** blink GP25 from Keel on the Pico 2, flashed over USB (BOOTSEL + `picotool`):
+`keelc flash ref/examples/firmware/pico/blink.kl` (verified on the board 2026-10-31). The image copies `.data` from flash to SRAM at
+startup, and sleeps in `wfi` when `main` returns or panics. Reading
 results back (step 4) waits for headers and a serial adapter or Debug Probe.
 
 ## 19. Open threads / next steps

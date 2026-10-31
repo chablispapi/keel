@@ -1,6 +1,12 @@
--- | RISC-V back end (M3): the lowered IR ("Keel.Lower") → RV64IM assembly for a freestanding
--- target, QEMU's @virt@ board (notes.md §12, §15). Same structure and conventions as
--- "Keel.AArch64"; only the instructions and the runtime differ.
+-- | RISC-V back end (M3): the lowered IR ("Keel.Lower") → RV64IM or RV32IM assembly for a
+-- freestanding target, QEMU's @virt@ board (notes.md §12, §15). Same structure and conventions
+-- as "Keel.AArch64"; only the instructions and the runtime differ.
+--
+-- RV32 (@compileRiscVAt 32@) is the same code with 4-byte words: a block's fields, closures'
+-- captured values, handler frames and array elements are 4 bytes each. A block keeps its 8-byte
+-- header, so the runtime reads headers as on RV64; stack slots, the free-list table and the
+-- runtime's own variables stay 8 bytes apart and use their low word. 'ins' turns the 64-bit
+-- instructions into their RV32 ones. A 64-bit integer (i64, u64) isn't supported there yet.
 --
 -- Freestanding: no operating system and no C library. The runtime prints through the board's
 -- 16550 UART (0x1000_0000), exits through its test device (0x10_0000), and performs unhandled
@@ -10,31 +16,59 @@
 -- Registers: a0 = block / result, a1 = argument; t0–t3 operands and temporaries (the allocator
 -- leaves them alone; t3 also addresses stack slots beyond 2 KB); a6/a7 for inline reference
 -- counting; s0 frame pointer.
-module Keel.RiscV (compileRiscV, linkerScript) where
+module Keel.RiscV (Board (..), boardXlen, compileRiscV, compileRiscVAt, compileRiscVFor, linkerScript) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.AArch64 (Loc (..), constData, allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepare, printerTypes, pruneRuntime, runtimeBegin, runtimeEnd, template)
-import Data.Bits ((.|.), shiftL)
+import Keel.AArch64 (Loc (..), constData, allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepareAt, printerTypes, pruneRuntime, runtimeBegin, runtimeEnd, template)
+import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe)
 import Keel.Lower
 import Keel.Syntax
 
+-- | What the image runs on: QEMU's virt board as RV64 or RV32 (the register width in bits), or
+-- the Raspberry Pi Pico 2's RISC-V cores (RP2350, RV32; notes.md §18).
+data Board = Virt Int | Pico2
+  deriving (Eq)
+
+boardXlen :: Board -> Int
+boardXlen b = case b of
+  Virt n -> n
+  Pico2 -> 32
+
 compileRiscV :: Program -> Either String String
-compileRiscV p = do
-  (decls, t, lp) <- prepare p
-  emitProgram decls t lp
+compileRiscV = compileRiscVAt 64
 
-stackSize :: Integer
-stackSize = 8 * 1024 * 1024
+-- | For QEMU's virt board as RV64 or RV32 (the register width in bits).
+compileRiscVAt :: Int -> Program -> Either String String
+compileRiscVAt = compileRiscVFor . Virt
 
--- | Link at the start of the virt board's RAM, where QEMU loads the kernel image.
-linkerScript :: String
-linkerScript =
-  unlines
+compileRiscVFor :: Board -> Program -> Either String String
+compileRiscVFor board p = do
+  let xlen = boardXlen board
+  (decls, t, lp) <- prepareAt xlen False p
+  -- ponytail: register pairs for i64 and u64 on RV32 come next.
+  let wide = not (S.null (lWide lp)) || t `elem` [TInt (IntTy sgn 64) | sgn <- [False, True]]
+        || or [n < -(2 ^ (31 :: Int)) || n >= 2 ^ (32 :: Int) | (_, h, as) <- lConsts lp, AInt n <- maybe [] pure h ++ as]
+  when (xlen == 32 && wide) $
+    Left "not supported yet on riscv32: 64-bit integers (i64, u64); use i32, u32 or usize"
+  emitProgram board decls t lp
+
+-- | The heap's and the stack's sizes in bytes. The Pico 2 has 520 KB of SRAM, which also holds
+-- the runtime's variables.
+heapBytes, stackBytes :: Board -> Integer
+heapBytes b = if b == Pico2 then 384 * 1024 else heapSize
+stackBytes b = if b == Pico2 then 64 * 1024 else 8 * 1024 * 1024
+
+-- | QEMU's virt board: link at the start of its RAM, where QEMU loads the kernel image. The
+-- Pico 2: code and constants in flash, from 0x1000_0000, where the boot ROM looks for the
+-- image; the variables in SRAM, copied there from flash at startup ('emitStart').
+linkerScript :: Board -> String
+linkerScript b = unlines $ case b of
+  Virt _ ->
     [ "OUTPUT_ARCH(riscv)"
     , "ENTRY(_start)"
     , "SECTIONS {"
@@ -45,16 +79,49 @@ linkerScript =
     , "  .bss : { *(.bss*) *(COMMON) }"
     , "}"
     ]
+  Pico2 ->
+    [ "OUTPUT_ARCH(riscv)"
+    , "ENTRY(_start)"
+    , "MEMORY {"
+    , "  FLASH (rx) : ORIGIN = 0x10000000, LENGTH = 4M"
+    , "  RAM (rwx) : ORIGIN = 0x20000000, LENGTH = 520K"
+    , "}"
+    , "SECTIONS {"
+    , "  .text : { *(.text.start) *(.text*) } > FLASH"
+    , "  .rodata : { *(.rodata*) } > FLASH"
+    , "  .data : { _keel_data = .; *(.data*) . = ALIGN(4); _keel_data_end = .; } > RAM AT > FLASH"
+    , "  _keel_data_load = LOADADDR(.data);"
+    , "  .bss (NOLOAD) : { *(.bss*) *(COMMON) } > RAM"
+    , "}"
+    ]
 
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer}
+-- | gsWord: the word's size in bytes, 8 (RV64) or 4 (RV32).
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer, gsWord :: Int, gsBoard :: Board}
 
 type G = State GS
 
 line :: String -> G ()
 line l = modify (\s -> s {gsLines = l : gsLines s})
 
+-- | An instruction, written for RV64. On RV32 a 64-bit load or store becomes a word one, and a
+-- W instruction (32 bits, sign-extended) the plain one: the registers are 32 bits wide.
 ins :: String -> G ()
-ins i = line ("\t" ++ i)
+ins i = do
+  w <- gets gsWord
+  let (op, rest) = break (== ' ') i
+      op' = if w == 8 then op else M.findWithDefault op op rv32
+  line ("\t" ++ op' ++ rest)
+  where
+    rv32 = M.fromList [("ld", "lw"), ("sd", "sw"), ("lwu", "lw"), ("addiw", "addi"), ("srliw", "srli")]
+
+-- | The word's size in bytes, and log₂ of it.
+wordSize, wordShift :: G Int
+wordSize = gets gsWord
+wordShift = (\w -> if w == 8 then 3 else 2) <$> wordSize
+
+-- | The register width in bits.
+xlenBits :: G Int
+xlenBits = (* 8) <$> wordSize
 
 newLabel :: G String
 newLabel = do
@@ -79,11 +146,36 @@ printStr s = do
   ins ("la a0, " ++ l)
   ins "call _keel_print_str"
 
--- | Load a constant (any 64-bit pattern, given as a mathematical integer).
+-- | Load a constant (any pattern of the register's width, given as a mathematical integer).
 li :: String -> Integer -> G ()
-li r n = ins ("li " ++ r ++ ", " ++ show (signed64 n))
-  where
-    signed64 v = let u = v `mod` (2 ^ (64 :: Int)) in if u >= 2 ^ (63 :: Int) then u - 2 ^ (64 :: Int) else u
+li r n = do
+  bitsN <- xlenBits
+  let u = n `mod` (2 ^ bitsN)
+  ins ("li " ++ r ++ ", " ++ show (if u >= 2 ^ (bitsN - 1) then u - 2 ^ bitsN else u))
+
+-- | A pointer-sized word in the data section, at an 8-byte spacing on both widths (the
+-- runtime's variables are 8 bytes apart; on RV32 it uses their low word).
+dataPtr :: Int -> String -> [String]
+dataPtr w v = if w == 8 then ["\t.dword " ++ v] else ["\t.word " ++ v, "\t.word 0"]
+
+-- | Write a header (a 64-bit pattern) to -8(r). Clobbers t6.
+storeHeader :: String -> Integer -> G ()
+storeHeader r h = do
+  w <- wordSize
+  if w == 8
+    then li "t6" h >> ins ("sd t6, -8(" ++ r ++ ")")
+    else do
+      li "t6" (h .&. 0xffffffff) >> ins ("sw t6, -8(" ++ r ++ ")")
+      li "t6" (h `shiftR` 32) >> ins ("sw t6, -4(" ++ r ++ ")")
+
+-- | The pointer map of the block in @r@ (bits 40–55 of its header, with the packed bit 56) into
+-- @d@.
+headerMap :: String -> String -> G ()
+headerMap d r = do
+  w <- wordSize
+  if w == 8
+    then ins ("ld " ++ d ++ ", -8(" ++ r ++ ")") >> ins ("slli " ++ d ++ ", " ++ d ++ ", 7") >> ins ("srli " ++ d ++ ", " ++ d ++ ", 47")
+    else ins ("lw " ++ d ++ ", -4(" ++ r ++ ")") >> ins ("slli " ++ d ++ ", " ++ d ++ ", 7") >> ins ("srli " ++ d ++ ", " ++ d ++ ", 15")
 
 -- | Jump to a possibly distant label when a condition holds. Conditional branches only reach
 -- ±4 KiB, so branch over an unconditional jump instead.
@@ -111,14 +203,15 @@ jumpIf cond operands target = do
       "bgez" -> "bltz"
       _ -> error ("jumpIf: " ++ c)
 
-emitProgram :: [Decl] -> Ty -> LProg -> Either String String
-emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = Right (unlines (pruneRuntime (reverse (gsLines final))))
+emitProgram :: Board -> [Decl] -> Ty -> LProg -> Either String String
+emitProgram board decls mainTy (LProg funs statics mainF _ layouts consts _) = Right (unlines (pruneRuntime (reverse (gsLines final))))
   where
-    final = execState gen (GS 0 [] M.empty S.empty layouts)
+    w = boardXlen board `div` 8
+    final = execState gen (GS 0 [] M.empty S.empty layouts w board)
     printers = printerTypes decls mainTy
     gen = do
       line "\t.section .text.start, \"ax\""
-      emitStart printers mainTy
+      if board == Pico2 then emitBoot else emitStart printers mainTy
       line "\t.text"
       forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
       emitFun "_kf_main" mainF
@@ -131,12 +224,12 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = Right (un
       forM_ statics $ \(i, name, fs) -> do
         ins ".dword 0x80000000\t\t# header: immortal"
         line ("_kc_" ++ show i ++ ":\t\t\t# static block of " ++ name)
-        forM_ fs $ \f -> ins (".dword _kf_" ++ show f)
+        forM_ fs $ \f -> ins ((if w == 8 then ".dword" else ".word") ++ " _kf_" ++ show f)
       tags <- gets gsNullary
       forM_ (S.toList tags) $ \t -> do
         ins (".dword " ++ show (header layouts t .|. 0x80000000) ++ "\t\t# header: immortal, layout " ++ show t)
         line ("_kn_" ++ show t ++ ":\t\t\t# every constructor without fields with this layout")
-      mapM_ line (constData (".dword", ".word", ".L") layouts consts)
+      mapM_ line (constData (".dword", if w == 8 then ".dword" else ".word", ".word", ".L") layouts consts)
       -- The words and pointer map of each layout whose header holds a field, as in "Keel.AArch64".
       line "\t.p2align 2"
       line "_keel_layouts:"
@@ -145,14 +238,13 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = Right (un
         ins (".word " ++ show (maybe 0 (\(n, bm) -> toInteger n .|. (bm `shiftL` 8)) (M.lookup i byId)))
       line "\t.p2align 3"
       line "_keel_heap_ptr:"
-      ins ".dword _keel_heap"
-      ins (".dword _keel_heap+" ++ show heapSize)
+      mapM_ line (dataPtr w "_keel_heap" ++ dataPtr w ("_keel_heap+" ++ show (heapBytes board)))
       line "_keel_arena_base:" -- as in "Keel.AArch64"
       ins ".dword -1"
       line "_keel_arena_top:"
       ins ".dword 0"
       line "_keel_fl:"
-      ins ".dword _keel_freelists"
+      mapM_ line (dataPtr w "_keel_freelists")
       -- Zero-initialized state lives in .data so it needs no clearing at startup.
       line "_keel_freelists:"
       ins (".zero " ++ show (8 * (maxSmall + 1)))
@@ -165,9 +257,9 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts consts) = Right (un
       line "\t.bss"
       line "\t.p2align 4"
       line "_keel_heap:"
-      ins (".zero " ++ show heapSize)
+      ins (".zero " ++ show (heapBytes board))
       line "_keel_stack:"
-      ins (".zero " ++ show stackSize)
+      ins (".zero " ++ show (stackBytes board))
       line "_keel_stack_top:"
       line "\t.section .rodata"
       strs <- gets gsStrings
@@ -193,8 +285,9 @@ emitFun lbl f@(Fun name params base env envPtrs dropsSelf body) = do
   ins "mv s0, sp"
   when (frame > 0) $ if frame <= 2048 then ins ("addi sp, sp, -" ++ show frame) else li "t3" (toInteger frame) >> ins "sub sp, sp, t3"
   forM_ saved $ \(r, off) -> slot off >>= \s -> ins ("sd " ++ r ++ ", " ++ s)
+  w <- wordSize
   forM_ (zip [base ..] env) $ \(j, v) -> do
-    ins ("ld t0, " ++ show (8 * j) ++ "(a0)")
+    ins ("ld t0, " ++ show (w * j) ++ "(a0)")
     store slots "t0" v
   line ("L" ++ lbl ++ "_loop:")
   forM_ (zip [1 :: Int ..] params) $ \(r, p) -> store slots ("a" ++ show r) p
@@ -327,19 +420,22 @@ expr slots join e = case e of
       RProj a i -> Just $ do
         atom slots "a0" a
         ins "li a1, 0"
-        ins ("ld t6, " ++ show (8 * i) ++ "(a0)")
+        w <- wordSize
+        ins ("ld t6, " ++ show (w * i) ++ "(a0)")
         leave slots
         ins "jr t6"
       _ -> Nothing
 
--- | Allocate a block into a0 (header written). Clobbers a0, a1, t4–t6, a6 only.
+-- | Allocate a block into a0 (header written). Clobbers a0, a1, t4–t6, a6 only (and a2 on
+-- RV32, which passes the header's high half there).
 alloc :: Int -> Integer -> G ()
 alloc fields lid = do
   t <- gets (\st -> template (gsLayouts st) lid)
   -- A packed layout has fewer words than fields.
   n <- gets (\st -> maybe fields (\(_, w, _) -> w) (keyOf (gsLayouts st) lid))
   li "a0" (toInteger n)
-  li "a1" t
+  w <- wordSize
+  if w == 8 then li "a1" t else li "a1" (t .&. 0xffffffff) >> li "a2" (t `shiftR` 32)
   ins "call _keel_alloc"
 
 rhsCode :: Slots -> Rhs -> G ()
@@ -369,14 +465,16 @@ rhsCode slots rhs = case rhs of
     storeAll 1 fvs
   RCodata is fvs lid -> do
     alloc (length is + length fvs) lid
+    w <- wordSize
     forM_ (zip [0 :: Int ..] is) $ \(j, i) -> do
       ins ("la t2, _kf_" ++ show i)
-      ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
+      ins ("sd t2, " ++ show (w * j) ++ "(a0)")
     storeAll (length is) fvs
   RProj a i -> do
     atom slots "a0" a
     ins "li a1, 0"
-    ins ("ld t6, " ++ show (8 * i) ++ "(a0)")
+    w <- wordSize
+    ins ("ld t6, " ++ show (w * i) ++ "(a0)")
     ins "jalr t6"
   RAlloc lid h as -> do
     alloc (length as) lid
@@ -386,8 +484,7 @@ rhsCode slots rhs = case rhs of
     lDone <- newLabel
     load' slots "a0" tok
     jumpIf "beqz" ["a0"] lFresh
-    gets (\st -> header (gsLayouts st) lid) >>= li "t6"
-    ins "sd t6, -8(a0)"
+    gets (\st -> header (gsLayouts st) lid) >>= storeHeader "a0"
     ins "la t4, _keel_stats"
     ins "ld t5, 16(t4)"
     ins "addi t5, t5, 1"
@@ -399,7 +496,8 @@ rhsCode slots rhs = case rhs of
     fields lid h as
   RField a i -> do
     atom slots "t0" a
-    ins ("ld a0, " ++ show (8 * i) ++ "(t0)")
+    w <- wordSize
+    ins ("ld a0, " ++ show (w * i) ++ "(t0)")
   RRel a i -> do
     atom slots "t0" a
     ins ("lw t1, " ++ show (4 * i) ++ "(t0)")
@@ -408,16 +506,17 @@ rhsCode slots rhs = case rhs of
   RHeader a sgn -> atom slots "t0" a >> ins ((if sgn then "lw" else "lwu") ++ " a0, -4(t0)")
   RPushHandler cs lid -> do
     alloc (2 + 2 * length cs) lid
+    w <- wordSize
     ins "la t3, _keel_handlers"
     ins "ld t2, 0(t3)"
     ins "sd t2, 0(a0)"
     li "t2" (toInteger (length cs))
-    ins "sd t2, 8(a0)"
+    ins ("sd t2, " ++ show w ++ "(a0)")
     forM_ (zip [0 :: Int ..] cs) $ \(i, (n, a)) -> do
       li "t2" (toInteger n)
-      ins ("sd t2, " ++ show (8 * (2 + 2 * i)) ++ "(a0)")
+      ins ("sd t2, " ++ show (w * (2 + 2 * i)) ++ "(a0)")
       atom slots "t2" a
-      ins ("sd t2, " ++ show (8 * (3 + 2 * i)) ++ "(a0)")
+      ins ("sd t2, " ++ show (w * (3 + 2 * i)) ++ "(a0)")
     ins "la t3, _keel_handlers" -- again: loading a variable may have used t3
     ins "sd a0, 0(t3)"
   RPopHandler a -> do
@@ -455,35 +554,40 @@ rhsCode slots rhs = case rhs of
     storeAll :: Int -> [String] -> G ()
     storeAll from vs = forM_ (zip [from ..] vs) $ \(j, v) -> do
       load' slots "t2" v
-      ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
+      w <- wordSize
+      ins ("sd t2, " ++ show (w * j) ++ "(a0)")
     -- A packed layout's pointers go in 4-byte slots after its words, relative to the block.
     fields :: Integer -> Maybe Atom -> [Atom] -> G ()
     fields lid h as = do
       bm <- gets (\st -> maybe 0 (\(_, _, m) -> m) (keyOf (gsLayouts st) lid))
       let nw = fromMaybe (length as) (packedFrom bm (length as))
+      w <- wordSize
       forM_ h $ \a -> atom slots "t2" a >> ins "sw t2, -4(a0)"
       forM_ (zip [0 :: Int ..] as) $ \(j, a) -> do
         atom slots "t2" a
         if j < nw
-          then ins ("sd t2, " ++ show (8 * j) ++ "(a0)")
+          then ins ("sd t2, " ++ show (w * j) ++ "(a0)")
           else do
             ins "sub t2, t2, a0"
             ins "srai t2, t2, 3"
             ins ("sw t2, " ++ show (4 * (nw + j)) ++ "(a0)")
 
--- | Load element t1 of array t0 into a0.
+-- | Load element t1 of array t0 into a0. Elements follow the length and the capacity, and on
+-- RV32 every kind is 4 bytes.
 element :: Elem -> G ()
 element e = do
-  ins ("slli t1, t1, " ++ (case e of ENarrow _ -> "2"; _ -> "3"))
+  w <- wordSize
+  ins ("slli t1, t1, " ++ (case e of ENarrow _ -> "2"; _ -> if w == 8 then "3" else "2"))
   ins "add t0, t0, t1"
-  ins ((case e of ENarrow True -> "lw"; ENarrow False -> "lwu"; _ -> "ld") ++ " a0, 16(t0)")
+  ins ((case e of ENarrow True -> "lw"; ENarrow False -> "lwu"; _ -> "ld") ++ " a0, " ++ show (2 * w) ++ "(t0)")
 
 -- | Checked division (t0 / t1 into a0), as in "Keel.AArch64": RISC-V doesn't trap on a zero
 -- divisor or on min / -1, so both are checked.
 divide :: IntTy -> ArithOp -> G ()
 divide it@(IntTy sgn n) aop = do
+  xlen <- xlenBits
   jumpIf "beqz" ["t1"] "_keel_panic_div"
-  when (sgn && n == 64 && aop == Div) $ do
+  when (sgn && n == xlen && aop == Div) $ do
     lOk <- newLabel
     ins "li t2, -1"
     ins ("bne t1, t2, " ++ lOk)
@@ -491,22 +595,29 @@ divide it@(IntTy sgn n) aop = do
     jumpIf "beq" ["t0", "t2"] "_keel_panic_overflow"
     line (lOk ++ ":")
   ins ((case aop of Div -> "div"; _ -> "rem") ++ (if sgn then "" else "u") ++ " a0, t0, t1")
-  when (sgn && n < 64 && aop == Div) $ do
+  when (sgn && n < xlen && aop == Div) $ do
     li "t2" (snd (intRange it))
     jumpIf "bgt" ["a0", "t2"] "_keel_panic_overflow"
 
 -- | Re-extend a0 to the canonical form of an integer type.
 canonical :: IntTy -> G ()
-canonical (IntTy sgn n)
-  | n == 64 = pure ()
-  | sgn = ins ("slli a0, a0, " ++ show (64 - n)) >> ins ("srai a0, a0, " ++ show (64 - n))
-  | n == 8 = ins "andi a0, a0, 255"
-  | otherwise = ins ("slli a0, a0, " ++ show (64 - n)) >> ins ("srli a0, a0, " ++ show (64 - n))
+canonical (IntTy sgn n) = xlenBits >>= extend
+  where
+    extend xlen
+      | n >= xlen = pure ()
+      | sgn = ins ("slli a0, a0, " ++ sh) >> ins ("srai a0, a0, " ++ sh)
+      | n == 8 = ins "andi a0, a0, 255"
+      | otherwise = ins ("slli a0, a0, " ++ sh) >> ins ("srli a0, a0, " ++ sh)
+      where
+        sh = show (xlen - n)
 
 -- | Arithmetic with t0, t1 as operands and the result in a0 (spec §2.5). RISC-V has no flags,
 -- so overflow is computed from the operands and the result.
 arith :: IntTy -> Overflow -> ArithOp -> G ()
-arith it@(IntTy sgn n) ov aop
+arith it ov aop = xlenBits >>= \xlen -> arithAt xlen it ov aop
+
+arithAt :: Int -> IntTy -> Overflow -> ArithOp -> G ()
+arithAt xlen it@(IntTy sgn n) ov aop
   | ov == Wrap = plain >> when narrow (canonical it)
   | otherwise = do
       lOvf <- if ov == Checked then pure "_keel_panic_overflow" else newLabel
@@ -531,7 +642,7 @@ arith it@(IntTy sgn n) ov aop
           line (lDone ++ ":")
         _ -> pure ()
   where
-    narrow = n < 64
+    narrow = n < xlen
     (lo, hi) = intRange it
     opName = case aop of
       Add -> "add"
@@ -566,7 +677,7 @@ arith it@(IntTy sgn n) ov aop
           (_, True) -> do -- Mul (division never reaches here: see divide)
             ins "mul a0, t0, t1"
             ins "mulh t2, t0, t1"
-            ins "srai t3, a0, 63"
+            ins ("srai t3, a0, " ++ show (xlen - 1))
             jumpIf "bne" ["t2", "t3"] lOvf
           (Add, False) -> ins "add a0, t0, t1" >> jumpIf "bltu" ["a0", "t0"] lOvf
           (Sub, False) -> ins "sub a0, t0, t1" >> jumpIf "bltu" ["t0", "t1"] lOvf
@@ -595,11 +706,11 @@ arith it@(IntTy sgn n) ov aop
           line (lEnd ++ ":")
 
 bitwise :: IntTy -> BitOp -> G ()
-bitwise it@(IntTy sgn n) bop = case bop of
+bitwise it@(IntTy sgn _) bop = case bop of
   And -> ins "and a0, t0, t1"
   Or -> ins "or a0, t0, t1"
   Xor -> ins "xor a0, t0, t1"
-  Shl -> shift "sll" >> when (n < 64) (canonical it)
+  Shl -> shift "sll" >> canonical it
   Shr -> shift (if sgn then "sra" else "srl")
   where
     shift instr = do
@@ -610,12 +721,13 @@ bitwise it@(IntTy sgn n) bop = case bop of
         ins ("bgez t1, " ++ lPos)
         ins "li t1, 0"
       line (lPos ++ ":")
-      ins "li t2, 63"
+      xlen <- xlenBits
+      li "t2" (toInteger xlen - 1)
       ins ("bgtu t1, t2, " ++ lBig)
       ins (instr ++ " a0, t0, t1")
       ins ("j " ++ lDone)
       line (lBig ++ ":")
-      if instr == "sra" then ins "srai a0, t0, 63" else ins "li a0, 0"
+      if instr == "sra" then ins ("srai a0, t0, " ++ show (xlen - 1)) else ins "li a0, 0"
       line (lDone ++ ":")
 
 -- Results ---------------------------------------------------------------------------------
@@ -652,8 +764,9 @@ emitPrinter decls printers lbl t = do
     TData d tys | Just (ps, cs) <- dataOf decls d -> do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
+      w <- wordSize
       -- As in "Keel.AArch64": constructors never built at this type have no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (8 * w) (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins "ld t0, 0(sp)"
@@ -715,10 +828,47 @@ emitPrinter decls printers lbl t = do
       case place of
         Left sgn -> ins ((if sgn then "lw" else "lwu") ++ " a0, -4(a0)")
         Right (i, True) -> ins ("lw t0, " ++ show (4 * i) ++ "(a0)") >> ins "slli t0, t0, 3" >> ins "add a0, a0, t0"
-        Right (i, _) -> when (i >= 0) $ ins ("ld a0, " ++ show (8 * i) ++ "(a0)")
+        Right (i, _) -> when (i >= 0) $ wordSize >>= \w -> ins ("ld a0, " ++ show (w * i) ++ "(a0)")
       case M.lookup (prettyTy ft) printers of
         Just (_, l) -> ins ("call " ++ l)
         Nothing -> printStr "..."
+
+-- | The Pico 2's entry point, at the image's first byte: past the IMAGE_DEF block that marks
+-- the image as an RP2350 RISC-V executable (picobin, datasheet §5.9; within the first 4 KB),
+-- set up the stack, copy the variables from flash to SRAM, and run main. Nothing reads its
+-- value: when it returns, the core sleeps.
+emitBoot :: G ()
+emitBoot = do
+  line "\t.globl _start"
+  line "\t.p2align 2"
+  line "_start:"
+  ins "j .L_boot"
+  line "\t.p2align 2"
+  ins ".word 0xffffded3\t\t# block start"
+  ins ".byte 0x42, 0x01\t\t# item: image type, 1 word"
+  ins ".hword 0x1121\t\t# executable, secure, RISC-V, RP2350"
+  ins ".byte 0xff\t\t# the last item"
+  ins ".hword 0x0001\t\t# the items before it, in words"
+  ins ".byte 0x00"
+  ins ".word 0x00000000\t\t# the next block: none (a loop of one)"
+  ins ".word 0xab123579\t\t# block end"
+  line ".L_boot:"
+  ins "la sp, _keel_stack_top"
+  ins "la t0, _keel_data_load"
+  ins "la t1, _keel_data"
+  ins "la t2, _keel_data_end"
+  line ".L_boot_copy:"
+  ins "bgeu t1, t2, .L_boot_run"
+  ins "lw t3, 0(t0)"
+  ins "sw t3, 0(t1)"
+  ins "addi t0, t0, 4"
+  ins "addi t1, t1, 4"
+  ins "j .L_boot_copy"
+  line ".L_boot_run:"
+  ins "li a0, 0"
+  ins "call _kf_main"
+  ins "li a0, 0"
+  ins "tail _keel_exit"
 
 -- | Entry point: set up the stack, run main, print the result and the allocator counters
 -- (always: there is no environment to ask), then exit through the test device.
@@ -761,8 +911,13 @@ emitStart printers t = do
 
 emitRuntime :: G ()
 emitRuntime = do
-  -- _keel_alloc: a0 = payload words, a1 = header without its count → a0 = payload. Clobbers
-  -- t4–t6, a6.
+  w <- wordSize
+  sh <- wordShift
+  console <- gets ((/= Pico2) . gsBoard)
+  let wd k = show (k * w) -- the byte offset of word k
+      rv32 = w == 4
+  -- _keel_alloc: a0 = payload words, a1 = header without its count (on RV32 its low half, and
+  -- a2 the high one) → a0 = payload. Clobbers t4–t6, a6.
   fn "_keel_alloc"
   li "t4" (toInteger maxSmall)
   ins "bgtu a0, t4, .L_alloc_bump"
@@ -781,7 +936,7 @@ emitRuntime = do
   line ".L_alloc_bump:"
   ins "la t4, _keel_heap_ptr"
   ins "ld t5, 0(t4)"
-  ins "slli t6, a0, 3"
+  ins ("slli t6, a0, " ++ show sh)
   ins "add t6, t6, t5"
   ins "addi t6, t6, 8"
   ins "ld a6, 8(t4)"
@@ -792,13 +947,14 @@ emitRuntime = do
   line ".L_alloc_header:"
   ins "ori t6, a1, 1024" -- count 1
   ins "sd t6, -8(t5)"
+  when rv32 $ ins "sw a2, -4(t5)"
   ins "mv a0, t5"
   ins "ret"
   -- A block of no words links to the next in its header's high half, in words from it.
   line ".L_alloc_link0:"
   ins "lw t6, -4(t5)"
   ins "beqz t6, .L_alloc_pop"
-  ins "slli t6, t6, 3"
+  ins ("slli t6, t6, " ++ show sh)
   ins "add t6, t6, t5"
   ins "j .L_alloc_pop"
 
@@ -881,9 +1037,7 @@ emitRuntime = do
   ins "andi t3, t0, 0x3ff"
   li "t1" arrayLayout
   ins "bgeu t3, t1, .L_drop_special"
-  ins "ld t2, -8(a0)"
-  ins "slli t2, t2, 7"
-  ins "srli t2, t2, 47" -- the pointer map, bits 40–55, and whether it is packed (bit 56)
+  headerMap "t2" "a0"
   splitPacked
   line ".L_drop_loop:"
   ins "beqz t2, .L_drop_free"
@@ -935,9 +1089,9 @@ emitRuntime = do
   ins "addi t2, t2, -1"
   ins "sd t2, 8(sp)"
   ins "ld t0, 0(sp)"
-  ins "slli t3, t2, 3"
+  ins ("slli t3, t2, " ++ show sh)
   ins "add t0, t0, t3"
-  ins "ld a0, 16(t0)"
+  ins ("ld a0, " ++ wd 2 ++ "(t0)")
   ins "call _keel_drop"
   ins "ld t2, 8(sp)"
   ins "j .L_drop_elems"
@@ -969,7 +1123,7 @@ emitRuntime = do
   line ".L_free_link0:"
   ins "beqz t2, .L_free_link"
   ins "sub t2, t2, a0"
-  ins "srai t2, t2, 3"
+  ins ("srai t2, t2, " ++ show sh)
   line ".L_free_link:"
   ins "sw t2, -4(a0)"
   ins "sd a0, 0(t1)"
@@ -998,11 +1152,11 @@ emitRuntime = do
   ins "bltu t3, t4, .L_aalloc_size"
   ins "mv t3, t4"
   line ".L_aalloc_size:"
-  ins "slli t3, t3, 32"
-  ins "or t2, t2, t3"
-  ins "sd t2, -8(a0)"
+  if rv32
+    then ins "sw t2, -8(a0)" >> ins "sw t3, -4(a0)"
+    else ins "slli t3, t3, 32" >> ins "or t2, t2, t3" >> ins "sd t2, -8(a0)"
   ins "sd zero, 0(a0)"
-  ins "sd t0, 8(a0)"
+  ins ("sd t0, " ++ wd 1 ++ "(a0)")
   ins "ld ra, 24(sp)"
   ins "addi sp, sp, 32"
   ins "ret"
@@ -1025,16 +1179,16 @@ emitRuntime = do
   ins "beqz t2, .L_anew_fill4"
   line ".L_anew_fill:"
   ins "bgeu t3, t0, .L_anew_filled"
-  ins "slli t4, t3, 3"
+  ins ("slli t4, t3, " ++ show sh)
   ins "add t4, t4, a0"
-  ins "sd t1, 16(t4)"
+  ins ("sd t1, " ++ wd 2 ++ "(t4)")
   ins "addi t3, t3, 1"
   ins "j .L_anew_fill"
   line ".L_anew_fill4:"
   ins "bgeu t3, t0, .L_anew_filled"
   ins "slli t4, t3, 2"
   ins "add t4, t4, a0"
-  ins "sw t1, 16(t4)"
+  ins ("sw t1, " ++ wd 2 ++ "(t4)")
   ins "addi t3, t3, 1"
   ins "j .L_anew_fill4"
   line ".L_anew_filled:"
@@ -1089,11 +1243,11 @@ emitRuntime = do
   ins "li t2, 0"
   line ".L_aclone_copy:"
   ins "bgeu t2, t6, .L_aclone_copied"
-  ins "slli t3, t2, 3"
+  ins ("slli t3, t2, " ++ show sh)
   ins "add t4, t0, t3"
-  ins "ld t5, 16(t4)"
+  ins ("ld t5, " ++ wd 2 ++ "(t4)")
   ins "add t4, a0, t3"
-  ins "sd t5, 16(t4)"
+  ins ("sd t5, " ++ wd 2 ++ "(t4)")
   ins "addi t2, t2, 1"
   ins "j .L_aclone_copy"
   line ".L_aclone_copied:"
@@ -1119,9 +1273,9 @@ emitRuntime = do
   ins "li t3, 0"
   line ".L_aclone_dup:"
   ins "bgeu t3, t1, .L_aclone_dec"
-  ins "slli t4, t3, 3"
+  ins ("slli t4, t3, " ++ show sh)
   ins "add t4, t4, t0"
-  ins "ld t4, 16(t4)"
+  ins ("ld t4, " ++ wd 2 ++ "(t4)")
   ins "lw t5, -8(t4)"
   ins "bltz t5, .L_aclone_next"
   ins "addiw t5, t5, 1024"
@@ -1149,7 +1303,7 @@ emitRuntime = do
   ins "beq t1, t2, .L_aset_store"
   ins "sd a1, 0(sp)"
   ins "sd a2, 8(sp)"
-  ins "ld a1, 8(a0)"
+  ins ("ld a1, " ++ wd 1 ++ "(a0)")
   ins "call _keel_array_clone"
   ins "ld a1, 0(sp)"
   ins "ld a2, 8(sp)"
@@ -1160,13 +1314,13 @@ emitRuntime = do
   ins "bnez t2, .L_aset_word"
   ins "slli t0, a1, 2"
   ins "add t0, t0, a0"
-  ins "sw a2, 16(t0)"
+  ins ("sw a2, " ++ wd 2 ++ "(t0)")
   ins "j .L_aset_ret"
   line ".L_aset_word:"
-  ins "slli t0, a1, 3"
+  ins ("slli t0, a1, " ++ show sh)
   ins "add t0, t0, a0"
-  ins "ld t1, 16(t0)"
-  ins "sd a2, 16(t0)"
+  ins ("ld t1, " ++ wd 2 ++ "(t0)")
+  ins ("sd a2, " ++ wd 2 ++ "(t0)")
   ins "addi t2, t2, -2"
   ins "bnez t2, .L_aset_ret"
   ins "sd a0, 0(sp)"
@@ -1184,7 +1338,7 @@ emitRuntime = do
   ins "sd ra, 24(sp)"
   ins "sd a1, 0(sp)"
   ins "ld t0, 0(a0)"
-  ins "ld t1, 8(a0)"
+  ins ("ld t1, " ++ wd 1 ++ "(a0)")
   ins "bgeu t0, t1, .L_apush_grow"
   ins "lw t2, -8(a0)"
   ins "srliw t2, t2, 10"
@@ -1209,12 +1363,12 @@ emitRuntime = do
   ins "bnez t2, .L_apush_word"
   ins "slli t1, t0, 2"
   ins "add t1, t1, a0"
-  ins "sw a1, 16(t1)"
+  ins ("sw a1, " ++ wd 2 ++ "(t1)")
   ins "j .L_apush_count"
   line ".L_apush_word:"
-  ins "slli t1, t0, 3"
+  ins ("slli t1, t0, " ++ show sh)
   ins "add t1, t1, a0"
-  ins "sd a1, 16(t1)"
+  ins ("sd a1, " ++ wd 2 ++ "(t1)")
   line ".L_apush_count:"
   ins "addi t0, t0, 1"
   ins "sd t0, 0(a0)"
@@ -1232,7 +1386,7 @@ emitRuntime = do
   ins "srliw t1, t1, 10"
   ins "li t2, 1"
   ins "beq t1, t2, .L_apop_take"
-  ins "ld a1, 8(a0)"
+  ins ("ld a1, " ++ wd 1 ++ "(a0)")
   ins "call _keel_array_clone"
   line ".L_apop_take:"
   ins "ld t0, 0(a0)"
@@ -1242,10 +1396,10 @@ emitRuntime = do
   ins "andi t2, t2, 0x3ff"
   ins ("addi t2, t2, -" ++ show (arrayLayout + 2))
   ins "bnez t2, .L_apop_ret"
-  ins "slli t1, t0, 3"
+  ins ("slli t1, t0, " ++ show sh)
   ins "add t1, t1, a0"
   ins "sd a0, 0(sp)"
-  ins "ld a0, 16(t1)"
+  ins ("ld a0, " ++ wd 2 ++ "(t1)")
   ins "call _keel_drop"
   ins "ld a0, 0(sp)"
   line ".L_apop_ret:"
@@ -1322,13 +1476,13 @@ emitRuntime = do
   ins "sd t1, 0(sp)" -- restored afterwards
   line ".L_perform_frame:"
   ins "beqz t1, .L_perform_machine"
-  ins "ld t2, 8(t1)"
-  ins "addi t3, t1, 16"
+  ins ("ld t2, " ++ wd 1 ++ "(t1)")
+  ins ("addi t3, t1, " ++ wd 2)
   line ".L_perform_scan:"
   ins "beqz t2, .L_perform_next"
   ins "ld t4, 0(t3)"
   ins "beq t4, a0, .L_perform_found"
-  ins "addi t3, t3, 16"
+  ins ("addi t3, t3, " ++ wd 2)
   ins "addi t2, t2, -1"
   ins "j .L_perform_scan"
   line ".L_perform_next:"
@@ -1337,7 +1491,7 @@ emitRuntime = do
   line ".L_perform_found:"
   ins "ld t4, 0(t1)"
   ins "sd t4, 0(t0)" -- the clause runs under the enclosing frames
-  ins "ld a0, 8(t3)"
+  ins ("ld a0, " ++ wd 1 ++ "(t3)")
   ins "lw t5, -8(a0)" -- the call consumes the closure; the frame keeps it
   ins "bltz t5, .L_perform_call"
   ins "addiw t5, t5, 1024"
@@ -1377,6 +1531,7 @@ emitRuntime = do
   -- read: QEMU's serial input has no end, so a blocking read would never see one. Block here if
   -- a console needs it.
   line ".L_getc_op:"
+  unless console $ ins "li a0, -1" >> ins "j .L_machine_ret"
   ins "li t0, 0x10000000"
   ins "lbu t1, 5(t0)"
   ins "andi t1, t1, 1"
@@ -1422,12 +1577,12 @@ emitRuntime = do
   ins "j .L_machine_ret"
   line ".L_write8:"
   ins "ld t0, 0(a1)" -- the pair's fields
-  ins "ld t1, 8(a1)"
+  ins ("ld t1, " ++ wd 1 ++ "(a1)")
   ins "sb t1, 0(t0)"
   ins "j .L_write_done"
   line ".L_write32:"
   ins "ld t0, 0(a1)" -- the pair's fields
-  ins "ld t1, 8(a1)"
+  ins ("ld t1, " ++ wd 1 ++ "(a1)")
   ins "sw t1, 0(t0)"
   line ".L_write_done:"
   ins "mv a0, a1" -- the (address, value) pair was passed owned
@@ -1453,7 +1608,7 @@ emitRuntime = do
     ins "j .L_machine_ret"
   line ".L_csr_set:"
   ins "ld t0, 0(a1)" -- the pair's fields: CSR, bits
-  ins "ld t1, 8(a1)"
+  ins ("ld t1, " ++ wd 1 ++ "(a1)")
   forM_ csrs $ \(n, name) -> li "t2" n >> ins ("beq t0, t2, .L_csrs_" ++ name)
   ins "j _keel_panic_csr"
   forM_ csrs $ \(_, name) -> do
@@ -1466,7 +1621,10 @@ emitRuntime = do
   ins "j .L_machine_ret"
 
   -- Output through the 16550 UART: wait for bit 5 of the line status register.
+  -- ponytail: the Pico 2 has no console yet (its UART needs headers and an adapter), so output
+  -- goes nowhere there, and getc finds no byte.
   fn "_keel_putc"
+  unless console $ ins "ret"
   ins "li t0, 0x10000000"
   line ".L_putc_wait:"
   ins "lbu t1, 5(t0)"
@@ -1523,8 +1681,13 @@ emitRuntime = do
   line ".L_i64_pos:"
   ins "tail _keel_print_u64"
 
-  -- Exit through the virt board's test device: 0x5555 passes, (code << 16) | 0x3333 fails.
+  -- Exit through the virt board's test device: 0x5555 passes, (code << 16) | 0x3333 fails. The
+  -- Pico 2 has none: its core sleeps, after main and after a panic alike.
   fn "_keel_exit"
+  unless console $ do
+    line ".L_exit_sleep:"
+    ins "wfi"
+    ins "j .L_exit_sleep"
   ins "li t0, 0x100000"
   ins "li t1, 0x5555"
   ins "beqz a0, .L_exit_write"
@@ -1553,8 +1716,9 @@ emitRuntime = do
       ins ("ld a6, " ++ show off ++ "(t6)")
       ins "addi a6, a6, 1"
       ins ("sd a6, " ++ show off ++ "(t6)")
-    -- An array's payload words for n elements of a kind (2 + the elements, rounded up to words).
-    elemWords d n kind tmp = do
+    -- An array's payload words for n elements of a kind (2 + the elements, rounded up to words;
+    -- on RV32 every element is a word).
+    elemWords d n kind tmp = wordSize >>= \w -> if w == 4 then ins ("addi " ++ d ++ ", " ++ n ++ ", 2") else do
       ins ("snez " ++ tmp ++ ", " ++ kind)
       ins ("addi " ++ tmp ++ ", " ++ tmp ++ ", 2") -- log2 of the element size
       ins ("sll " ++ d ++ ", " ++ n ++ ", " ++ tmp)
@@ -1570,16 +1734,15 @@ emitRuntime = do
       ins "srli t2, t2, 8"
     -- The 17-bit map in t2: its packed bit to 16(sp), t2 the map. Clobbers t5.
     splitPacked = do
+      xlen <- xlenBits
       ins "srli t5, t2, 16"
       ins "sd t5, 16(sp)"
-      ins "slli t2, t2, 48"
-      ins "srli t2, t2, 48"
+      ins ("slli t2, t2, " ++ show (xlen - 16))
+      ins ("srli t2, t2, " ++ show (xlen - 16))
     -- The map of the block in a0 (header's low half in t0) into t2, its packed bit to 16(sp).
     reuseMap = do
       lMap <- newLabel
-      ins "ld t2, -8(a0)"
-      ins "slli t2, t2, 7"
-      ins "srli t2, t2, 47"
+      headerMap "t2" "a0"
       ins "andi t3, t0, 0x200"
       ins ("beqz t3, " ++ lMap)
       ins "andi t3, t0, 0x3ff" -- a field in the header: the map is in the table
@@ -1603,16 +1766,17 @@ emitRuntime = do
       ins ("slli " ++ dst ++ ", " ++ dst ++ ", 3")
       ins ("add " ++ dst ++ ", " ++ base ++ ", " ++ dst)
       line (lDone ++ ":")
-    -- t3 holds a single set bit; put its byte offset (index · 8) in t4.
+    -- t3 holds a single set bit; put its byte offset (index · word size) in t4.
     lowIndex = do
       lLoop <- newLabel
       lDone <- newLabel
+      w <- wordSize
       ins "li t4, 0"
       line (lLoop ++ ":")
       ins "li t5, 1"
       ins ("beq t3, t5, " ++ lDone)
       ins "srli t3, t3, 1"
-      ins "addi t4, t4, 8"
+      ins ("addi t4, t4, " ++ show w)
       ins ("j " ++ lLoop)
       line (lDone ++ ":")
     panic lbl msg = do

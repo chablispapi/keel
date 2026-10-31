@@ -10,7 +10,7 @@
 -- argument in x1, both owned, and returns an owned result in x0. Heap blocks carry a header
 -- word at offset -8 (reference count, size, tag, pointer map) and are recycled through free lists
 -- (spec/memory.md). Panics exit with status 101 after flushing stdout.
-module Keel.AArch64 (compileNative, constData, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, keyOf, performedOps, pruneRuntime, runtimeBegin, runtimeEnd, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
+module Keel.AArch64 (compileNative, constData, compileNativeWith, compileNativeWithReuse, emitProgram, prepare, prepareAt, keyOf, performedOps, pruneRuntime, runtimeBegin, runtimeEnd, bound, uses, printerTypes, dataOf, header, heapSize, maxSmall, Loc (..), allocate, template, Reduction (..), reduction) where
 
 import Control.Monad (forM_, unless, when)
 import Control.Monad.Trans.State.Strict (State, execState, gets, modify)
@@ -48,16 +48,20 @@ compileNativeWithReuse debug reuse p = do
 -- | The target-independent part of every back end: the core pipeline and lowering. Returns
 -- the declarations (with built-ins), @main@'s type, and the lowered program.
 prepare :: Program -> Either String ([Decl], Ty, LProg)
-prepare = prepareWith False
+prepare = prepareAt 64 False
 
 prepareWith :: Bool -> Program -> Either String ([Decl], Ty, LProg)
-prepareWith debug p = do
+prepareWith = prepareAt 64
+
+-- | For a word size in bits (64, or 32 for the 32-bit targets), with debug information or not.
+prepareAt :: Int -> Bool -> Program -> Either String ([Decl], Ty, LProg)
+prepareAt word debug p = do
   checked <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram checked)
-  let mono = resolveWord 64 checked
-  lp <- ranges <$> lower mono
+  let mono = resolveWord word checked
+  lp <- ranges <$> lower word mono
   let Program decls _ = mono
-  pure (optionDecl : decls, resolveTyWord 64 t, lp)
+  pure (optionDecl : decls, resolveTyWord word t, lp)
 
 heapSize :: Integer
 heapSize = 64 * 1024 * 1024
@@ -114,7 +118,7 @@ emitProgram :: [Decl] -> Ty -> LProg -> String
 emitProgram = emitProgramWithReuse True
 
 emitProgramWithReuse :: Bool -> [Decl] -> Ty -> LProg -> String
-emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts consts) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts)))))
+emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts consts _) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts)))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -141,7 +145,7 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts c
       forM_ (S.toList tags) $ \t -> do
         ins (".quad " ++ show (header layouts t .|. 0x80000000) ++ "\t\t// header: immortal, layout " ++ show t)
         line ("_kn_" ++ show t ++ ":\t\t\t// every constructor without fields with this layout")
-      mapM_ line (constData (".quad", ".long", "L") layouts consts)
+      mapM_ line (constData (".quad", ".quad", ".long", "L") layouts consts)
       layoutTable layouts
       line "_keel_heap_ptr:"
       ins ".quad _keel_heap"
@@ -899,16 +903,16 @@ layoutTable layouts = do
 header :: M.Map (Integer, Int, Integer) Integer -> Integer -> Integer
 header layouts lid = 1024 .|. template layouts lid
 
--- | The constant blocks ('lConsts'), immortal, as data lines: given the directives for 8 and 4
--- bytes and the prefix of local labels (a packed slot is the difference of two labels, which
+-- | The constant blocks ('lConsts'), immortal, as data lines: given the directives for the
+-- 8-byte header, a word and 4 bytes, and the prefix of local labels (a packed slot is the difference of two labels, which
 -- assemblers resolve only between local ones). A block's words are written as 'fields' would.
-constData :: (String, String, String) -> M.Map (Integer, Int, Integer) Integer -> [(Integer, Maybe Atom, [Atom])] -> [String]
-constData (quad, long, local) layouts consts = concat (zipWith block [0 :: Int ..] consts)
+constData :: (String, String, String, String) -> M.Map (Integer, Int, Integer) Integer -> [(Integer, Maybe Atom, [Atom])] -> [String]
+constData (quad, wordD, long, local) layouts consts = concat (zipWith block [0 :: Int ..] consts)
   where
     lbl i = local ++ "_ks_" ++ show i
     block i (lid, h, as) =
       ["\t" ++ quad ++ " " ++ show (header layouts lid .|. 0x80000000 .|. (maybe 0 (\a -> (value a .&. 0xffffffff) `shiftL` 32) h)), lbl i ++ ":"]
-        ++ ["\t" ++ quad ++ " " ++ word a | a <- take nw as]
+        ++ ["\t" ++ wordD ++ " " ++ word a | a <- take nw as]
         ++ ["\t" ++ long ++ " " ++ slot a | a <- drop nw as]
         ++ ["\t" ++ long ++ " 0" | odd (length as - nw)]
       where
@@ -1386,7 +1390,7 @@ emitPrinter decls printers lbl t = do
       let inst = substTy (M.fromList (zip ps tys)) M.empty
       layouts <- gets gsLayouts
       -- Constructors never built at this type have no layout, and no block to print.
-      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
+      let built = [(c, fts, lid, h, ws) | (c, fs) <- cs, let fts = map inst fs, let (key, h, ws) = dataLayoutKey 64 (conNumbers decls M.! c) fts, Just lid <- [M.lookup key layouts]]
       lDone <- newLabel
       labels <- mapM (const newLabel) built
       ins "ldr x9, [sp, #16]"

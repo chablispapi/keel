@@ -1,7 +1,7 @@
 -- | Call-by-value, environment-based evaluator for Keel Core, stages 1–4
 -- (spec/core.md §1.4, §2.5, §3.4, §4.5). Types are erased: @f[τ̄]@ evaluates like @f@. Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
-module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn, runProgramOn) where
+module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn, runProgramOn, runProgramAt) where
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
@@ -92,9 +92,13 @@ evalProgramOn :: Machine -> Program -> (Outcome, String)
 evalProgramOn m p = let (o, out, _) = runProgramOn m p in (o, out)
 
 -- | Also the files the program wrote, with their contents at the end (keelc run saves them).
--- ponytail: a 64-bit machine (usize is u64); a word size in Machine when 32-bit targets come.
+-- On a 64-bit machine (usize is u64).
 runProgramOn :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
-runProgramOn m p = runResolved m (resolveWord 64 p)
+runProgramOn = runProgramAt 64
+
+-- | The same with a word size in bits: usize is u32 on a 32-bit machine.
+runProgramAt :: Int -> Machine -> Program -> (Outcome, String, M.Map FilePath String)
+runProgramAt word m p = runResolved m (resolveWord word p)
 
 runResolved :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
 runResolved (Machine input files hosted) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)), fromMaybe M.empty (wWritten w))

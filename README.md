@@ -32,14 +32,14 @@ cabal install exe:keelc        # puts keelc on your PATH
 
 ```
 keelc new NAME
-keelc (check | run | asm | qemu) [FILE.kl]
-keelc build [FILE.kl] [-o OUT] [--target native|riscv64|x86_64] [-g]
+keelc (check | run | asm | qemu | flash) [FILE.kl]
+keelc build [FILE.kl] [-o OUT] [--target native|riscv64|riscv32|rp2350|x86_64] [-g]
 keelc lsp
 ```
 
 Without `FILE.kl`, keelc uses the `keel.project` in the current directory. Native builds use the
 system `cc`. The RISC-V target also needs LLVM clang, `ld.lld` and QEMU
-(`brew install llvm lld qemu`).
+(`brew install llvm lld qemu`), and flashing a Raspberry Pi Pico 2 needs `picotool`.
 
 ## Tests
 
