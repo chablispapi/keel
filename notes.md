@@ -834,14 +834,16 @@ development for over a decade.
 **Suggested path:** M0 first, to see λ compile and run on the Mac. Then M1. Then choose between M2
 (the memory model, most novel) and M3 (running on a microcontroller, most fun).
 
-## 18. Real hardware: Raspberry Pi Pico 2 W (planned)
+## 18. Real hardware: Raspberry Pi Pico 2 (planned)
 
-Goal: run Keel firmware on real silicon, not only QEMU. The user has a Pico 2 W.
+Goal: run Keel firmware on real silicon, not only QEMU. The user has a Pico 2 (RP2350, no W)
+without headers, so for now only USB is available, and an original Pico W (RP2040, Cortex-M0+
+only, no RISC-V) with an LED on GP15.
 
 **The board.** RP2350 chip: two ARM Cortex-M33 cores and two RISC-V Hazard3 cores (32-bit,
 RV32IMAC plus extensions); the boot image selects the architecture. Start on the RISC-V cores,
-since Keel already has a RISC-V back end. On the "W" boards the onboard LED is wired to the
-wireless chip (CYW43439), not to a GPIO, so blinking it is a project of its own.
+since Keel already has a RISC-V back end. The plain Pico 2's onboard LED is on GP25, so a blink
+needs no wiring. (On the "W" boards it is wired to the wireless chip, CYW43439.)
 
 **Getting output.** The language isn't the blocker: Keel firmware already writes bytes to a UART
 through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
@@ -864,7 +866,21 @@ through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
    for UART0, set the baud rate. Ordinary `MMIO` register writes, a natural first Keel driver.
 4. **Tests:** run the native test programs on the board over serial, like the QEMU runs.
 
-**Decision pending:** which output path. Waiting for an adapter or Debug Probe.
+**Verified 2026-10-31** with a hand-written RV32 blink (not yet Keel), flashed with
+`picotool load -x blink.elf`, GP25 blinking on the RISC-V cores:
+- Image: linked at flash 0x1000_0000, entered at its first byte (`j reset`), with an IMAGE_DEF
+  block in the first 4 KB: `.word 0xffffded3; .byte 0x42, 1; .hword 0x1121` (EXE, secure,
+  RISC-V, RP2350) `; .byte 0xff; .hword 1; .byte 0; .word 0; .word 0xab123579`. The boot ROM
+  switches from ARM to RISC-V by itself. Stack at the top of SRAM, 0x2008_2000.
+- GP25: clear RESETS bits 6 (IO_BANK0) and 9 (PADS_BANK0) through the clear alias 0x4002_3000,
+  wait for them in RESET_DONE 0x4002_0008; clear the pad's ISO and OD bits (0x180 to
+  0x4003_b068); FUNCSEL 5 (SIO) in 0x4002_80cc; then SIO 0xd000_0000: `GPIO_OE_SET` +0x38,
+  `GPIO_OUT_XOR` +0x28. The clock is left as the boot ROM set it; 3 M iterations of a two-
+  instruction loop toggle about once or twice a second.
+- Back to BOOTSEL: replug holding the button (the image has no USB, so picotool can't reset it).
+
+**First target:** blink GP25 from Keel on the Pico 2, flashed over USB (BOOTSEL + `picotool`). Reading
+results back (step 4) waits for headers and a serial adapter or Debug Probe.
 
 ## 19. Open threads / next steps
 
@@ -874,7 +890,7 @@ through `MMIO` (`ref/examples/firmware/hello.kl`). The options:
 - [ ] Design the real-time effects (`Alloc`, `Block`, `Diverge`) and the termination checker (section 13).
 - [ ] Design refinement types and constant-time `Secret a` typing; choose translation validation or a verified compiler (section 14).
 - [x] First RISC-V milestone: "hello world" over the QEMU `virt` UART (section 15). Done in M3: `keelc qemu ref/examples/firmware/hello.kl`.
-- [ ] Run Keel on the Pico 2 W (section 18): RV32 back end, RP2350 boot image and startup, UART output through a Debug Probe or USB-serial adapter.
+- [ ] Run Keel on the Pico 2 (section 18): RV32 back end, RP2350 boot image and startup, blink GP25; later UART output through a Debug Probe or USB-serial adapter.
 - [x] Write the core calculus formally: linear types + second-class refs + effects + codata (section 16). Done: `spec/core.md` (Keel Core, stages 1–4) with the Haskell reference checker/evaluator in `ref/` (`cd ref && cabal test`).
 - [x] Turn the evaluator from section 5 into a tiny compiler: λ-terms → ANF → closure conversion → ARM64 asm that assembles and runs on this Mac. Done (M0): `ref/src/Keel/Lower.hs` + `AArch64.hs`, checked against the reference evaluator by `ref/test/Native.hs`.
 - [ ] Deep dive: closures and defunctionalization (eval/apply, partial application).
