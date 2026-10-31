@@ -315,21 +315,25 @@ data Decl
 data Program = Program [Decl] Term
   deriving (Eq, Show)
 
--- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@, @Files@ and @Net@ have the
+-- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@, @Hart@, @Files@ and @Net@ have the
 -- operations in 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
-ioE, inputE, mmioE, filesE, netE, panicE, divergeE :: String
+ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE :: String
 ioE = "IO"
 inputE = "Input"
 filesE = "Files"
 netE = "Net"
 mmioE = "MMIO"
+hartE = "Hart"
 panicE = "Panic"
 divergeE = "Diverge"
 
 -- | Built-in effects and their operations, in operation-number order (the native runtime
 -- numbers operations this way, then user operations in declaration order). Unhandled, @out@
 -- prints a number and a newline, @putc@ one byte, @getc@ reads one byte of input (-1 at its
--- end), the MMIO operations access device memory (freestanding targets only), and the Files
+-- end), the MMIO operations access device memory and the Hart operations the processor's
+-- control registers (freestanding targets only: @csrRead@ and @csrSet@ take mstatus, mie, mip
+-- or mcause; @csrSet@ sets the bits given; @wfi@ sleeps until an enabled interrupt is
+-- pending), and the Files
 -- operations read and write files: @openFile@ takes a path's bytes and gives a handle to read
 -- (-1 if it can't be opened), @readByte@ a byte (-1 at the end); @createFile@ (emptied) and
 -- @appendFile@ give one to write, @writeBytes@ writes bytes (how many, or -1); @closeFile@
@@ -344,6 +348,12 @@ builtinEffects =
       , ("read32", TInt u64, TInt u32)
       , ("write8", TPair (TInt u64) (TInt u8), TUnit)
       , ("write32", TPair (TInt u64) (TInt u32), TUnit)
+      ]
+    )
+  , ( hartE
+    , [ ("csrRead", TInt u64, TInt u64)
+      , ("csrSet", TPair (TInt u64) (TInt u64), TUnit)
+      , ("wfi", TUnit, TUnit)
       ]
     )
   , ( filesE

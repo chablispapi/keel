@@ -34,13 +34,13 @@ import Keel.X86 (compileX86, linkCommand)
 import System.Info qualified as Info
 import Keel.RiscV (compileRiscV)
 import Keel.Syntax (Program, prettyEff, prettyTy)
-import Keel.Toolchain (RiscVTools, buildNative, buildRiscV, findRiscVTools, runQemu)
+import Keel.Toolchain (RiscVTools (..), buildNative, buildRiscV, findRiscVTools, qemuArgs)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath (dropExtension, takeDirectory, takeFileName, (<.>), (</>))
 import System.IO (hPutStr, hPutStrLn, hSetBinaryMode, stderr, stdin, stdout)
-import System.Process (readProcessWithExitCode)
+import System.Process (rawSystem, readProcessWithExitCode)
 
 usage :: String
 usage =
@@ -92,9 +92,8 @@ main = do
           putStr =<< orDie (compileNativeWith (jobDebug job) core)
         "qemu" -> do
           (tools, elf) <- buildRv (jobEntry job) (jobOut job)
-          (code, out) <- runQemu tools elf
-          putStr out
-          exitWith code
+          -- The terminal is the UART, both ways: firmware can read what you type (Ctrl-A x quits).
+          exitWith =<< rawSystem (toolQemu tools) (qemuArgs elf)
         _ -> case jobTarget job of
           Native -> build job
           RiscV64 -> () <$ buildRv (jobEntry job) (jobOut job)

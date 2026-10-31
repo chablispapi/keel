@@ -186,7 +186,8 @@ perform hs op v = case break handles hs of
     handles (Handler clauses _) = M.member op clauses
 
 -- | Operations no handler caught are performed by the machine. The evaluator has no device
--- memory, so an unhandled MMIO operation panics (handle MMIO with a mock to run drivers here).
+-- memory or control registers, so an unhandled MMIO or Hart operation panics (handle them with a
+-- mock to run drivers here).
 machine :: String -> Value -> Run Value
 machine "out" (VInt _ n) = write (show n ++ "\n")
 machine "putc" (VInt _ b) = write [toEnum (fromInteger b)]

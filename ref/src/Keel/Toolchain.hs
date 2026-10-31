@@ -2,7 +2,7 @@
 -- QEMU (Apple's clang only targets ARM and x86, so these come from Homebrew: @brew install llvm
 -- lld qemu@); for native builds, the system cc, with that LLVM clang as the assembler when it
 -- is there.
-module Keel.Toolchain (RiscVTools (..), findRiscVTools, buildRiscV, runQemu, buildNative) where
+module Keel.Toolchain (RiscVTools (..), findRiscVTools, buildRiscV, runQemu, qemuArgs, buildNative) where
 
 import Control.Monad (filterM)
 import Keel.RiscV (linkerScript)
@@ -77,13 +77,13 @@ buildRiscV tools out asm = do
         ExitFailure _ -> Left ("linker failed:\n" ++ e2)
         ExitSuccess -> Right out
 
--- | Boot the image on QEMU's virt board; the UART is stdout. Returns the exit status (from
--- the board's test device) and the output.
-runQemu :: RiscVTools -> FilePath -> IO (ExitCode, String)
-runQemu tools elf = do
-  (code, out, _) <-
-    readProcessWithExitCode
-      (toolQemu tools)
-      ["-machine", "virt", "-m", "256M", "-nographic", "-bios", "none", "-kernel", elf]
-      ""
+-- | Boot the image on QEMU's virt board with @input@ typed into the UART; the UART is stdout.
+-- Returns the exit status (from the board's test device) and the output.
+runQemu :: RiscVTools -> FilePath -> String -> IO (ExitCode, String)
+runQemu tools elf input = do
+  (code, out, _) <- readProcessWithExitCode (toolQemu tools) (qemuArgs elf) input
   pure (code, out)
+
+-- | QEMU's arguments for the image: the virt board, the UART on stdin and stdout.
+qemuArgs :: FilePath -> [String]
+qemuArgs elf = ["-machine", "virt", "-m", "256M", "-nographic", "-bios", "none", "-kernel", elf]

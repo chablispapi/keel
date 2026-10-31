@@ -2122,7 +2122,7 @@ emitRuntime used = do
   when (any performs netOpNames) $ do
     ins ("cmp x0, #" ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
     ins "b.hs L_perform_net"
-  ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO needs a freestanding target
+  ins "cbnz x0, _keel_panic_unhandled" -- operation 0 is out; MMIO and Hart need a freestanding target
   ins "sub sp, sp, #16"
   ins "str x1, [sp]" -- printf's variadic argument
   fmt <- str "%lld\n"
@@ -2199,7 +2199,7 @@ emitRuntime used = do
     ins "ret"
   when (any performs ("writeBytes" : netOpNames)) netOps
 
-  panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO needs a freestanding target)\n"
+  panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO and Hart need a freestanding target)\n"
   panic "_keel_panic_div" "panic: division by zero\n"
   panic "_keel_panic_bounds" "panic: array index out of bounds\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"

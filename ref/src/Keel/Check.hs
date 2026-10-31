@@ -63,10 +63,10 @@ data Sig = Sig
   , sigEv :: S.Set String                                      -- ^ effect variables in scope
   }
 
--- | Effects @main@ may leave unhandled: the machine provides them (MMIO only on freestanding
--- targets; elsewhere an unhandled MMIO operation panics at run time).
+-- | Effects @main@ may leave unhandled: the machine provides them (MMIO and Hart only on
+-- freestanding targets; elsewhere their unhandled operations panic at run time).
 topLevelEffects :: Eff
-topLevelEffects = S.fromList [ioE, inputE, mmioE, filesE, netE, panicE, divergeE]
+topLevelEffects = S.fromList [ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE]
 
 -- | §1.2 and §4.2: a data type is linear if declared so or if any type argument is linear;
 -- codata is always Free; a type variable has its declared kind.

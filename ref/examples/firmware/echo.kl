@@ -1,0 +1,78 @@
+-- Interrupt-driven echo for QEMU's RISC-V virt board: the UART raises an interrupt when a byte
+-- arrives (through the PLIC), the CLINT timer raises one on each tick. Each byte is echoed;
+-- after a 'q' the program waits three ticks and returns how many bytes it echoed.
+--
+-- No trap handler: interrupts stay globally off (mstatus.MIE = 0), and the program sleeps in
+-- wfi, which still wakes when an interrupt enabled in mie is pending. It then reads mip and
+-- turns what it finds into an Event for a pure step function, as std.loop does for sockets.
+-- One flow of control, so no reentrancy: the allocator and reference counts need no locks.
+-- Hart is built in like MMIO: unhandled, its operations are the instructions csrr, csrs and wfi.
+--
+--   keelc qemu examples/firmware/echo.kl      (type, then q; Ctrl-A x quits early)
+
+-- CSRs, and their interrupt bits: machine timer (7) and machine external (11).
+def mie : u64 = 0x304
+def mip : u64 = 0x344
+def timerBit : u64 = 0x80
+def externalBit : u64 = 0x800
+
+-- 16550 UART: receive/transmit register, interrupt enable (bit 0: data received), line status.
+def uartData : u64 = 0x1000_0000
+def uartIer : u64 = 0x1000_0001
+def uartLsr : u64 = 0x1000_0005
+bitdata LineStatus : u8 { data_ready @ 0 ; thr_empty @ 5 }
+
+-- PLIC, hart 0 in machine mode: the UART is source 10.
+def uartIrq : u32 = 10
+def plicPriority : u64 = 0x0C00_0028
+def plicEnable : u64 = 0x0C00_2000
+def plicThreshold : u64 = 0x0C20_0000
+def plicClaim : u64 = 0x0C20_0004
+
+-- CLINT: mtime counts at 10 MHz.
+def mtime : u64 = 0x0200_BFF8
+def mtimecmp : u64 = 0x0200_4000
+def tick : u32 = 1_000_000
+
+def putc : u8 ->{MMIO, Diverge} Unit =
+  \c. if LineStatus(read8(uartLsr)).thr_empty == 1 then write8(uartData, c) else putc c
+
+-- The next timer interrupt, one tick from now.
+-- ponytail: low 32 bits of mtime only, which wrap after 429 s; read and write the high halves
+-- when a program runs longer.
+def rearm : Unit ->{MMIO, Panic} Unit =
+  \u. write32(mtimecmp + 4, 0); write32(mtimecmp, read32(mtime) + tick)
+
+def setup : Unit ->{MMIO, Hart, Panic} Unit =
+  \u. write8(uartIer, 1);
+      write32(plicPriority, 1); write32(plicEnable, 1 lsl uartIrq); write32(plicThreshold, 0);
+      rearm ();
+      csrSet(mie, timerBit lor externalBit)
+
+data Event = Byte(u8) | Tick
+
+-- Sleep until something happens. A byte already waiting comes first; an external interrupt
+-- is claimed and completed (the UART keeps its line up while bytes wait, so the PLIC raises
+-- it again after completion if needed).
+def next : Unit ->{MMIO, Hart, Panic, Diverge} Event =
+  \u. if LineStatus(read8(uartLsr)).data_ready == 1 then Byte(read8(uartData))
+      else (
+        wfi();
+        let pending = csrRead(mip) in
+        if pending land timerBit != 0 then (rearm (); Tick)
+        else (
+          (if pending land externalBit != 0 then write32(plicClaim, read32(plicClaim)) else ());
+          next ()))
+
+-- State: bytes echoed, and the ticks still to wait once 'q' has arrived (-1 before).
+def step : (i64, i64) -> Event ->{MMIO, Panic, Diverge} (i64, i64) =
+  \s e. let (echoed, left) = s in
+    case e of
+      { Byte(c) -> putc c; (echoed + 1, if c == 'q' then 3 else left)
+      | Tick -> (echoed, if left > 0 then left - 1 else left) }
+
+def run : (i64, i64) ->{MMIO, Hart, Panic, Diverge} i64 =
+  \s. let (echoed, left) = s in
+    if left == 0 then echoed else run (step (echoed, left) (next ()))
+
+main = setup (); run (0, -1)

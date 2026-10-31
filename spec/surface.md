@@ -356,6 +356,22 @@ freestanding RISC-V target; on the Mac and in the evaluator an unhandled MMIO op
 Handled, they are an ordinary effect, so a driver can be tested against a mock device:
 `examples/uart.kl` and `examples/firmware/hello.kl` are the same driver, mocked and on QEMU.
 
+**Hart** is a built-in effect for the processor itself, separate from `MMIO` so that existing
+MMIO mocks stay exhaustive:
+
+| Operation | Type |
+|---|---|
+| `csrRead(csr)` | `u64 => u64` |
+| `csrSet(csr, bits)` | `(u64, u64) => Unit`: sets the given bits |
+| `wfi()` | `Unit => Unit`: sleeps until an interrupt enabled in `mie` is pending |
+
+Unhandled, they are the instructions `csrr`, `csrs` and `wfi`, on the freestanding RISC-V
+target only (elsewhere they panic, as MMIO does). A CSR's number is part of the instruction,
+so only `mstatus` (0x300), `mie` (0x304), `mcause` (0x342) and `mip` (0x344) can be named;
+any other panics. Interrupts can be taken without a trap handler: leave `mstatus.MIE` off,
+enable the sources in `mie`, sleep in `wfi` and read `mip` on waking.
+`examples/firmware/echo.kl` echoes UART input that way, with timer ticks from the CLINT.
+
 **bitdata** declares a register layout over an integer type: fields are a bit (`@ 5`) or an
 inclusive range (`@ 1..2`). A bitdata type is distinct from its integer while type checking
 (a `LineStatus` can't be passed where a `u8` is expected) and is the plain integer at run time:

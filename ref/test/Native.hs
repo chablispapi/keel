@@ -485,7 +485,7 @@ runRiscV tools dir i (name, prog) = case (compile prog, compileRiscV prog) of
     buildRiscV tools (dir </> ("rv" ++ show i)) asm >>= \case
       Left e -> pure [failMsg e]
       Right elf -> do
-        (code, uart) <- runQemu tools elf
+        (code, uart) <- runQemu tools elf ""
         -- The UART carries everything: the program's output, then a panic message or the
         -- result and statistics lines.
         let (body, stats) = case breakLast "keel-stats:" uart of
@@ -499,19 +499,24 @@ runRiscV tools dir i (name, prog) = case (compile prog, compileRiscV prog) of
   where
     failMsg msg = "FAIL [riscv] " ++ name ++ ": " ++ msg
 
--- | The firmware example drives the board's UART itself.
+-- | The firmware examples drive the board themselves: (file, what is typed into the UART, the
+-- start of what it must print).
 firmware :: RiscVTools -> FilePath -> IO [String]
-firmware tools dir = do
-  let path = "examples/firmware/hello.kl"
+firmware tools dir = fmap concat $ forM (zip [0 :: Int ..] examples) $ \(i, (path, input, expected)) -> do
   loaded <- loadModules path
   case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileRiscV of
     Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
     Right asm ->
-      buildRiscV tools (dir </> "firmware") asm >>= \case
+      buildRiscV tools (dir </> ("firmware" ++ show i)) asm >>= \case
         Left e -> pure ["FAIL [riscv] " ++ path ++ ": " ++ e]
         Right elf -> do
-          (code, uart) <- runQemu tools elf
-          pure ["FAIL [riscv] " ++ path ++ ": got " ++ show (code, uart) | code /= ExitSuccess || not ("Hi!\nresult: ()\n" `isPrefixOf` uart)]
+          (code, uart) <- runQemu tools elf input
+          pure ["FAIL [riscv] " ++ path ++ ": got " ++ show (code, uart) | code /= ExitSuccess || not (expected `isPrefixOf` uart)]
+  where
+    examples =
+      [ ("examples/firmware/hello.kl", "", "Hi!\nresult: ()\n")
+      , ("examples/firmware/echo.kl", "hiq", "hiqresult: 3\n")
+      ]
 
 -- | Focused instruction-selection checks, plus native comparisons with the optimization
 -- disabled. The latter require identical output, exit status and every allocator counter.

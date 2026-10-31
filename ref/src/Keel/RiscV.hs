@@ -4,7 +4,7 @@
 --
 -- Freestanding: no operating system and no C library. The runtime prints through the board's
 -- 16550 UART (0x1000_0000), exits through its test device (0x10_0000), and performs unhandled
--- MMIO operations as real memory accesses. The program is linked at 0x8000_0000 (see
+-- MMIO operations as real memory accesses and Hart operations as csrr, csrs and wfi. The program is linked at 0x8000_0000 (see
 -- 'linkerScript') and run with @qemu-system-riscv64 -machine virt -bios none -kernel prog.elf@.
 --
 -- Registers: a0 = block / result, a1 = argument; t0–t3 operands and temporaries (the allocator
@@ -1351,13 +1351,13 @@ emitRuntime = do
   ins "ld ra, 24(sp)"
   ins "addi sp, sp, 32"
   ins "ret"
-  -- The machine: out (0) and putc (1) print, getc (2) reads the UART; MMIO (3–6) reads and
-  -- writes device memory; there are no files (7–9).
+  -- The machine: out and putc print, getc reads the UART; MMIO reads and writes device
+  -- memory; Hart reads and sets control registers and waits for interrupts; there are no files.
   line ".L_perform_machine:"
   -- No file system: openFile, createFile and appendFile drop the path and fail; writeBytes
   -- drops its pair and fails; readByte and closeFile, which only a successful open would
   -- reach, give -1.
-  forM_ [("putc", ".L_putc_op"), ("getc", ".L_getc_op"), ("read8", ".L_read8"), ("read32", ".L_read32"), ("write8", ".L_write8"), ("write32", ".L_write32"), ("openFile", ".L_open_op"), ("createFile", ".L_open_op"), ("appendFile", ".L_open_op"), ("writeBytes", ".L_net_drop"), ("readByte", ".L_no_file"), ("closeFile", ".L_no_file")] $ \(op, l) ->
+  forM_ [("putc", ".L_putc_op"), ("getc", ".L_getc_op"), ("read8", ".L_read8"), ("read32", ".L_read32"), ("write8", ".L_write8"), ("write32", ".L_write32"), ("csrRead", ".L_csr_read"), ("csrSet", ".L_csr_set"), ("wfi", ".L_wfi"), ("openFile", ".L_open_op"), ("createFile", ".L_open_op"), ("appendFile", ".L_open_op"), ("writeBytes", ".L_net_drop"), ("readByte", ".L_no_file"), ("closeFile", ".L_no_file")] $ \(op, l) ->
     ins ("li t0, " ++ show (opNumber op)) >> ins ("beq a0, t0, " ++ l)
   ins ("li t0, " ++ show (opNumber "tcpListen")) -- the Net operations, the last ones
   ins "bgeu a0, t0, .L_no_net"
@@ -1439,6 +1439,31 @@ emitRuntime = do
   ins "ret"
   line ".L_perform_unhandled:"
   ins "j _keel_panic_unhandled"
+  -- csrRead and csrSet: a CSR's number is part of the instruction, so the ones Keel can name
+  -- are dispatched here; any other panics.
+  -- ponytail: four CSRs, the ones interrupt-driven firmware needs; add rows when a driver
+  -- needs another.
+  let csrs = [(0x300, "mstatus"), (0x304, "mie"), (0x342, "mcause"), (0x344, "mip")] :: [(Integer, String)]
+  line ".L_csr_read:"
+  forM_ csrs $ \(n, name) -> li "t0" n >> ins ("beq a1, t0, .L_csrr_" ++ name)
+  ins "j _keel_panic_csr"
+  forM_ csrs $ \(_, name) -> do
+    line (".L_csrr_" ++ name ++ ":")
+    ins ("csrr a0, " ++ name)
+    ins "j .L_machine_ret"
+  line ".L_csr_set:"
+  ins "ld t0, 0(a1)" -- the pair's fields: CSR, bits
+  ins "ld t1, 8(a1)"
+  forM_ csrs $ \(n, name) -> li "t2" n >> ins ("beq t0, t2, .L_csrs_" ++ name)
+  ins "j _keel_panic_csr"
+  forM_ csrs $ \(_, name) -> do
+    line (".L_csrs_" ++ name ++ ":")
+    ins ("csrs " ++ name ++ ", t1")
+    ins "j .L_write_done"
+  line ".L_wfi:"
+  ins "wfi"
+  ins "li a0, 0"
+  ins "j .L_machine_ret"
 
   -- Output through the 16550 UART: wait for bit 5 of the line status register.
   fn "_keel_putc"
@@ -1512,6 +1537,7 @@ emitRuntime = do
   ins "j .L_exit_hang"
 
   panic "_keel_panic_unhandled" "panic: unhandled operation\n"
+  panic "_keel_panic_csr" "panic: csrRead or csrSet of a CSR other than mstatus, mie, mcause, mip\n"
   panic "_keel_panic_div" "panic: division by zero\n"
   panic "_keel_panic_bounds" "panic: array index out of bounds\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"

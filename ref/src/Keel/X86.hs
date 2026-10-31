@@ -1641,7 +1641,7 @@ emitRuntime used = do
   ins "mov qword ptr [rip + _keel_handlers], r12"
   ins "jmp .L_perform_ret"
   -- The machine, through the C library: out (0) and putc (1) print, getc (2) reads stdin,
-  -- files (7–9); MMIO (3–6) needs a freestanding target.
+  -- files; MMIO and Hart need a freestanding target.
   line ".L_perform_machine:"
   forM_ [("putc", "putc"), ("getc", "getc"), ("openFile", "open"), ("createFile", "create"), ("appendFile", "append"), ("readByte", "read"), ("closeFile", "close"), ("writeBytes", "write")] $ \(op, l) ->
     when (performs op) $ ins ("cmp rax, " ++ show (opNumber op)) >> ins ("je .L_perform_" ++ l)
@@ -1729,7 +1729,7 @@ emitRuntime used = do
   printer "_keel_print_i64" "%lld"
   printer "_keel_print_u64" "%llu"
 
-  panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO needs a freestanding target)\n"
+  panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO and Hart need a freestanding target)\n"
   panic "_keel_panic_div" "panic: division by zero\n"
   panic "_keel_panic_bounds" "panic: array index out of bounds\n"
   panic "_keel_panic_overflow" "panic: arithmetic overflow\n"
