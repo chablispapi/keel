@@ -465,6 +465,11 @@ builtinEffects =
     )
   ]
 
+-- | The definition the RISC-V runtime calls for each interrupt, with mcause; it returns with
+-- mret. Kept alive like main.
+interruptDef :: String
+interruptDef = "interrupt"
+
 -- | Operations whose argument is a pair of words that a call writes out, @write8(a, v)@:
 -- they take it in two registers, with no heap pair, unless a handler takes the operation.
 registerPairOps :: [String]

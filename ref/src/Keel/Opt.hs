@@ -399,7 +399,7 @@ removeDead (Program decls main) = Program [d | d <- decls, keep d] main
   where
     defs = M.fromList [(f, e) | Def f _ e <- decls]
     refs e = [x | Var x <- universe e, M.member x defs]
-    live = go S.empty (refs main)
+    live = go S.empty (refs main ++ [interruptDef | M.member interruptDef defs])
     go seen [] = seen
     go seen (f : fs)
       | f `S.member` seen = go seen fs

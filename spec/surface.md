@@ -400,10 +400,17 @@ so only `mstatus` (0x300), `mie` (0x304), `mcause` (0x342) and `mip` (0x344) can
 any other panics. Interrupts can be taken without a trap handler: leave `mstatus.MIE` off,
 enable the sources in `mie`, sleep in `wfi` and read `mip` on waking.
 `examples/firmware/echo.kl` echoes UART input that way, with timer ticks from the CLINT.
-There are no trap handlers in Keel: every trap panics. The runtime points `mtvec` at a vector that
-prints `panic: trap mcause=… mepc=… mtval=…` (hex) and exits with 101 (on the Pico 2 the core
-sleeps). That catches faults, such as an access to an address with no device, and an
-interrupt taken because `mstatus.MIE` was set.
+**Interrupt handlers.** `def interrupt : usize ->{…, !Alloc} Unit` is the trap handler: on the
+freestanding RISC-V target, an interrupt calls it with `mcause`, and it returns to the
+interrupted code with `mret`. It may have the effects `main` may have, except `Alloc`, since it
+can run in the middle of an allocation. It runs with interrupts off (until `mret`), on the
+interrupted stack, and its operations reach the machine even when the interrupted code is
+inside a `handle`. Set `mstatus.MIE` (bit 3) to take interrupts through it
+(`test/firmware/interrupt.kl`). Everything else panics: an exception (a fault, such as an
+access to an address with no device, an illegal instruction or `ecall`), or an interrupt
+in a program without `def interrupt`. The runtime prints `panic: trap mcause=… mepc=… mtval=…`
+(hex) and exits with 101 (on the Pico 2 the core sleeps). Elsewhere `interrupt` is an ordinary
+definition.
 
 **bitdata** declares a register layout over an integer type: fields are a bit (`@ 5`) or an
 inclusive range (`@ 1..2`). A bitdata type is distinct from its integer while type checking

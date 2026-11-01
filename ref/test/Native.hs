@@ -538,6 +538,8 @@ firmwareExamples =
   , ("test/firmware/fault.kl", Virt 32, "", "panic: trap mcause=0x5 mepc=")
   , ("test/firmware/noalloc.kl", Virt 64, "", "OK\nresult: 0\n")
   , ("test/firmware/noalloc.kl", Virt 32, "", "OK\nresult: 0\n")
+  , ("test/firmware/interrupt.kl", Virt 64, "", "1\nresult: 2000001000000\n")
+  , ("test/firmware/interrupt.kl", Virt 32, "", "1\nresult: 2000001000000\n")
   , ("examples/firmware/pico/blink.kl", Pico2, "", "")
   ]
 

@@ -70,7 +70,8 @@ main = printInt (area (Rect(3, 4))); putc('\n'); 0
   - `Diverge`: any recursion, and calling `map`, `length` and other recursive functions.
   - `IO`: output. `Input`: reading stdin. `Files` and `Net`: files and sockets.
   - `Alloc`: building or holding a heap block. Every arrow allows it without saying so;
-    `->{!Alloc}` forbids it, for code that must not touch the allocator (interrupt handlers).
+    `->{!Alloc}` forbids it, for code that must not touch the allocator. On RISC-V firmware,
+    `def interrupt : usize ->{MMIO, !Alloc} Unit` is the interrupt handler (`test/firmware/interrupt.kl`).
   - User effects: `effect E { op : A => B }`.
   `keelc check` prints the effects a definition actually has, so copy them from the error.
 - **Lists:** `Cons(x, box rest)` builds one, and `case xs of { Nil -> … | Cons(x, rest) -> … }`

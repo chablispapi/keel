@@ -1,0 +1,25 @@
+-- A Keel interrupt handler: the runtime calls def interrupt with mcause and returns with mret.
+-- The CLINT timer fires every 1000 ticks (100 µs) while main sums 1..2_000_000; the handler
+-- counts (up to 255) in the UART's scratch register and rearms the timer. The sum comes out
+-- right only if every register main was using survives each interrupt.
+
+def mstatus : usize = 0x300
+def mie : usize = 0x304
+def mtime : usize = 0x0200_BFF8
+def mtimecmp : usize = 0x0200_4000
+def uartScratch : usize = 0x1000_0007
+
+def rearm : Unit ->{MMIO, Panic, !Alloc} Unit =
+  \u. write32(mtimecmp + 4, 0); write32(mtimecmp, read32(mtime) + 1000)
+
+def interrupt : usize ->{MMIO, Panic, !Alloc} Unit =
+  \cause. let n = read8(uartScratch) in
+    (if n < 255 then write8(uartScratch, n + 1) else ()); rearm ()
+
+def sumTo : i64 -> i64 -> i64 ->{Panic, Diverge} i64 =
+  \i n acc. if i > n then acc else sumTo (i + 1) n (acc + i)
+
+main = write8(uartScratch, 0); rearm (); csrSet(mie, 0x80); csrSet(mstatus, 0x8);
+       let total = sumTo 1 2_000_000 0 in
+       out(if read8(uartScratch) > 0 then 1 else 0);
+       total

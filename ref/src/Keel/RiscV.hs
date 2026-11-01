@@ -218,6 +218,7 @@ emitProgram board decls mainTy (LProg funs statics mainF _ layouts consts wide) 
       line "\t.text"
       forM_ (M.toList funs) $ \(i, f) -> emitFun ("_kf_" ++ show i) f
       emitFun "_kf_main" mainF
+      emitTrap [i | (i, f) <- M.toList funs, funName f == interruptDef]
       forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
       line runtimeBegin
       emitRuntime
@@ -1150,6 +1151,38 @@ emitBoot = do
   ins "li a0, 0"
   ins "tail _keel_exit"
 
+-- | mtvec's target. With @def interrupt@, an interrupt (mcause's top bit) saves what the
+-- interrupted code may hold in caller-saved registers and in the runtime's globals, calls it
+-- with mcause and returns with mret; every other trap, and every trap without it, panics.
+-- The handler runs on the interrupted stack, with no handler frames (its operations reach the
+-- machine), and interrupts stay off until mret (the hart clears mstatus.MIE on entry).
+-- ponytail: one handler for every interrupt, not nested; vectored mode when latency matters.
+emitTrap :: [Int] -> G ()
+emitTrap handler = do
+  w <- wordSize
+  line "\t.p2align 2"
+  line "_keel_trap:"
+  case handler of
+    [i] -> do
+      let regs = "ra" : ["t" ++ show k | k <- [0 .. 6 :: Int]] ++ ["a" ++ show k | k <- [0 .. 7 :: Int]]
+          hiWords = 32 `div` w -- _keel_hi's size
+          frame = 16 * (((length regs + 1 + hiWords) * w + 15) `div` 16)
+          at k = show (k * w) ++ "(sp)"
+      ins ("addi sp, sp, -" ++ show frame)
+      forM_ (zip [0 ..] regs) $ \(k, r) -> ins ("sd " ++ r ++ ", " ++ at k)
+      ins "csrr a1, mcause"
+      ins "bgez a1, _keel_trap_fatal" -- an exception: mret would run the faulting instruction again
+      let globals = (length regs, "_keel_handlers") : [(length regs + 1 + k, "_keel_hi+" ++ show (k * w)) | k <- [0 .. hiWords - 1]]
+      forM_ globals $ \(k, g) -> ins ("la t0, " ++ g) >> ins "ld t1, 0(t0)" >> ins ("sd t1, " ++ at k)
+      ins "la t0, _keel_handlers"
+      ins "sd zero, 0(t0)"
+      ins ("call _kf_" ++ show i)
+      forM_ globals $ \(k, g) -> ins ("ld t1, " ++ at k) >> ins ("la t0, " ++ g) >> ins "sd t1, 0(t0)"
+      forM_ (zip [0 ..] regs) $ \(k, r) -> ins ("ld " ++ r ++ ", " ++ at k)
+      ins ("addi sp, sp, " ++ show frame)
+      ins "mret"
+    _ -> ins "j _keel_trap_fatal"
+
 -- | Entry point: set up the stack, run main, print the result and the allocator counters
 -- (always: there is no environment to ask), then exit through the test device.
 emitStart :: M.Map String (Ty, String) -> Ty -> G ()
@@ -2070,13 +2103,10 @@ emitRuntime = do
 
   when rv32 wideRuntime
 
-  -- Every trap is fatal: mtvec points here from startup. Interrupts don't trap while
-  -- mstatus.MIE is 0 (firmware polls them through wfi and mip), so this is a fault (illegal
-  -- instruction, bad address, ecall) or an interrupt enabled globally. The stack pointer may be
-  -- what faulted, so start a fresh stack.
-  -- ponytail: no handler returns with mret; add one when Keel can check that a handler never
-  -- allocates (notes.md §18).
-  fn "_keel_trap"
+  -- A fatal trap: a fault (illegal instruction, bad address, ecall), or an interrupt with no
+  -- def interrupt. The stack pointer may be what faulted, so start a fresh stack.
+  -- 'emitTrap' comes here for every trap without a handler.
+  fn "_keel_trap_fatal"
   ins "la sp, _keel_stack_top"
   forM_ [("panic: trap mcause=", "mcause"), (" mepc=", "mepc"), (" mtval=", "mtval")] $ \(label, csr) -> do
     printStr label
