@@ -100,6 +100,7 @@ Each of these has tripped up someone who had the spec open:
 | `if c then a else b; e` meaning `else (b; e)` | `;` binds looser than `if`, so `e` runs after either branch; often `expected Unit, got …` on the `then` branch | parenthesize the branch: `else (b; e)` |
 | `bitdata R : u8 { a @ 0, b @ 5 }` | parse error at the `,` | separate fields with `;`: `{ a @ 0 ; b @ 5 }` |
 | `!Alloc` on every arrow, as in `i64 ->{!Alloc} i64 ->{!Alloc} i64` | `only its last parameter's arrow can be !Alloc` | only the last: `i64 -> i64 ->{!Alloc} i64` |
+| `def interrupt` doing `out(…)` when `main` never prints | `def interrupt has effects {IO} that main doesn't` | `main` must have the handler's effects: give it the operation too, or drop it from the handler |
 | `write8 p` with `p` a pair variable, in a `!Alloc` function | `… is !Alloc, but it uses p, which holds a heap block` | write the pair at the call, `write8(a, v)`: then the two words go in registers |
 | `p.x` on data | `can't tell the type before .x (got P); add a type annotation`. Ignore the hint: `.obs` is only for codata, and data has no field access | match: `case p of { P(x, _) -> x }` |
 

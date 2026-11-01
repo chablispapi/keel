@@ -163,14 +163,18 @@ checkProgram (Program decls main) = do
       unless (sub t' body) $ case mismatch body t' of
         Left (TypeError k msg p) -> Left (TypeError k ("def " ++ f ++ ": " ++ msg) p)
         r -> r
-  -- The trap handler: the RISC-V runtime calls it with mcause for each interrupt, between any
-  -- two instructions, so it may not allocate.
-  forM_ [(t, body) | Def f t body <- decls, f == interruptDef] $ \(t, body) -> atPos' body $ case t of
-    TFun (TInt it) e TUnit | it == usize, allocE `S.notMember` e, e `S.isSubsetOf` topLevelEffects -> pure ()
-    _ -> err Mismatch ("def " ++ interruptDef ++ " is the interrupt handler: its type must be usize ->{…, !Alloc} Unit, with effects main may have; it is " ++ prettyTy t)
   (t, eff, _) <- infer sig S.empty M.empty main
   let extra = eff S.\\ topLevelEffects
   unless (S.null extra) $ err Unhandled ("main performs " ++ prettyEff extra)
+  -- The trap handler: the RISC-V runtime calls it with mcause for each interrupt, between any
+  -- two instructions, so it may not allocate. It runs inside main (main must turn interrupts
+  -- on), so main's effects include its own.
+  forM_ [(ty, body) | Def f ty body <- decls, f == interruptDef] $ \(ty, body) -> atPos' body $ case ty of
+    TFun (TInt it) e TUnit | it == usize, allocE `S.notMember` e -> do
+      let missing = e S.\\ eff
+      unless (S.null missing) $
+        err Unhandled ("def " ++ interruptDef ++ " has effects " ++ prettyEff missing ++ " that main doesn't: an interrupt runs inside main, so main must have them too")
+    _ -> err Mismatch ("def " ++ interruptDef ++ " is the interrupt handler: its type must be usize ->{…, !Alloc} Unit; it is " ++ prettyTy ty)
   pure (t, eff)
 
 -- | The type of a closed term (no free locals) in a program's signature; used by the optimizer

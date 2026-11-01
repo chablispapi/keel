@@ -402,8 +402,10 @@ enable the sources in `mie`, sleep in `wfi` and read `mip` on waking.
 `examples/firmware/echo.kl` echoes UART input that way, with timer ticks from the CLINT.
 **Interrupt handlers.** `def interrupt : usize ->{…, !Alloc} Unit` is the trap handler: on the
 freestanding RISC-V target, an interrupt calls it with `mcause`, and it returns to the
-interrupted code with `mret`. It may have the effects `main` may have, except `Alloc`, since it
-can run in the middle of an allocation. It runs with interrupts off (until `mret`), on the
+interrupted code with `mret`. It can't have `Alloc`, since it can run in the middle of an
+allocation, and `main` must have its other effects: an interrupt runs inside `main`, which
+turns interrupts on. A function `main` calls may still be interrupted by a handler with
+effects that function lacks, such as `Panic`: interrupts are asynchronous. It runs with interrupts off (until `mret`), on the
 interrupted stack, and its operations reach the machine even when the interrupted code is
 inside a `handle`. Set `mstatus.MIE` (bit 3) to take interrupts through it
 (`test/firmware/interrupt.kl`). Everything else panics: an exception (a fault, such as an
