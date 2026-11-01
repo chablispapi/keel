@@ -379,6 +379,10 @@ so only `mstatus` (0x300), `mie` (0x304), `mcause` (0x342) and `mip` (0x344) can
 any other panics. Interrupts can be taken without a trap handler: leave `mstatus.MIE` off,
 enable the sources in `mie`, sleep in `wfi` and read `mip` on waking.
 `examples/firmware/echo.kl` echoes UART input that way, with timer ticks from the CLINT.
+There are no trap handlers in Keel: every trap panics. The runtime points `mtvec` at a vector that
+prints `panic: trap mcause=… mepc=… mtval=…` (hex) and exits with 101 (on the Pico 2 the core
+sleeps). That catches faults, such as an access to an address with no device, and an
+interrupt taken because `mstatus.MIE` was set.
 
 **bitdata** declares a register layout over an integer type: fields are a bit (`@ 5`) or an
 inclusive range (`@ 1..2`). A bitdata type is distinct from its integer while type checking

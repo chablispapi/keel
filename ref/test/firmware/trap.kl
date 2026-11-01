@@ -1,0 +1,11 @@
+-- A trap with no handler panics: the runtime's mtvec reports mcause, mepc and mtval. Here the
+-- machine timer interrupt, made pending at once (mtimecmp = 0), traps as soon as interrupts are
+-- enabled globally (mstatus.MIE). The firmware tests expect mcause = interrupt bit | 7.
+
+def mstatus : usize = 0x300
+def mie : usize = 0x304
+def mtimecmp : usize = 0x0200_4000
+
+main = write32(mtimecmp, 0); write32(mtimecmp + 4, 0);
+       csrSet(mie, 0x80); csrSet(mstatus, 0x8);
+       0

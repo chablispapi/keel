@@ -1113,6 +1113,8 @@ emitBoot = do
   ins ".word 0xab123579\t\t# block end"
   line ".L_boot:"
   ins "la sp, _keel_stack_top"
+  ins "la t0, _keel_trap"
+  ins "csrw mtvec, t0"
   ins "la t0, _keel_data_load"
   ins "la t1, _keel_data"
   ins "la t2, _keel_data_end"
@@ -1137,6 +1139,8 @@ emitStart printers t = do
   line "\t.p2align 2"
   line "_start:"
   ins "la sp, _keel_stack_top"
+  ins "la t0, _keel_trap"
+  ins "csrw mtvec, t0"
   ins "li a0, 0"
   ins "call _kf_main"
   ins "addi sp, sp, -16"
@@ -1998,6 +2002,49 @@ emitRuntime = do
   ins "j .L_exit_hang"
 
   when rv32 wideRuntime
+
+  -- Every trap is fatal: mtvec points here from startup. Interrupts don't trap while
+  -- mstatus.MIE is 0 (firmware polls them through wfi and mip), so this is a fault (illegal
+  -- instruction, bad address, ecall) or an interrupt enabled globally. The stack pointer may be
+  -- what faulted, so start a fresh stack.
+  -- ponytail: no handler returns with mret; add one when Keel can check that a handler never
+  -- allocates (notes.md §18).
+  fn "_keel_trap"
+  ins "la sp, _keel_stack_top"
+  forM_ [("panic: trap mcause=", "mcause"), (" mepc=", "mepc"), (" mtval=", "mtval")] $ \(label, csr) -> do
+    printStr label
+    ins ("csrr a0, " ++ csr)
+    ins "call _keel_print_hex"
+  printStr "\n"
+  ins "li a0, 101"
+  ins "tail _keel_exit"
+
+  fn "_keel_print_hex" -- a0 = value, printed as 0x and hex digits
+  ins "addi sp, sp, -48"
+  ins "sd ra, 40(sp)"
+  ins "addi a2, sp, 32"
+  ins "sb zero, 0(a2)"
+  ins "li a3, 10"
+  line ".L_hex_loop:"
+  ins "andi a4, a0, 15"
+  ins "srli a0, a0, 4"
+  ins "blt a4, a3, .L_hex_digit"
+  ins "addi a4, a4, 39" -- 10–15 to 'a'–'f'
+  line ".L_hex_digit:"
+  ins "addi a4, a4, 48"
+  ins "addi a2, a2, -1"
+  ins "sb a4, 0(a2)"
+  ins "bnez a0, .L_hex_loop"
+  ins "addi a2, a2, -2"
+  ins "li a4, 48"
+  ins "sb a4, 0(a2)"
+  ins "li a4, 120"
+  ins "sb a4, 1(a2)"
+  ins "mv a0, a2"
+  ins "call _keel_print_str"
+  ins "ld ra, 40(sp)"
+  ins "addi sp, sp, 48"
+  ins "ret"
 
   panic "_keel_panic_unhandled" "panic: unhandled operation\n"
   panic "_keel_panic_csr" "panic: csrRead or csrSet of a CSR other than mstatus, mie, mcause, mip\n"

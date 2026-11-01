@@ -1,0 +1,4 @@
+-- A load from a gap in QEMU virt's memory map: an access fault (mcause 5), which the runtime's
+-- trap vector reports with the address in mtval.
+
+main = read32(0x0e00_0000)

@@ -505,7 +505,8 @@ runRiscV tools xlen dir i (name, prog) = case (compile prog, compileRiscVAt xlen
     failMsg msg = "FAIL [riscv" ++ (if xlen == 32 then "32" else "") ++ "] " ++ name ++ ": " ++ msg
 
 -- | The firmware examples drive the board themselves: (file, board, what is typed into the
--- UART, the start of what it must print). The Pico 2's are only built: QEMU has no RP2350.
+-- UART, the start of what it must print; a panic's exits with 101). The Pico 2's are only
+-- built: QEMU has no RP2350.
 firmware :: RiscVTools -> FilePath -> IO [String]
 firmware tools dir = fmap concat $ forM (zip [0 :: Int ..] firmwareExamples) $ \(i, (path, board, input, expected)) -> do
   loaded <- loadModules path
@@ -517,7 +518,8 @@ firmware tools dir = fmap concat $ forM (zip [0 :: Int ..] firmwareExamples) $ \
         Right elf -> case board of
           Virt xlen -> do
             (code, uart) <- runQemu tools xlen elf input
-            pure [failMsg path ("RV" ++ show xlen ++ " got " ++ show (code, uart)) | code /= ExitSuccess || not (expected `isPrefixOf` uart)]
+            let want = if "panic: " `isPrefixOf` expected then ExitFailure 101 else ExitSuccess
+            pure [failMsg path ("RV" ++ show xlen ++ " got " ++ show (code, uart)) | code /= want || not (expected `isPrefixOf` uart)]
           Pico2 -> pure []
   where
     failMsg path e = "FAIL [riscv] " ++ path ++ ": " ++ e
@@ -528,6 +530,10 @@ firmwareExamples =
   , ("examples/firmware/hello.kl", Virt 32, "", "Hi!\nresult: ()\n")
   , ("examples/firmware/echo.kl", Virt 64, "hiq", "hiqresult: 3\n")
   , ("examples/firmware/echo.kl", Virt 32, "hiq", "hiqresult: 3\n")
+  , ("test/firmware/trap.kl", Virt 64, "", "panic: trap mcause=0x8000000000000007 mepc=")
+  , ("test/firmware/trap.kl", Virt 32, "", "panic: trap mcause=0x80000007 mepc=")
+  , ("test/firmware/fault.kl", Virt 64, "", "panic: trap mcause=0x5 mepc=")
+  , ("test/firmware/fault.kl", Virt 32, "", "panic: trap mcause=0x5 mepc=")
   , ("examples/firmware/pico/blink.kl", Pico2, "", "")
   ]
 
