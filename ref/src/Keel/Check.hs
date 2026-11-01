@@ -7,6 +7,7 @@
 module Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram, localTypes, recursiveGroups, typeOfClosed) where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
+import Control.Applicative ((<|>))
 import Data.List (isPrefixOf, nub, sort)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
@@ -61,12 +62,38 @@ data Sig = Sig
   , sigOps :: M.Map String (String, Ty, Ty)                    -- ^ operation ↦ (label, argument, result)
   , sigTv :: M.Map String Kind                                 -- ^ type variables in scope
   , sigEv :: S.Set String                                      -- ^ effect variables in scope
+  , sigArity :: M.Map String Int                               -- ^ λ definitions ↦ leading parameters
   }
 
 -- | Effects @main@ may leave unhandled: the machine provides them (MMIO and Hart only on
 -- freestanding targets; elsewhere their unhandled operations panic at run time).
 topLevelEffects :: Eff
-topLevelEffects = S.fromList [ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE]
+topLevelEffects = S.fromList [ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE, allocE]
+
+-- | Whether values of a type live in heap blocks that are reference counted (§2.5): data with
+-- a constructor that has fields, pairs, closures, codata. A type variable might be one. Data
+-- whose constructors have no fields is a shared static block, which dup and drop leave alone.
+heapTy :: Sig -> Ty -> Bool
+heapTy s t = case t of
+  TData d _ | Just (_, _, cs) <- M.lookup d (sigData s) -> any (not . null . snd) cs
+  TData d _ -> M.member d (sigCodata s)
+  TFun {} -> True
+  TLFun {} -> True
+  TPair {} -> True
+  TBox a -> heapTy s a
+  TVar _ -> True
+  _ -> False
+
+-- | The leading λs of a definition: a call with that many arguments is one direct call, with no
+-- closures in between (as "Keel.Lower" compiles it, which takes at most 7).
+arity :: Term -> Int
+arity = min 7 . go
+  where
+    go tm = case tm of
+      At _ e -> go e
+      Lam _ _ b -> 1 + go b
+      LLam _ _ b -> 1 + go b
+      _ -> 0
 
 -- | §1.2 and §4.2: a data type is linear if declared so or if any type argument is linear;
 -- codata is always Free; a type variable has its declared kind.
@@ -127,8 +154,12 @@ checkProgram (Program decls main) = do
     wfTy sig' body
     -- Errors about the definition as a whole point at its body.
     atPos' e $ do
-      (t', eff, _) <- infer sig' (M.findWithDefault S.empty f groups) M.empty e
+      (t', eff0, _) <- infer sig' (M.findWithDefault S.empty f groups) M.empty e
+      -- A definition's own value is built once, before main: its Alloc is no one's effect.
+      let eff = S.delete allocE eff0
       unless (S.null eff) $ err Unhandled ("def " ++ f ++ " has effects " ++ prettyEff eff)
+      when (not (sub t' body) && sub (eraseAlloc t') (eraseAlloc body)) $
+        allocError sig' f e body
       unless (sub t' body) $ case mismatch body t' of
         Left (TypeError k msg p) -> Left (TypeError k ("def " ++ f ++ ": " ++ msg) p)
         r -> r
@@ -148,7 +179,10 @@ typeOfClosed decls tm = do
 -- | The type of every local binder in a checked term (binders are unique), so the optimizer
 -- can give a lifted λ parameters for the locals it captures.
 localTypes :: [Decl] -> Term -> M.Map String Ty
-localTypes decls tm = either (const M.empty) (\s -> go s M.empty tm) (buildSig decls)
+localTypes decls tm = either (const M.empty) (`localTypesIn` tm) (buildSig decls)
+
+localTypesIn :: Sig -> Term -> M.Map String Ty
+localTypesIn s0 = go s0 M.empty
   where
     go s ctx e = case e of
       Lam x t b -> under [(x, t)] b
@@ -167,6 +201,93 @@ localTypes decls tm = either (const M.empty) (\s -> go s M.empty tm) (buildSig d
       where
         ty a = (\(t, _, _) -> t) <$> infer s S.empty ctx a
         under xts b = M.fromList xts <> go s (M.union (M.fromList xts) ctx) b
+
+-- | A definition whose type says @!Alloc@ but whose body allocates: point at the first place
+-- that does (in evaluation order), or at an arrow that can't be @!Alloc@.
+allocError :: Sig -> String -> Term -> Ty -> TC a
+allocError s f e declared
+  | (_ : _) <- [() | (i, row) <- zip [1 ..] (rows declared), i < n, allocE `S.notMember` row] =
+      err EffectMismatch ("def " ++ f ++ ": only its last parameter's arrow can be !Alloc, since giving it fewer arguments builds a closure; write " ++ prettyTy (allowEarly declared))
+  | otherwise = case culprit Nothing (bodyOf n e) of
+      Just (p, why) -> maybe id atPos p (err EffectMismatch ("def " ++ f ++ " is !Alloc, but " ++ why))
+      Nothing -> err EffectMismatch ("def " ++ f ++ " is !Alloc, but its body allocates")
+  where
+    n = arity e
+    tys = localTypesIn s e
+    rows t = case t of
+      TFun _ r b -> r : rows b
+      TLFun _ r b -> r : rows b
+      _ -> []
+    allowEarly = go 1
+      where
+        go i t = case t of
+          TFun a r b -> TFun a (if i < n then S.insert allocE r else r) (go (i + 1 :: Int) b)
+          TLFun a r b -> TLFun a (if i < n then S.insert allocE r else r) (go (i + 1) b)
+          _ -> t
+    bodyOf k tm = case tm of
+      At _ b -> bodyOf k b
+      Lam _ _ b | k > 0 -> bodyOf (k - 1) b
+      LLam _ _ b | k > 0 -> bodyOf (k - 1) b
+      _ -> tm
+    typeOf tm = either (const Nothing) (\(t, _, _) -> Just t) (infer s S.empty tys tm)
+    heap tm = maybe True (heapTy s) (typeOf tm)
+    first p = foldr (\tm r -> culprit p tm <|> r) Nothing
+    culprit p tm = case tm of
+      At q b -> culprit (Just q) b
+      Var x | M.member x tys, heap tm -> Just (p, "it uses " ++ x ++ ", which holds a heap block (" ++ maybe "?" prettyTy (typeOf tm) ++ ")")
+      Var x | heap tm -> Just (p, "it uses " ++ x ++ " as a value, a closure")
+      TyApp x _ _ -> Just (p, "it uses " ++ x ++ " as a value, a closure")
+      Lam {} -> Just (p, "it builds a closure")
+      LLam {} -> Just (p, "it builds a closure")
+      Pair {} -> Just (p, "it builds a pair")
+      Con c _ (_ : _) -> Just (p, "it builds " ++ c ++ "(…), a heap block")
+      Cocase d _ _ -> Just (p, "it builds a " ++ d ++ " value, a heap block")
+      ArrayPrim {} -> Just (p, "it uses an array")
+      App {} -> first p (args ++ [h | not (knownHead h)]) <|> call
+        where
+          (h, args) = spine tm
+          call
+            | knownHead h, length args < arityOf h' = Just (p, "it gives " ++ name h' ++ " fewer arguments than its " ++ show (arityOf h') ++ " parameters, which builds a closure")
+            | knownHead h, Just t <- typeOf (unAt h) = case h' of
+                _ | any (allocE `S.member`) (drop (arityOf h' - 1) (take (length args) (rows t))) ->
+                      Just (p, "it calls " ++ name h' ++ ", which may allocate (its type has no !Alloc)")
+                _ -> result
+            | otherwise = case typeOf (unAt h) of
+                Just t | any (allocE `S.member`) (take 1 (rows t)) -> Just (p, "it calls a function that may allocate")
+                _ -> result
+            where
+              h' = unAt h
+          result = if heap tm then Just (p, "its call returns a heap value (" ++ maybe "?" prettyTy (typeOf tm) ++ ")") else Nothing
+      Perform op _ | heap tm -> Just (p, op ++ " returns a heap value")
+      _ -> first p (children tm)
+    unAt (At _ b) = unAt b
+    unAt b = b
+    knownHead h = case unAt h of
+      Var g -> not (M.member g tys) && M.member g (sigArity s)
+      TyApp g _ _ -> M.member g (sigArity s)
+      _ -> False
+    arityOf h = case h of
+      Var g -> M.findWithDefault 1 g (sigArity s)
+      TyApp g _ _ -> M.findWithDefault 1 g (sigArity s)
+      _ -> 1
+    name h = case h of
+      Var g -> g
+      TyApp g _ _ -> g
+      _ -> "a function"
+    spine tm = case tm of
+      App g a -> let (h, as) = spine g in (h, as ++ [a])
+      At _ b -> spine b
+      _ -> (tm, [])
+
+-- | A type with Alloc removed from every row.
+eraseAlloc :: Ty -> Ty
+eraseAlloc t = case t of
+  TFun p e r -> TFun (eraseAlloc p) (S.delete allocE e) (eraseAlloc r)
+  TLFun p e r -> TLFun (eraseAlloc p) (S.delete allocE e) (eraseAlloc r)
+  TBox a -> TBox (eraseAlloc a)
+  TPair a b -> TPair (eraseAlloc a) (eraseAlloc b)
+  TData d as -> TData d (map eraseAlloc as)
+  _ -> t
 
 -- | Attach the position of a term's outermost source location, if it has one.
 atPos' :: Term -> TC a -> TC a
@@ -209,7 +330,7 @@ buildSig userDecls = do
       defs = [(f, t) | Def f t _ <- decls]
       effs = builtinEffects ++ [(l, os) | Effect l os <- decls]
       ops = [(op, (l, a, r)) | (l, os) <- effs, (op, a, r) <- os]
-      labels = map fst effs ++ [panicE, divergeE]
+      labels = map fst effs ++ [panicE, divergeE, allocE]
       names xs = map fst xs
       unique what ns = when (length ns /= length (nub ns)) $ err BadDecl ("duplicate " ++ what ++ " name")
   unique "type" (names datas ++ names codatas)
@@ -220,7 +341,7 @@ buildSig userDecls = do
   forM_ codatas $ \(_, (_, os)) -> unique "observation" (names os)
   forM_ (map snd datas) $ \(_, ps, _) -> unique "type parameter" ps
   forM_ (map snd codatas) $ \(ps, _) -> unique "type parameter" ps
-  let sig = Sig (M.fromList datas) (M.fromList cons) (M.fromList codatas) (M.fromList defs) (M.fromList effs) (M.fromList ops) M.empty S.empty
+  let sig = Sig (M.fromList datas) (M.fromList cons) (M.fromList codatas) (M.fromList defs) (M.fromList effs) (M.fromList ops) M.empty S.empty (M.fromList [(f, arity e) | Def f _ e <- decls, arity e > 0])
       -- Parameters count as Free inside their declaration: an argument's linearity
       -- propagates to the whole type instead (kindOf).
       inDecl ps = sig {sigTv = M.fromList [(p, Free) | p <- ps]}
@@ -322,7 +443,7 @@ wfTy s t = case t of
 
 wfEff :: Sig -> Eff -> TC ()
 wfEff s e = forM_ e $ \l ->
-  unless (M.member l (sigEffs s) || l `elem` [panicE, divergeE] || l `S.member` sigEv s) $
+  unless (M.member l (sigEffs s) || l `elem` [panicE, divergeE, allocE] || l `S.member` sigEv s) $
     err Unbound ("effect " ++ l)
 
 -- | @rec@ is the recursive group of the definition being checked: referencing one of its
@@ -331,10 +452,10 @@ infer :: Sig -> S.Set String -> Ctx -> Term -> TC (Ty, Eff, Usage)
 infer s rec ctx tm = case tm of
   At p e -> atPos p (infer s rec ctx e)
   Var x -> case M.lookup x ctx of
-    Just t -> pure (t, S.empty, if kindOf s t == Lin then S.singleton x else S.empty)
+    Just t -> pure (t, alloc t, if kindOf s t == Lin then S.singleton x else S.empty)
     Nothing -> case M.lookup x (sigDefs s) of
       Just TForall {} -> err Mismatch (x ++ " is polymorphic: apply it to types, " ++ x ++ "[…]")
-      Just t -> pure (t, divergeIf x, S.empty)
+      Just t -> pure (t, divergeIf x <> alloc t, S.empty)
       Nothing -> err Unbound x
   TyApp f tys effs -> do
     (vs, es, body) <- case M.lookup f (sigDefs s) of
@@ -348,7 +469,8 @@ infer s rec ctx tm = case tm of
       when (k == Free && kindOf s ty == Lin) $
         err KindMismatch (f ++ ": " ++ v ++ " must be Free, got linear " ++ prettyTy ty)
     mapM_ (wfEff s) effs
-    pure (substTy (M.fromList (zip (map fst vs) tys)) (M.fromList (zip es effs)) body, divergeIf f, S.empty)
+    let t = substTy (M.fromList (zip (map fst vs) tys)) (M.fromList (zip es effs)) body
+    pure (t, divergeIf f <> alloc t, S.empty)
   UnitLit -> pure (TUnit, S.empty, S.empty)
   IntLit it n -> do
     let (lo, hi) = intRange it
@@ -382,7 +504,7 @@ infer s rec ctx tm = case tm of
     when (length tys /= length args) $ err Mismatch "array operation: wrong number of arguments"
     rs <- mapM (uncurry expect) (zip tys args)
     u <- foldM join2 S.empty (map snd rs)
-    pure (r, S.unions (eff : map fst rs), u)
+    pure (r, S.unions (S.singleton allocE : eff : map fst rs), u)
   Convert to e -> do
     (te, ee, ue) <- infer s rec ctx e
     case te of
@@ -398,11 +520,29 @@ infer s rec ctx tm = case tm of
     wfTy s t
     (tb, eb, u) <- bind [(x, t)] body
     unless (S.null u) $ err LinearCapture ("free λ" ++ x ++ " captures " ++ show (S.toList u))
-    pure (TFun t eb tb, S.empty, u)
+    pure (TFun t (eb <> alloc t) tb, S.singleton allocE, u)
   LLam x t body -> do
     wfTy s t
     (tb, eb, u) <- bind [(x, t)] body
-    pure (TLFun t eb tb, S.empty, u)
+    pure (TLFun t (eb <> alloc t) tb, S.singleton allocE, u)
+  -- A definition given all its leading parameters is one direct call: the closures in between
+  -- are never built, so only the arrows from the last of them on count (and the head, a
+  -- static block, is not reference counted).
+  App _ _
+    | (h, args) <- spine tm
+    , Just n <- known h
+    , length args >= n -> do
+        (th, eh, _) <- infer s rec ctx h
+        let step (t, effs, us, i) a = do
+              (p, latent, r) <- case t of
+                TFun p e r -> pure (p, e, r)
+                TLFun p e r -> pure (p, e, r)
+                _ -> err Mismatch ("applying a non-function of type " ++ prettyTy t)
+              (ea, ua) <- expect p a
+              u <- join2 us ua
+              pure (r, S.unions [effs, ea, if i >= n then latent else S.empty], u, i + 1)
+        (r, effs, u, _) <- foldM step (th, S.delete allocE eh, S.empty, 1 :: Int) args
+        pure (r, effs <> alloc r, u)
   App f a -> do
     (tf, ef, uf) <- infer s rec ctx f
     (p, latent, r) <- case tf of
@@ -410,7 +550,7 @@ infer s rec ctx tm = case tm of
       TLFun p e r -> pure (p, e, r)
       _ -> err Mismatch ("applying a non-function of type " ++ prettyTy tf)
     (ea, ua) <- expect p a
-    (r,S.unions [ef, ea, latent],) <$> join2 uf ua
+    (r,S.unions [ef, ea, latent, alloc r],) <$> join2 uf ua
   Let x e body -> do
     (te, ee, ue) <- infer s rec ctx e
     (tb, eb, ub) <- bind [(x, te)] body
@@ -424,7 +564,7 @@ infer s rec ctx tm = case tm of
     let inst = substTy (M.fromList (zip ps tys)) M.empty
     rs <- mapM (uncurry expect) (zip (map inst fields) args)
     u <- foldM join2 S.empty (map snd rs)
-    pure (TData d tys, S.unions (map fst rs), u)
+    pure (TData d tys, S.unions ((if null args then S.empty else S.singleton allocE) : map fst rs), u)
   Case e alts -> do
     (te, ee, ue) <- infer s rec ctx e
     (ctors, inst) <- case te of
@@ -463,7 +603,7 @@ infer s rec ctx tm = case tm of
   Perform op a -> do
     (l, targ, tres) <- maybe (err Unbound ("operation " ++ op)) pure (M.lookup op (sigOps s))
     (ea, ua) <- expect targ a
-    pure (tres, S.insert l ea, ua)
+    pure (tres, S.insert l ea <> alloc tres, ua)
   Handle l body clauses -> do
     ops <- maybe (err Unbound ("effect " ++ l ++ " cannot be handled")) pure (M.lookup l (sigEffs s))
     unless (sort [op | (op, _, _) <- clauses] == sort [op | (op, _, _) <- ops]) $
@@ -480,7 +620,7 @@ infer s rec ctx tm = case tm of
   Pair a b -> do
     (ta, ea, ua) <- infer s rec ctx a
     (tb, eb, ub) <- infer s rec ctx b
-    (TPair ta tb,ea <> eb,) <$> join2 ua ub
+    (TPair ta tb,S.unions [ea, eb, S.singleton allocE],) <$> join2 ua ub
   LetPair x y e body -> do
     (te, ee, ue) <- infer s rec ctx e
     (ta, tb) <- case te of
@@ -497,22 +637,39 @@ infer s rec ctx tm = case tm of
     let inst = substTy (M.fromList (zip ps tys)) M.empty
     forM_ bs $ \(o, e) -> do
       let want = inst (fromMaybe TUnit (lookup o obs)) -- present: checked against obs above
-      (te, ee, ue) <- infer s rec ctx e
+      (te, ee0, ue) <- infer s rec ctx e
       unless (S.null ue) $ err LinearCapture ("cocase branch " ++ o ++ " captures " ++ show (S.toList ue))
+      -- A branch runs when it is observed, and projecting holds the codata value: that Alloc
+      -- is charged at the projection.
+      let ee = S.delete allocE ee0
       unless (S.null ee) $ err EffectMismatch ("cocase branch " ++ o ++ " has effects " ++ prettyEff ee)
       unless (sub te want) $ mismatch want te
-    pure (TData d tys, S.empty, S.empty)
+    pure (TData d tys, S.singleton allocE, S.empty)
   Proj e o -> do
     (te, ee, ue) <- infer s rec ctx e
     case te of
       TData d tys
         | Just (ps, obs) <- M.lookup d (sigCodata s)
         , Just t <- lookup o obs ->
-            pure (substTy (M.fromList (zip ps tys)) M.empty t, ee, ue)
+            let t' = substTy (M.fromList (zip ps tys)) M.empty t in pure (t', ee <> alloc t', ue)
       _ -> err Mismatch ("no observation " ++ o ++ " on " ++ prettyTy te)
   _ -> err RefEscape ("surface construct in core (elaborate first): " ++ show tm)
   where
     divergeIf x = if x `S.member` rec then S.singleton divergeE else S.empty
+
+    -- §2.5: building or holding a heap block (which may be dup'd or dropped) is Alloc.
+    alloc t = if heapTy s t then S.singleton allocE else S.empty
+
+    -- The head of a known call: a λ definition, not shadowed by a local.
+    known h = case h of
+      Var g | not (M.member g ctx) -> M.lookup g (sigArity s)
+      TyApp g _ _ -> M.lookup g (sigArity s)
+      _ -> Nothing
+
+    spine e = case e of
+      App f a -> let (h, as) = spine f in (h, as ++ [a])
+      At _ e' -> spine e'
+      _ -> (e, [])
 
     expect t e = do
       (t', eff, u) <- infer s rec ctx e

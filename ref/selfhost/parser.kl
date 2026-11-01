@@ -257,7 +257,9 @@ private def arrowRest : Bool -> Ty -> List Token ->{Diverge, Panic} (Ty, List To
     (if lin then TLFun(box p, effs, box r) else TFun(box p, effs, box r), ts)
 
 private def effName : List Token ->{Diverge} (List u8, List Token) =
-  \ts. case tok ts of { EffVar(e) -> (Cons('\'', box e), next ts) | _ -> qualUpper ts }
+  \ts. case tok ts of
+    { EffVar(e) -> (Cons('\'', box e), next ts)
+    | _ -> if symIs "!" ts then (let (n, ts) = qualUpper (next ts) in (Cons('!', box n), ts)) else qualUpper ts }
 
 -- Into a sorted list without duplicates (keelc keeps effects in a set).
 private def insertName : List u8 -> List (List u8) ->{Diverge} List (List u8) =

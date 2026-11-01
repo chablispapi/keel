@@ -1,0 +1,19 @@
+-- !Alloc: these functions never build or hold a heap block, checked through every call.
+-- Integers, Bool and enums (data whose constructors have no fields) are fine; a direct call
+-- with all of a definition's parameters builds no closure.
+
+data Dir = Up | Down
+
+def turn : Dir ->{!Alloc} Dir = \d. case d of { Up -> Down | Down -> Up }
+
+def step : Dir -> i64 -> i64 ->{Panic, !Alloc} i64 =
+  \d n k. case d of { Up -> n + k | Down -> n - k }
+
+def walk : Dir -> i64 -> i64 ->{Panic, Diverge, !Alloc} i64 =
+  \d n left. if left == 0 then n else walk (turn d) (step d n left) (left - 1)
+
+-- An ordinary function may call one that doesn't allocate.
+def both : i64 -> (i64, i64) ->{Panic, Diverge} (i64, i64) =
+  \n p. let (a, b) = p in (walk Up n a, walk Down n b)
+
+main = let (x, y) = both 10 (4, 3) in x * 100 + y

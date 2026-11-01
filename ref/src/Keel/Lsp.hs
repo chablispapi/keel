@@ -215,7 +215,7 @@ hover overlay file line col = do
       entry <- entryFor file
       loaded <- E.try @SomeException (loadModulesWith (readWith overlay) entry)
       pure $ case loaded of
-        Right (Right (Program decls _, _)) -> describe w (decls ++ map (uncurry Effect) builtinEffects)
+        Right (Right (p, _)) | Program decls _ <- implicitAlloc p -> describe w (decls ++ map (uncurry Effect) builtinEffects)
         _ -> Nothing
   where
     -- Private names are renamed name@module by the loader.

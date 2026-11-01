@@ -61,6 +61,10 @@ positionCases =
     , (4, 7)
     )
   , ("position: effect missing from a signature", "def inc : i64 -> i64 = \\n. n + 1\nmain = inc 41\n", EffectMismatch, (1, 24))
+  , ("position: !Alloc and a pair", "def f : i64 ->{!Alloc} (i64, i64) = \\n. (n, n)\nmain = f 1\n", EffectMismatch, (1, 37))
+  , ("position: !Alloc calling an allocating function", "def g : i64 -> i64 = \\n. n\ndef f : i64 ->{!Alloc} i64 = \\n. g n\nmain = f 1\n", EffectMismatch, (2, 30))
+  , ("position: !Alloc and a partial application", "def add : i64 -> i64 ->{Panic, !Alloc} i64 = \\a b. a + b\ndef f : i64 ->{Panic, !Alloc} i64 = \\n. let h = add n in h 1\nmain = f 1\n", EffectMismatch, (2, 49))
+  , ("position: !Alloc on an early arrow", "def add : i64 ->{!Alloc} i64 ->{Panic, !Alloc} i64 = \\a b. a + b\nmain = add 1 2\n", EffectMismatch, (1, 54))
   , ("position: integer used as a condition", "main =\n  let x = 5 in\n  if x then 1 else 2\n", Mismatch, (3, 6))
   , ( "position: reference captured by a closure"
     , "main = var x = 1 in let g = \\u. x in g ()\n"

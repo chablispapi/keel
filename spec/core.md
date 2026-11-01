@@ -941,8 +941,8 @@ and effects only through the function types it returns.
 
 ## 5. Additions for systems code (M3)
 
-Three small extensions, added with the native back ends. None changes the metatheory: they are
-new primitives with ordinary typing rules.
+Small extensions, added with the native back ends. None changes the metatheory: they are new
+primitives with ordinary typing rules, and `Alloc` is a label like `Panic`.
 
 **Bitwise operations.** `e₁ ⊙ e₂` with `⊙ ∈ { land, lor, lxor, lsl, lsr }`: both operands have
 the same integer type ι, the result has type ι, and the effect is `{}` (they can't overflow).
@@ -979,3 +979,32 @@ never touches device memory.
 
 The surface language adds `bitdata` register layouts on top of these (`spec/surface.md`); they
 are elaborated away before Keel Core.
+
+**Alloc.** A built-in label with no operations, not handleable (like `Panic`), that `main` may
+leave unhandled. It marks code that may touch the allocator: build a heap block, or hold one,
+since holding a block means its reference count may be raised or dropped, and a drop may free
+it (`spec/memory.md`). A function whose type lacks `Alloc` can run where the allocator's state
+is in the middle of a change, such as an interrupt handler. A type is a **heap type** if its
+values are blocks: data with at least one constructor that has fields, pairs, closures (`→`,
+`⊸`), codata, `Box τ` of a heap type, and type variables (which might be one). Data whose
+constructors have no fields is a heap type in no case: its values are shared static blocks,
+which dup and drop never change. The effect of a term gains `Alloc` when it:
+
+- builds a block: `C(e₁, …, eₙ)` with n ≥ 1, `(e₁, e₂)`, `λ` and `λ°` (a closure), `cocase`, or
+  any array operation;
+- is a variable, a definition or an instantiation `f[τ̄; ε̄]` of a heap type;
+- is an application, an operation or a projection whose result has a heap type;
+- is a `λ` whose parameter has a heap type (in its latent effect: the body may drop it).
+
+Two exceptions follow the compiled code. **Direct calls:** a definition whose body starts with
+k λs (k ≤ 7) applied to at least k arguments is one call that builds no closure, so its head is
+not charged, and neither are the latent effects of its first k − 1 arrows (all they do is build
+the next closure). Only the arrows from the k-th one on count, as for any application.
+**Definitions and cocase branches:** a definition's own value is built once, before `main`
+runs, so the `Alloc` of its body is dropped when it is checked; a `cocase` branch may have
+`Alloc`, since projecting it already charges `Alloc` for the codata value.
+
+The rules are conservative: a constructor of constants is a static block, and a closed `λ` may
+be lifted by the optimizer, yet both count. Because the optimizer's output is checked again,
+an optimization that introduced an allocation into code without `Alloc` would be a type
+error. The surface language writes `Alloc` implicitly (`spec/surface.md`).

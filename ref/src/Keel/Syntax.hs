@@ -325,8 +325,8 @@ prettyTy t = case t of
   TBool -> "Bool"
   TInt (IntTy False 0) -> "usize"
   TInt (IntTy s n) -> (if s then "i" else "u") ++ show n
-  TFun a e b -> paren a ++ " →" ++ prettyEff e ++ " " ++ prettyTy b
-  TLFun a e b -> paren a ++ " ⊸" ++ prettyEff e ++ " " ++ prettyTy b
+  TFun a e b -> paren a ++ " →" ++ prettyRow e ++ " " ++ prettyTy b
+  TLFun a e b -> paren a ++ " ⊸" ++ prettyRow e ++ " " ++ prettyTy b
   TData d [] -> d
   TData d as -> d ++ "[" ++ intercalate ", " (map prettyTy as) ++ "]"
   TVar a -> a
@@ -342,6 +342,10 @@ prettyTy t = case t of
       TLFun {} -> "(" ++ prettyTy x ++ ")"
       TPair {} -> "(" ++ prettyTy x ++ ")"
       _ -> prettyTy x
+
+-- | An arrow's row as the surface writes it: Alloc is implied, its absence is @!Alloc@.
+prettyRow :: Eff -> String
+prettyRow e = prettyEff (if allocE `S.member` e then S.delete allocE e else S.insert ('!' : allocE) e)
 
 prettyEff :: Eff -> String
 prettyEff e
@@ -363,7 +367,7 @@ data Program = Program [Decl] Term
 
 -- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@, @Hart@, @Files@ and @Net@ have the
 -- operations in 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
-ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE :: String
+ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE, allocE :: String
 ioE = "IO"
 inputE = "Input"
 filesE = "Files"
@@ -372,6 +376,42 @@ mmioE = "MMIO"
 hartE = "Hart"
 panicE = "Panic"
 divergeE = "Diverge"
+allocE = "Alloc"
+
+-- | Surface rows imply Alloc (spec/surface.md): every arrow allows it unless it says @!Alloc@.
+-- Keel Core has no implicit labels, so the front end turns @!Alloc@ into a row without Alloc
+-- and every other arrow's row into one with it. Effect arguments (@f[τ; {ε}]@) are rows of an
+-- arrow already, so they only lose a written @!Alloc@.
+implicitAlloc :: Program -> Program
+implicitAlloc (Program decls main) = Program (map decl decls) (term main)
+  where
+    noAlloc = '!' : allocE
+    row e = if noAlloc `S.member` e then S.delete noAlloc e else S.insert allocE e
+    decl d = case d of
+      Data lin n ps cs -> Data lin n ps [(c, map ty fs) | (c, fs) <- cs]
+      Codata n ps os -> Codata n ps [(o, ty t) | (o, t) <- os]
+      Effect l os -> Effect l [(o, ty a, ty r) | (o, a, r) <- os]
+      Def f t e -> Def f (ty t) (term e)
+      _ -> d
+    term tm = descend term $ case tm of
+      Lam x t b -> Lam x (ty t) b
+      LLam x t b -> LLam x (ty t) b
+      Con c ts as -> Con c (map ty ts) as
+      ArrayPrim op t as -> ArrayPrim op (ty t) as
+      TyApp f ts es -> TyApp f (map ty ts) (map (S.delete noAlloc) es)
+      Cocase d ts bs -> Cocase d (map ty ts) bs
+      NumLit (Just t) n -> NumLit (Just (ty t)) n
+      _ -> tm
+    ty t = case t of
+      TFun a e b -> TFun (ty a) (row e) (ty b)
+      TLFun a e b -> TLFun (ty a) (row e) (ty b)
+      TData d as -> TData d (map ty as)
+      TBox a -> TBox (ty a)
+      TPair a b -> TPair (ty a) (ty b)
+      TRef a -> TRef (ty a)
+      TMut a -> TMut (ty a)
+      TForall vs es b -> TForall vs es (ty b)
+      _ -> t
 
 -- | Built-in effects and their operations, in operation-number order (the native runtime
 -- numbers operations this way, then user operations in declaration order). Unhandled, @out@

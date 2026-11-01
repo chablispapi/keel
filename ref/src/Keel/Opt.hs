@@ -247,7 +247,9 @@ specialize (Program decls main) = Program (others ++ [Def f t e | (f, (t, e)) <-
                       newPs = concat [maybe [p] (const (captured i)) (lookup i fixed) | (i, p) <- zip [0 ..] ps']
                       body' = foldr (\(x, ty, lin) b -> (if lin then LLam else Lam) x ty b) (replaceVars subst body) newPs
                       (arrs, res) = arrows (length ps') t
-                      eff = S.unions [ef | (_, ef, _) <- arrs]
+                      -- The intermediate arrows' Alloc is building the next closure, which
+                      -- a direct call doesn't do; the last arrow keeps its own.
+                      eff = S.unions [if j == length arrs then ef else S.delete allocE ef | (j, (_, ef, _)) <- zip [1 :: Int ..] arrs]
                       newArrs = concat [maybe [a] (const [(ty, S.empty, lin) | (_, ty, lin) <- captured i]) (lookup i fixed) | (i, a) <- zip [0 ..] arrs]
                       t' = rebuild newArrs eff res
                   modify (\st -> st {ssDefs = M.insert key (t', body') (ssDefs st), ssTodo = key : ssTodo st, ssRaw = M.insert key body' (ssRaw st)})
@@ -256,10 +258,11 @@ specialize (Program decls main) = Program (others ++ [Def f t e | (f, (t, e)) <-
       Var v -> Just v
       _ -> Nothing
 
-    -- Intermediate arrows of nested λs are pure; the last carries every effect.
+    -- Intermediate arrows of nested λs only build the next closure (Alloc); the last carries
+    -- every other effect.
     rebuild [] _ res = res
     rebuild [(a, _, lin)] eff res = (if lin then TLFun else TFun) a eff res
-    rebuild ((a, _, lin) : rest) eff res = (if lin then TLFun else TFun) a S.empty (rebuild rest eff res)
+    rebuild ((a, _, lin) : rest) eff res = (if lin then TLFun else TFun) a (S.singleton allocE) (rebuild rest eff res)
 
 -- | Replace free occurrences of variables (binders are unique, so no capture).
 replaceVars :: M.Map String Term -> Term -> Term

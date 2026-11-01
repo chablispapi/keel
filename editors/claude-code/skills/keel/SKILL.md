@@ -69,6 +69,8 @@ main = printInt (area (Rect(3, 4))); putc('\n'); 0
   - `Panic`: checked arithmetic (`+ - *` panic on overflow), `/`, array indexing.
   - `Diverge`: any recursion, and calling `map`, `length` and other recursive functions.
   - `IO`: output. `Input`: reading stdin. `Files` and `Net`: files and sockets.
+  - `Alloc`: building or holding a heap block. Every arrow allows it without saying so;
+    `->{!Alloc}` forbids it, for code that must not touch the allocator (interrupt handlers).
   - User effects: `effect E { op : A => B }`.
   `keelc check` prints the effects a definition actually has, so copy them from the error.
 - **Lists:** `Cons(x, box rest)` builds one, and `case xs of { Nil -> … | Cons(x, rest) -> … }`
@@ -96,6 +98,8 @@ Each of these has tripped up someone who had the spec open:
 | a fallthrough nested pattern on `linear data` | `a linear value can't be matched twice` | cover every constructor at each level |
 | `if c then a else b; e` meaning `else (b; e)` | `;` binds looser than `if`, so `e` runs after either branch; often `expected Unit, got …` on the `then` branch | parenthesize the branch: `else (b; e)` |
 | `bitdata R : u8 { a @ 0, b @ 5 }` | parse error at the `,` | separate fields with `;`: `{ a @ 0 ; b @ 5 }` |
+| `!Alloc` on every arrow, as in `i64 ->{!Alloc} i64 ->{!Alloc} i64` | `only its last parameter's arrow can be !Alloc` | only the last: `i64 -> i64 ->{!Alloc} i64` |
+| `write8(a, v)` in a `!Alloc` function | `… is !Alloc, but it builds a pair`: two-argument operations take a pair, a heap block | keep MMIO writes and `csrSet` out of `!Alloc` code for now; reads (`read8`, `csrRead`) are fine |
 | `p.x` on data | `can't tell the type before .x (got P); add a type annotation`. Ignore the hint: `.obs` is only for codata, and data has no field access | match: `case p of { P(x, _) -> x }` |
 
 ## Idioms

@@ -45,11 +45,12 @@ tI = TInt i64
 int :: Integer -> Term
 int = IntLit i64
 
+-- | An ordinary arrow: in Keel Core, Alloc is written out (the surface implies it).
 fn :: Ty -> Ty -> Ty
-fn a = TFun a S.empty
+fn a = TFun a (S.singleton allocE)
 
 fnE :: [String] -> Ty -> Ty -> Ty
-fnE es a = TFun a (S.fromList es)
+fnE es a = TFun a (S.fromList (allocE : es))
 
 add, sub, mul, lt, eq :: Term -> Term -> Term
 add = Prim (Arith Checked Add)
@@ -223,6 +224,7 @@ exampleFiles =
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))
   , ("test/memory/narrow.kl", (Just "6148567732", ""))
+  , ("test/memory/noalloc.kl", (Just "1208", ""))
   , ("test/memory/wide.kl", (Just "-446744079709551416", "8589934591\n-4294980180901883\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n9223372036854775807\n-1\n21474836480\n-7692307692\n-11\n-7692307692\n11\n2635249153387078802\n-1311768467463790471\n1\n1\n0\n3320009719690\n9223372036854775000\n5\n4294967305\n17179869186\n-1\n4000000000\n-3\n"))
   -- The Keel skill's examples (editors/claude-code/skills/keel): what agents are told must compile.
   , ("../editors/claude-code/skills/keel/examples/basics.kl", (Just "3", "24\n1,2\n"))

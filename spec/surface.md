@@ -55,6 +55,7 @@ type variables, operations and observations.
 |---|---|
 | `i8` … `i64`, `u8` … `u64`, `usize`, `Bool`, `Unit` | base types; `usize` is as wide as an address on the target (32 or 64 bits) |
 | `a -> b`, `a ->{Panic, 'e} b` | function, with effects |
+| `a ->{MMIO, !Alloc} b` | a function that never allocates (below) |
 | `a -o b`, `a -o{IO} b` | linear (one-shot) function |
 | `&a -> b`, `&mut a -> b` | reference parameters (only as a parameter) |
 | `List a`, `Box a`, `(a, b)` | data / codata types, boxes, pairs |
@@ -62,6 +63,27 @@ type variables, operations and observations.
 | `forall a (b : Free) 'e. type` | polymorphic definition type; kind defaults to `Lin` |
 
 Arrows associate to the right. Effect variables start with `'`.
+
+**`Alloc` is implied.** Building a heap block (a pair, a constructor with fields, a closure, an
+array) or holding one, which reference counting may copy or free, has the effect `Alloc`
+(`spec/core.md` §5). Every arrow allows it without saying so, and `!Alloc` in a row forbids it:
+
+```
+def turn : Dir ->{!Alloc} Dir = \d. case d of { Up -> Down | Down -> Up }
+def step : Dir -> i64 -> i64 ->{Panic, !Alloc} i64 = \d n k. …
+```
+
+The body of a `!Alloc` function, and everything it calls, uses only integers, `Bool`, `Unit`,
+data whose constructors have no fields, bitdata and operations of one argument, and calls
+other `!Alloc` functions with all their parameters (a call with fewer builds a closure). An
+operation of two arguments, such as `write8(a, v)`, `write32` or `csrSet`, takes a pair, which
+is a heap block today, so it is `Alloc` (ponytail: passing such pairs in two registers would
+let MMIO writes into `!Alloc` code). Only the last arrow
+of a definition can say `!Alloc`: the earlier ones build the next closure. That's what an
+interrupt handler needs, since it may run in the middle of an allocation. `keelc` names the
+first thing in the body that allocates (`def f is !Alloc, but it builds a pair`).
+`test/memory/noalloc.kl` is an example. `Alloc` may also be written out, as `keelc check`
+prints it, and means the same as leaving it out.
 
 ## Expressions
 
@@ -400,6 +422,7 @@ Keel Core is explicitly typed (`spec/core.md` §4.1). Inference supplies:
 - **Effect arguments** of polymorphic definitions: an effect variable gets the union of the
   effects that flow into it. `map (\n. n * 10) xs` instantiates `'e := {Panic}`.
 - **λ vs λ°**: a λ that captures a linear value is linear.
+- **`Alloc`** in every arrow that doesn't say `!Alloc`, written or inferred.
 - **Operations**: `read(4)` is `Perform read 4` when `read` is an operation, not a variable.
 - **Shadowing**: allowed; binders are renamed apart (`x~1`), since the core forbids it.
 

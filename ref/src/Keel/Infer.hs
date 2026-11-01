@@ -67,7 +67,10 @@ located p m = StateT $ \s -> atPos p (runStateT m s)
 
 -- | Infer a surface program; the result is a λK₃ program for "Keel.Mono".compile.
 inferProgram :: Program -> Either TypeError Program
-inferProgram (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty M.empty [] bitsInfo)
+inferProgram = inferCore . implicitAlloc
+
+inferCore :: Program -> Either TypeError Program
+inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty M.empty [] bitsInfo)
   where
     decls = optionDecl : arrayDecl : userDecls
     bitsInfo = M.fromList [(b, (it, fs)) | Bitdata b it fs <- userDecls]
@@ -575,7 +578,8 @@ infer env tm = case tm of
       t' <- fill t
       (x', env') <- binder env x (content t')
       (b', tb, eb) <- infer env' b
-      pure (mk x' t' b', arrow t' eb tb, S.empty)
+      -- An arrow nobody wrote allows Alloc, as a written one does (implicitAlloc).
+      pure (mk x' t' b', arrow t' (S.insert allocE eb) tb, S.empty)
 
     -- A borrow argument: the parameter must be a reference to the variable's type.
     borrow refTy ctor x p = do

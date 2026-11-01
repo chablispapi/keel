@@ -23,11 +23,12 @@ tI = TInt i64
 int :: Integer -> Term
 int = IntLit i64
 
+-- | An ordinary arrow: in Keel Core, Alloc is written out (the surface implies it).
 fn :: Ty -> Ty -> Ty
-fn a = TFun a S.empty
+fn a = TFun a (S.singleton allocE)
 
 fnE :: [String] -> Ty -> Ty -> Ty
-fnE es a = TFun a (S.fromList es)
+fnE es a = TFun a (S.fromList (allocE : es))
 
 add, mul, eq :: Term -> Term -> Term
 add = Prim (Arith Checked Add)
@@ -371,7 +372,7 @@ cases =
     )
   , ( "free function where a linear one is expected"
     , Program
-        [Def "apply1" (fn (TLFun tI S.empty tI) tI) (Lam "g" (TLFun tI S.empty tI) (App (Var "g") (int 1)))]
+        [Def "apply1" (fn (TLFun tI (S.singleton allocE) tI) tI) (Lam "g" (TLFun tI (S.singleton allocE) tI) (App (Var "g") (int 1)))]
         (App (Var "apply1") (Lam "n" tI (Prim (Arith Wrap Add) (Var "n") (int 1))))
     , ok (VInt i64 2)
     )

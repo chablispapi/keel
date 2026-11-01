@@ -284,7 +284,8 @@ arrowTy = do
   p <- paramTy
   option p $ do
     arrow <- (op "->" $> TFun) <|> (op "-o" $> TLFun)
-    e <- option S.empty (S.fromList <$> braces (sepBy (qualUpper <|> effVar) comma))
+    -- !Alloc: this arrow doesn't allow Alloc, which every other arrow implies.
+    e <- option S.empty (S.fromList <$> braces (sepBy (qualUpper <|> effVar <|> (op "!" >> ('!' :) <$> qualUpper)) comma))
     arrow p e <$> arrowTy
 
 paramTy :: Parser Ty
