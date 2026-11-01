@@ -74,11 +74,10 @@ def step : Dir -> i64 -> i64 ->{Panic, !Alloc} i64 = \d n k. …
 ```
 
 The body of a `!Alloc` function, and everything it calls, uses only integers, `Bool`, `Unit`,
-data whose constructors have no fields, bitdata and operations of one argument, and calls
-other `!Alloc` functions with all their parameters (a call with fewer builds a closure). An
-operation of two arguments, such as `write8(a, v)`, `write32` or `csrSet`, takes a pair, which
-is a heap block today, so it is `Alloc` (ponytail: passing such pairs in two registers would
-let MMIO writes into `!Alloc` code). Only the last arrow
+data whose constructors have no fields, bitdata and operations, and calls other `!Alloc`
+functions with all their parameters (a call with fewer builds a closure). `write8(a, v)`,
+`write32` and `csrSet` take their two arguments in registers, not as a pair; a `handle`
+allocates (`test/firmware/noalloc.kl`). Only the last arrow
 of a definition can say `!Alloc`: the earlier ones build the next closure. That's what an
 interrupt handler needs, since it may run in the middle of an allocation. `keelc` names the
 first thing in the body that allocates (`def f is !Alloc, but it builds a pair`).

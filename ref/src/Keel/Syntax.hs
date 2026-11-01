@@ -465,6 +465,11 @@ builtinEffects =
     )
   ]
 
+-- | Operations whose argument is a pair of words that a call writes out, @write8(a, v)@:
+-- they take it in two registers, with no heap pair, unless a handler takes the operation.
+registerPairOps :: [String]
+registerPairOps = ["write8", "write32", "csrSet"]
+
 -- | A built-in operation's number: its place in 'builtinEffects' (user operations follow).
 opNumber :: String -> Int
 opNumber op = fromMaybe (error ("not a built-in operation: " ++ op)) (elemIndex op [o | (_, os) <- builtinEffects, (o, _, _) <- os])

@@ -656,6 +656,12 @@ rhsCode slots rhs = case rhs of
     atom slots "rdi" a
     li "rax" (toInteger n)
     ins "call _keel_perform"
+  -- ponytail: hosted targets have no MMIO or Hart, so only a handler takes these: build the pair.
+  RPerform2 n lid a b -> do
+    rhsCode slots (RAlloc lid Nothing [a, b])
+    ins "mov rdi, rax"
+    li "rax" (toInteger n)
+    ins "call _keel_perform"
   RConv to a -> atom slots "rax" a >> canonical to
   RArena True -> ins "call _keel_arena_open"
   RArena False -> ins "call _keel_arena_close"

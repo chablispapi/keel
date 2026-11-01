@@ -88,6 +88,7 @@ data Rhs
   | RPushHandler [(Int, Atom)] Integer  -- ^ push a handler frame (of this layout): (operation number, clause closure)
   | RPopHandler Atom                    -- ^ pop (and drop) the frame
   | RPerform Int Atom                   -- ^ perform operation n: innermost handler, else the machine
+  | RPerform2 Int Integer Atom Atom     -- ^ the same with a pair of words (of this layout), built only for a handler
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
   | RArray ArrayOp Elem [Atom]          -- ^ an array operation, by how the array holds its elements
   | RArena Bool                         -- ^ open (True) or close the innermost arena
@@ -527,6 +528,11 @@ expr info env tm k = case tm of
   Proj e o -> sub e $ \ve -> case typeOf info env e of
     TData d _ | Just i <- elemIndex o (map fst (M.findWithDefault [] d (iObs info))) -> bindRhs (RProj ve i)
     t -> lift (Left ("observation " ++ o ++ " on " ++ prettyTy t))
+  Perform op (Pair a b) | op `elem` registerPairOps, Just (n, _, _) <- M.lookup op (iOps info) -> do
+    lid <- bitmap 0 [False, False] >>= layoutId False (-1) 2
+    subs [a, b] $ \vs -> case vs of
+      [va, vb] -> bindRhs (RPerform2 n lid va vb)
+      _ -> lift (Left ("operation " ++ op ++ ": two arguments expected"))
   Perform op a -> case M.lookup op (iOps info) of
     Just (n, _, _) -> sub a $ \va -> bindRhs (RPerform n va)
     Nothing -> lift (Left ("unknown operation " ++ op))
@@ -907,6 +913,7 @@ exprAtoms e = case e of
       RPushHandler cs _ -> map snd cs
       RPopHandler a -> [a]
       RPerform _ a -> [a]
+      RPerform2 _ _ a b -> [a, b]
       RConv _ a -> [a]
       RArray _ _ as -> as
       RIndex a i _ -> [a, i]
@@ -959,6 +966,7 @@ consumedIn sigs rhs = case rhs of
   RPushHandler cs _ -> concatMap (atomVars . snd) cs
   RPopHandler a -> atomVars a
   RPerform _ a -> atomVars a
+  RPerform2 _ _ a b -> atomVars a ++ atomVars b
   RArray op _ as -> concatMap atomVars (if op `elem` [ALength, AGet] then drop 1 as else as)
   _ -> []
 

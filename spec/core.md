@@ -994,12 +994,16 @@ which dup and drop never change. The effect of a term gains `Alloc` when it:
   any array operation;
 - is a variable, a definition or an instantiation `f[τ̄; ε̄]` of a heap type;
 - is an application, an operation or a projection whose result has a heap type;
-- is a `λ` whose parameter has a heap type (in its latent effect: the body may drop it).
+- is a `λ` whose parameter has a heap type (in its latent effect: the body may drop it);
+- is a `handle` (its frame and its clauses' closures are blocks).
 
 Two exceptions follow the compiled code. **Direct calls:** a definition whose body starts with
 k λs (k ≤ 7) applied to at least k arguments is one call that builds no closure, so its head is
 not charged, and neither are the latent effects of its first k − 1 arrows (all they do is build
 the next closure). Only the arrows from the k-th one on count, as for any application.
+**Register pairs:** `write8 (e₁, e₂)`, `write32` and `csrSet` applied to a pair written out
+there pass its two words in registers, so the pair is not charged; only a handler that takes
+the operation is given a pair, built then and charged to its `handle`.
 **Definitions and cocase branches:** a definition's own value is built once, before `main`
 runs, so the `Alloc` of its body is dropped when it is checked; a `cocase` branch may have
 `Alloc`, since projecting it already charges `Alloc` for the codata value.

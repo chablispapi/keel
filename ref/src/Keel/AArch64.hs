@@ -172,7 +172,12 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts c
 
 -- | The built-in operations a program performs (the runtime leaves out the others).
 performedOps :: [Fun] -> S.Set Int
-performedOps fs = S.fromList [n | f <- fs, Bind _ (RPerform n _) _ <- subExprs (funBody f)]
+performedOps fs = S.fromList (concat [op r | f <- fs, Bind _ r _ <- subExprs (funBody f)])
+  where
+    op r = case r of
+      RPerform n _ -> [n]
+      RPerform2 n _ _ _ -> [n]
+      _ -> []
 
 -- | The lines between these hold the runtime; 'pruneRuntime' takes them out.
 runtimeBegin, runtimeEnd :: String
@@ -411,6 +416,7 @@ uses e = case e of
       RPushHandler cs _ -> concatMap (av . snd) cs
       RPopHandler a -> av a
       RPerform _ a -> av a
+      RPerform2 _ _ a b -> av a ++ av b
       RConv _ a -> av a
       RArray _ _ as -> concatMap av as
       RIndex a i _ -> av a ++ av i
@@ -1131,6 +1137,12 @@ rhsCode slots rhs = case rhs of
     canonical to
   RPerform n a -> do
     atom slots "x1" a
+    movImm "x0" (toInteger n)
+    ins "bl _keel_perform"
+  -- ponytail: hosted targets have no MMIO or Hart, so only a handler takes these: build the pair.
+  RPerform2 n lid a b -> do
+    rhsCode slots (RAlloc lid Nothing [a, b])
+    ins "mov x1, x0"
     movImm "x0" (toInteger n)
     ins "bl _keel_perform"
   RArena True -> ins "bl _keel_arena_open"

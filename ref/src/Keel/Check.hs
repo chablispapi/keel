@@ -258,7 +258,9 @@ allocError s f e declared
             where
               h' = unAt h
           result = if heap tm then Just (p, "its call returns a heap value (" ++ maybe "?" prettyTy (typeOf tm) ++ ")") else Nothing
+      Perform op (Pair a b) | op `elem` registerPairOps -> first p [a, b]
       Perform op _ | heap tm -> Just (p, op ++ " returns a heap value")
+      Handle {} -> Just (p, "it installs a handler, a heap block")
       _ -> first p (children tm)
     unAt (At _ b) = unAt b
     unAt b = b
@@ -600,6 +602,12 @@ infer s rec ctx tm = case tm of
     case t of
       TBox a -> pure (a, eff, u)
       _ -> err Mismatch ("unbox of non-Box type " ++ prettyTy t)
+  -- write8(a, v) passes its pair in registers: no block (a handler that takes it builds one,
+  -- charged where it is installed).
+  Perform op (Pair a b) | op `elem` registerPairOps, Just (l, TPair ta tb, tres) <- M.lookup op (sigOps s) -> do
+    (ea, ua) <- expect ta a
+    (eb, ub) <- expect tb b
+    (tres,S.insert l (ea <> eb),) <$> join2 ua ub
   Perform op a -> do
     (l, targ, tres) <- maybe (err Unbound ("operation " ++ op)) pure (M.lookup op (sigOps s))
     (ea, ua) <- expect targ a
@@ -616,7 +624,7 @@ infer s rec ctx tm = case tm of
       unless (S.null uc) $ err LinearCapture ("handler clause " ++ op ++ " captures " ++ show (S.toList uc))
       unless (sub tc tres) $ mismatch tres tc
       pure ec
-    pure (tb, S.unions (S.delete l eb : ecs), ub)
+    pure (tb, S.unions (S.delete l eb : S.singleton allocE : ecs), ub) -- the frame and its closures
   Pair a b -> do
     (ta, ea, ua) <- infer s rec ctx a
     (tb, eb, ub) <- infer s rec ctx b

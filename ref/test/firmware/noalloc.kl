@@ -1,0 +1,12 @@
+-- MMIO writes in !Alloc code: write8(a, v) passes its two words in registers, so a UART
+-- driver and an interrupt-enabling CSR write allocate nothing.
+
+bitdata LineStatus : u8 { thr_empty @ 5 }
+
+def putc : u8 ->{MMIO, Diverge, !Alloc} Unit =
+  \c. if LineStatus(read8(0x1000_0005)).thr_empty == 1 then write8(0x1000_0000, c)
+      else putc c
+
+def arm : Unit ->{Hart, !Alloc} Unit = \u. csrSet(0x304, 0x0)
+
+main = arm (); putc 79; putc 75; putc 10; 0

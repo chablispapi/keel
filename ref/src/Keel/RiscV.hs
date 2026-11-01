@@ -751,6 +751,25 @@ rhsCode slots rhs = case rhs of
     arg slots 1 a
     li "a0" (toInteger n)
     ins "call _keel_perform"
+  -- write8(a, v) and the like: the machine takes the two words in registers; only a handler
+  -- that takes the operation gets them as a pair.
+  RPerform2 n lid a b -> do
+    lMachine <- newLabel
+    lDone <- newLabel
+    li "a0" (toInteger n)
+    ins "call _keel_handled"
+    jumpIf "beqz" ["a0"] lMachine
+    rhsCode slots (RAlloc lid Nothing [a, b])
+    ins "mv a1, a0"
+    li "a0" (toInteger n)
+    ins "call _keel_perform"
+    ins ("j " ++ lDone)
+    line (lMachine ++ ":")
+    atom slots "a1" a
+    atom slots "a2" b
+    li "a0" (toInteger n)
+    ins "call _keel_machine2"
+    line (lDone ++ ":")
   -- On RV32 a 64-bit result is the value and its high half (a narrow value's sign, or the
   -- high half it had); a narrow one is the low word, re-extended.
   RConv to a | bits to == 64 -> wordSize >>= \w -> atom slots "a0" a >> when (w == 4) (atomHi slots "a1" a)
@@ -1921,6 +1940,54 @@ emitRuntime = do
   ins "wfi"
   ins "li a0, 0"
   ins "j .L_machine_ret"
+
+  -- _keel_handled: a0 = operation number → a0 = 1 if a handler frame takes it, else 0.
+  -- Clobbers t1–t4.
+  fn "_keel_handled"
+  ins "la t1, _keel_handlers"
+  ins "ld t1, 0(t1)"
+  line ".L_handled_frame:"
+  ins "beqz t1, .L_handled_no"
+  ins ("ld t2, " ++ wd 1 ++ "(t1)")
+  ins ("addi t3, t1, " ++ wd 2)
+  line ".L_handled_scan:"
+  ins "beqz t2, .L_handled_next"
+  ins "ld t4, 0(t3)"
+  ins "beq t4, a0, .L_handled_yes"
+  ins ("addi t3, t3, " ++ wd 2)
+  ins "addi t2, t2, -1"
+  ins "j .L_handled_scan"
+  line ".L_handled_next:"
+  ins "ld t1, 0(t1)"
+  ins "j .L_handled_frame"
+  line ".L_handled_yes:"
+  ins "li a0, 1"
+  ins "ret"
+  line ".L_handled_no:"
+  ins "li a0, 0"
+  ins "ret"
+
+  -- _keel_machine2: a0 = write8, write32 or csrSet, a1 and a2 = its two words → a0 = 0.
+  fn "_keel_machine2"
+  ins ("li t0, " ++ show (opNumber "write8"))
+  ins "beq a0, t0, .L_m2_write8"
+  ins ("li t0, " ++ show (opNumber "write32"))
+  ins "beq a0, t0, .L_m2_write32"
+  forM_ csrs $ \(n, name) -> li "t2" n >> ins ("beq a1, t2, .L_m2_csrs_" ++ name)
+  ins "j _keel_panic_csr"
+  forM_ csrs $ \(_, name) -> do
+    line (".L_m2_csrs_" ++ name ++ ":")
+    ins ("csrs " ++ name ++ ", a2")
+    ins "j .L_m2_done"
+  line ".L_m2_write8:"
+  ins "sb a2, 0(a1)"
+  ins "j .L_m2_done"
+  line ".L_m2_write32:"
+  ins "sw a2, 0(a1)"
+  line ".L_m2_done:"
+  ins "li a0, 0"
+  ins "li a1, 0"
+  ins "ret"
 
   -- Output through the 16550 UART: wait for bit 5 of the line status register.
   -- ponytail: the Pico 2 has no console yet (its UART needs headers and an adapter), so output

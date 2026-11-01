@@ -1,0 +1,4 @@
+# keelc qemu writes its build next to the source
+*
+!*.kl
+!.gitignore
