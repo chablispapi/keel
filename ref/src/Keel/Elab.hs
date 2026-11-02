@@ -39,6 +39,7 @@ checkRefs (Program decls main) = do
     Effect _ ops -> forM_ ops $ \(_, a, r) -> tyOk a >> tyOk r
     Def _ t e -> tyOk t >> places M.empty e
     Bitdata {} -> pure () -- removed by inference
+    Cell {} -> pure ()
   places M.empty main
 
 -- | References may appear only as the parameter type of an arrow.
@@ -125,6 +126,7 @@ elaborate (Program decls main) = evalState (Program <$> mapM decl decls <*> top 
       Effect l ops -> pure (Effect l [(op, elabTy a, elabTy r) | (op, a, r) <- ops])
       Def f t e -> Def f (elabTy t) <$> top e
       Bitdata {} -> pure d
+      Cell {} -> pure d
     top e = expr M.empty e (\_ v -> pure v)
 
 -- | @&τ →ε σ@ and @&mut τ →ε σ@ both become @τ →ε σ ⊗ τ@.

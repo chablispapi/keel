@@ -247,6 +247,8 @@ emitProgram board decls mainTy (LProg funs statics mainF _ layouts consts wide) 
       ins ".dword -1"
       line "_keel_arena_top:"
       ins ".dword 0"
+      line "_keel_cells:" -- one word per cell element (Keel.Syntax.cellSlots)
+      mapM_ (\v -> ins ((if w == 8 then ".dword " else ".word ") ++ show v)) (cellInits decls)
       line "_keel_fl:"
       mapM_ line (dataPtr w "_keel_freelists")
       -- Zero-initialized state lives in .data so it needs no clearing at startup.
@@ -670,6 +672,15 @@ rhsCode :: Slots -> Rhs -> G ()
 rhsCode slots rhs = case rhs of
   RAtom a -> atomRes slots a
   RJoin lo hi -> atom slots "a0" lo >> atom slots "a1" hi
+  RCell k v -> do
+    w <- wordSize
+    atom slots "t0" k
+    ins ("slli t0, t0, " ++ (if w == 8 then "3" else "2"))
+    ins "la t1, _keel_cells"
+    ins "add t0, t0, t1"
+    case v of
+      Nothing -> ins "ld a0, 0(t0)"
+      Just a -> atom slots "t2" a >> ins "sd t2, 0(t0)" >> ins "li a0, 0"
   RPrim op it a b | bits it == 64 -> wordSize >>= \w -> if w == 4 then primWide slots op it a b else prim64 slots op it a b
   RPrim op it a b -> prim64 slots op it a b
   RCall f a -> do

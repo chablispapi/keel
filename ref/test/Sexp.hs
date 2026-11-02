@@ -22,6 +22,7 @@ decl d = case d of
   Effect n ops -> list (["effect", n] ++ [list [o, ty a, ty b] | (o, a, b) <- ops])
   Def f t e -> list ["def", f, ty t, term e]
   Bitdata n it fs -> list (["bitdata", n, intTy it] ++ [list [f, show lo, show w] | (f, lo, w) <- fs])
+  Cell n it len v -> list ["cell", n, intTy it, maybe "-" show len, show v]
 
 intTy :: IntTy -> String
 intTy it = prettyTy (TInt it)

@@ -1,0 +1,4 @@
+-- (a, b, c) is (a, (b, c)), in expressions, types and case patterns.
+def f : (i64, i64, i64) ->{Panic} i64 = \t. case t of { (a, b, c) -> a + b * c }
+
+main = f (1, 2, 3) + f (1, (2, 3))

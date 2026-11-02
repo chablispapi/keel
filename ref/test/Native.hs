@@ -234,6 +234,9 @@ exampleFiles =
   , ("test/syntax/nested.kl", (Just "9", "45\n7\n-1\n3\n103\n100\n3\n10\n2\n"))
   , ("test/syntax/known-con.kl", (Just "12057", "1234"))
   , ("test/syntax/known-con-panic.kl", (Nothing, "78"))
+  , ("test/syntax/tuples.kl", (Just "14", ""))
+  , ("test/cells/cells.kl", (Just "301", "12\n-3\n1\n"))
+  , ("test/cells/bounds.kl", (Nothing, "9\n"))
   , ("test/syntax/const-ops.kl", (Just "930031494736259442", ""))
   , ("test/memory/array32.kl", (Just "142081499369", ""))
   , ("test/memory/array32-print.kl", (Just "[-5, -5, 2147483647, -2147483648]", ""))
@@ -540,6 +543,8 @@ firmwareExamples =
   , ("test/firmware/noalloc.kl", Virt 32, "", "OK\nresult: 0\n")
   , ("test/firmware/interrupt.kl", Virt 64, "", "1\nresult: 2000001000000\n")
   , ("test/firmware/interrupt.kl", Virt 32, "", "1\nresult: 2000001000000\n")
+  , ("test/firmware/cells.kl", Virt 64, "", "result: 190\n")
+  , ("test/firmware/cells.kl", Virt 32, "", "result: 190\n")
   , ("examples/firmware/pico/blink.kl", Pico2, "", "")
   ]
 

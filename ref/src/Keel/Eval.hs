@@ -5,7 +5,7 @@ module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgr
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
-import Control.Monad.Trans.State.Strict (State, get, modify, put, runState)
+import Control.Monad.Trans.State.Strict (State, get, gets, modify, put, runState)
 import Data.Bits (shiftL, shiftR, xor, (.&.), (.|.))
 import Data.Foldable (toList)
 import Data.Maybe (fromMaybe)
@@ -65,7 +65,7 @@ data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String, mH
 -- | Evaluation can panic, and changes the world: input not yet read, output written (newest
 -- chunk first), the open files' unread bytes by handle, the files written (Nothing: none can
 -- be) and the handles writing them, and the network (if there is one).
-data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wWritten :: Maybe (M.Map FilePath String), wWriting :: M.Map Integer FilePath, wNet :: Maybe Net}
+data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wWritten :: Maybe (M.Map FilePath String), wWriting :: M.Map Integer FilePath, wNet :: Maybe Net, wCells :: M.Map Integer Value}
 
 -- | A loopback network, all inside the program: listeners by fd (port, connections waiting to
 -- be accepted), connected sockets by fd, the next fd and free port, and a clock that only
@@ -103,11 +103,11 @@ runProgramAt word m p = runResolved m (resolveWord word p)
 runResolved :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
 runResolved (Machine input files hosted) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)), fromMaybe M.empty (wWritten w))
   where
-    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if hosted then Just M.empty else Nothing) M.empty (if hosted then Just (Net M.empty M.empty 3 49152 0) else Nothing))
+    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if hosted then Just M.empty else Nothing) M.empty (if hosted then Just (Net M.empty M.empty 3 49152 0) else Nothing) (M.fromList (zip [0 ..] [VInt u64 v | v <- cellInits decls])))
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
     globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
-    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty Nothing M.empty Nothing) of
-      (Right v, World _ [] _ _ _ _ _) -> v
+    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty Nothing M.empty Nothing M.empty) of
+      (Right v, World _ [] _ _ _ _ _ _) -> v
       _ -> stuck "effectful top-level definition"
 
 -- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
@@ -244,6 +244,9 @@ machine op v | op `elem` [o | (l, os) <- builtinEffects, l == netE, (o, _, _) <-
       (r, n') <- either throwE pure (network op v n)
       lift (put w {wNet = Just n'})
       pure r
+-- Cells: word slots (the value is a usize; get converts it to the cell's type).
+machine "%cellLoad" (VInt _ k) = lift (gets (M.findWithDefault (VInt u64 0) k . wCells))
+machine "%cellStore" (VPair (VInt _ k) v) = lift (modify (\w -> w {wCells = M.insert k v (wCells w)})) >> pure VUnit
 machine op _ = throwE ("unhandled operation " ++ op ++ " (no device memory in the evaluator)")
 
 pathOf :: Seq.Seq Value -> FilePath

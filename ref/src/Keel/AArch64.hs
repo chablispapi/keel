@@ -157,6 +157,8 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts c
       ins ".quad 0"
       line "_keel_fl:"
       ins ".quad _keel_freelists"
+      line "_keel_cells:" -- one word per cell element (Keel.Syntax.cellSlots)
+      mapM_ (\v -> ins (".quad " ++ show v)) (cellInits decls)
       line ("\t.zerofill __DATA,__bss,_keel_freelists," ++ show (8 * (maxSmall + 1)) ++ ",3")
       line ("\t.zerofill __DATA,__bss,_keel_nofree," ++ show (8 * (maxSmall + 1)) ++ ",3")
       line "\t.zerofill __DATA,__bss,_keel_stats,32,3"
@@ -417,6 +419,7 @@ uses e = case e of
       RPopHandler a -> av a
       RPerform _ a -> av a
       RPerform2 _ _ a b -> av a ++ av b
+      RCell k v -> av k ++ maybe [] av v
       RConv _ a -> av a
       RArray _ _ as -> concatMap av as
       RIndex a i _ -> av a ++ av i
@@ -1106,6 +1109,13 @@ rhsCode slots rhs = case rhs of
   RField a i -> do
     atom slots "x9" a
     ins ("ldr x0, [x9, #" ++ show (8 * i) ++ "]")
+  RCell k v -> do
+    atom slots "x9" k
+    mapM_ (atom slots "x11") v
+    address "x10" "_keel_cells"
+    case v of
+      Nothing -> ins "ldr x0, [x10, x9, lsl #3]"
+      Just _ -> ins "str x11, [x10, x9, lsl #3]" >> ins "mov x0, #0"
   RRel a i -> do
     atom slots "x9" a
     ins ("ldrsw x10, [x9, #" ++ show (4 * i) ++ "]")

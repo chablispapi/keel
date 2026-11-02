@@ -102,6 +102,7 @@ declared d = case d of
   Effect l ops -> S.fromList (l : [o | (o, _, _) <- ops])
   Def f _ _ -> S.singleton f
   Bitdata n _ _ -> S.singleton n
+  Cell n _ _ _ -> S.singleton n
 
 -- | Names a declaration refers to: free variables, constructors and types. (A parameter that
 -- happens to share a user definition's name is not a mention.)
@@ -112,6 +113,7 @@ mentions d = case d of
   Codata _ _ os -> S.unions (map (tyNames . snd) os)
   Effect _ ops -> S.unions [tyNames a <> tyNames r | (_, a, r) <- ops]
   Bitdata {} -> S.empty
+  Cell {} -> S.empty
   where
     termNames tm = case tm of
       Con c _ _ -> [c]

@@ -1,0 +1,15 @@
+-- Cells: static word slots, read and written under Shared, with no allocation.
+cell count : u32 = 7
+cell delta : i8
+cell ring : [u8; 4]
+
+def push : u8 ->{Shared, Panic, !Alloc} Unit =
+  \c. let n = get(count) in setAt(ring, n % 4, c); set(count, n + 1)
+
+def sum : usize -> u32 ->{Shared, Panic, Diverge, !Alloc} u32 =
+  \i acc. if i == 4 then acc else sum (i + 1) (acc + getAt(ring, i) as u32)
+
+main = set(delta, -3); push 10; push 20; push 30; push 250; push 1;
+       out(get(count) as i64); out(get(delta) as i64);
+       out(getAt(ring, 3) as i64);
+       sum 0 0

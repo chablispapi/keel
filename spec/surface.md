@@ -42,6 +42,7 @@ A file is a list of declarations followed by `main = expression`. Comments are `
 codata Ord a { lt : a -> a -> Bool }
 bitdata LineStatus : u8 { thr_empty @ 5 ; parity @ 1..2 }
 effect MMIO { read : i64 => i64 ; write : W => Unit }
+cell head : u32 = 0                 -- static state: one integer, or [u8; 64] for an array
 def name : type = expression        -- top-level definitions need a type
 main = expression
 ```
@@ -101,7 +102,7 @@ prints it, and means the same as leaving it out.
 | `handle e with MMIO { read a -> e \| write w -> e }` | handler |
 | `read8(4)`, `out(x)`, `putc(c)` | performing an operation (`out` prints a number and a newline, `putc` one byte) |
 | `getc ()` | read one byte of input (effect `Input`): `0`–`255`, or `-1` at the end |
-| `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs |
+| `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs; `(a, b, c)` is `(a, (b, c))`, in types and `case` patterns too |
 | `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
 | `"Hi!\n"` | a `List u8` of the string's UTF-8 bytes (Haskell-style escapes) |
 | `'a'`, `'\n'` | an ASCII character as a `u8` (in expressions only; in types `'a` is an effect variable) |
@@ -405,14 +406,32 @@ freestanding RISC-V target, an interrupt calls it with `mcause`, and it returns 
 interrupted code with `mret`. It can't have `Alloc`, since it can run in the middle of an
 allocation, and `main` must have its other effects: an interrupt runs inside `main`, which
 turns interrupts on. A function `main` calls may still be interrupted by a handler with
-effects that function lacks, such as `Panic`: interrupts are asynchronous. It runs with interrupts off (until `mret`), on the
-interrupted stack, and its operations reach the machine even when the interrupted code is
-inside a `handle`. Set `mstatus.MIE` (bit 3) to take interrupts through it
+effects that function lacks, such as `Panic`: interrupts are asynchronous. It runs with
+interrupts off (until `mret`), on the interrupted stack, and its operations reach the machine
+even when the interrupted code is inside a `handle`. Set `mstatus.MIE` (bit 3) to take interrupts through it
 (`test/firmware/interrupt.kl`). Everything else panics: an exception (a fault, such as an
 access to an address with no device, an illegal instruction or `ecall`), or an interrupt
 in a program without `def interrupt`. The runtime prints `panic: trap mcause=… mepc=… mtval=…`
 (hex) and exits with 101 (on the Pico 2 the core sleeps). Elsewhere `interrupt` is an ordinary
 definition.
+
+**Cells** are static state, on every target: `cell head : u32 = 0` is one integer (0 when no
+value is given), `cell ring : [u8; 64]` an array of them, all zero. An element is an integer of
+up to 32 bits, or a `usize`. They are reached only through four accesses, with the built-in
+effect `Shared`:
+
+| Access | Type |
+|---|---|
+| `get(c)`, `set(c, v)` | `τ ! Shared`, `Unit ! Shared` |
+| `getAt(c, i)`, `setAt(c, i, v)` | the same, `! Shared, Panic`: an index of any integer type, panicking past the end (`arithmetic overflow: … in u64`, from computing the slot) |
+
+A cell isn't a value: `n + 1` with `n` a cell is an error that names the accesses. Accesses
+don't allocate, so they work in `!Alloc` code, and a function that reads a cell says
+`Shared`, so pure code never sees one change. `Shared` can't be handled. Each access is one
+load or store of a word, so an interrupt never splits it: a handler and `main` can share a ring
+buffer with no lock when only the handler writes `head` and only `main` writes `tail`
+(`test/firmware/cells.kl`). Anything that updates several cells at once is the program's
+job (turn interrupts off in `mstatus` around it).
 
 **bitdata** declares a register layout over an integer type: fields are a bit (`@ 5`) or an
 inclusive range (`@ 1..2`). A bitdata type is distinct from its integer while type checking

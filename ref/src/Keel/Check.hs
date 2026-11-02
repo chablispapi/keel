@@ -68,7 +68,7 @@ data Sig = Sig
 -- | Effects @main@ may leave unhandled: the machine provides them (MMIO and Hart only on
 -- freestanding targets; elsewhere their unhandled operations panic at run time).
 topLevelEffects :: Eff
-topLevelEffects = S.fromList [ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE, allocE]
+topLevelEffects = S.fromList [ioE, inputE, mmioE, hartE, sharedE, filesE, netE, panicE, divergeE, allocE]
 
 -- | Whether values of a type live in heap blocks that are reference counted (§2.5): data with
 -- a constructor that has fields, pairs, closures, codata. A type variable might be one. Data

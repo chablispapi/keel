@@ -167,7 +167,7 @@ private def has : List u8 -> u8 ->{Diverge} Bool =
   \s c. case s of { Nil -> false | Cons(d, rest) -> c == d || has (unbox rest) c }
 
 private def isKeyword : List u8 ->{Diverge} Bool =
-  \w. member w (string.split ' ' "data linear codata effect def main forall let in var if then else case of cocase handle with box unbox true false mut Box Unit Bool Free Lin bitdata land lor lxor lsl lsr as import private")
+  \w. member w (string.split ' ' "data linear codata effect def main forall let in var if then else case of cocase handle with box unbox true false mut Box Unit Bool Free Lin bitdata land lor lxor lsl lsr as import private cell")
 
 private def isUpper : u8 -> Bool = \c. c >= 'A' && c <= 'Z'
 

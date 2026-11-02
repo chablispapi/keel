@@ -1012,3 +1012,13 @@ The rules are conservative: a constructor of constants is a static block, and a 
 be lifted by the optimizer, yet both count. Because the optimizer's output is checked again,
 an optimization that introduced an allocation into code without `Alloc` would be a type
 error. The surface language writes `Alloc` implicitly (`spec/surface.md`).
+
+**Cells.** A declaration `cell c : ι [n] = v` reserves word slots in one static area, in
+declaration order: one slot, or n for an array, each starting as v. The built-in label
+`Shared` has two operations, `%cellLoad : usize ⇒ usize` and `%cellStore : usize ⊗ usize ⇒
+Unit`, on slot numbers; their names can't be written, so `Shared` can't be handled.
+Inference turns `get(c)` into `(%cellLoad(k)) as ι` for the cell's first slot k, `set(c, v)`
+into `%cellStore(k, v as usize)`, and the array forms into the same at slot
+`(k + n − 1) − ((n − 1) − i)`, whose checked subtraction panics for i ≥ n. A store's pair is
+a register pair (above), so neither operation is `Alloc`. Lowering makes each one a load or a
+store of the slot.

@@ -291,6 +291,7 @@ resolveWord w (Program decls main) = Program (map decl decls) (term main)
       Effect l os -> Effect l [(o, ty a, ty r) | (o, a, r) <- os]
       Def f t e -> Def f (ty t) (term e)
       Bitdata n i fs -> Bitdata n (it i) fs
+      Cell n i len v -> Cell n (it i) len v
     term tm = descend term $ case tm of
       IntLit i n -> IntLit (it i) n
       Convert i e -> Convert (it i) e
@@ -360,6 +361,7 @@ data Decl
   | Effect String [(String, Ty, Ty)]           -- ^ label, operations with argument and result types
   | Def String Ty Term
   | Bitdata String IntTy [(String, Int, Int)] -- ^ name, underlying integer, fields (low bit, width); front end only
+  | Cell String IntTy (Maybe Integer) Integer -- ^ name, element type, array length (Nothing: one), initial value
   deriving (Eq, Show)
 
 data Program = Program [Decl] Term
@@ -367,7 +369,10 @@ data Program = Program [Decl] Term
 
 -- | Built-in effect labels. @IO@ (output), @Input@, @MMIO@, @Hart@, @Files@ and @Net@ have the
 -- operations in 'builtinEffects'; @Panic@ and @Diverge@ have none and cannot be handled.
-ioE, inputE, mmioE, hartE, filesE, netE, panicE, divergeE, allocE :: String
+-- @Shared@'s operations can't be written (inference makes them from cell accesses), so it can't
+-- be handled either.
+ioE, inputE, mmioE, hartE, sharedE, filesE, netE, panicE, divergeE, allocE :: String
+sharedE = "Shared"
 ioE = "IO"
 inputE = "Input"
 filesE = "Files"
@@ -442,6 +447,7 @@ builtinEffects =
       , ("wfi", TUnit, TUnit)
       ]
     )
+  , (sharedE, [("%cellLoad", TInt usize, TInt usize), ("%cellStore", TPair (TInt usize) (TInt usize), TUnit)])
   , ( filesE
     , [ ("openFile", TData "Array" [TInt u8], TInt i64)
       , ("readByte", TInt i64, TInt i64)
@@ -473,7 +479,22 @@ interruptDef = "interrupt"
 -- | Operations whose argument is a pair of words that a call writes out, @write8(a, v)@:
 -- they take it in two registers, with no heap pair, unless a handler takes the operation.
 registerPairOps :: [String]
-registerPairOps = ["write8", "write32", "csrSet"]
+registerPairOps = ["write8", "write32", "csrSet", "%cellStore"]
+
+-- | Cells (spec/surface.md) are word slots in one static area, in declaration order: each
+-- cell's first slot, element type and array length.
+cellSlots :: [Decl] -> M.Map String (Integer, IntTy, Maybe Integer)
+cellSlots decls = M.fromList (zip names (zip3 (scanl (+) 0 sizes) tys lens))
+  where
+    cells = [(n, i, len) | Cell n i len _ <- decls]
+    names = [n | (n, _, _) <- cells]
+    tys = [i | (_, i, _) <- cells]
+    lens = [len | (_, _, len) <- cells]
+    sizes = [fromMaybe 1 len | (_, _, len) <- cells]
+
+-- | The cell area's initial words, slot by slot.
+cellInits :: [Decl] -> [Integer]
+cellInits decls = concat [replicate (fromInteger (fromMaybe 1 len)) v | Cell _ _ len v <- decls]
 
 -- | A built-in operation's number: its place in 'builtinEffects' (user operations follow).
 opNumber :: String -> Int

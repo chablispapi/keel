@@ -224,6 +224,10 @@
     "named": false
   },
   {
+    "type": "cell",
+    "named": false
+  },
+  {
     "type": "character",
     "named": true
   },

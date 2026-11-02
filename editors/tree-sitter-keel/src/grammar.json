@@ -87,8 +87,17 @@
           ]
         },
         {
-          "type": "STRING",
-          "value": "def"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "def"
+            },
+            {
+              "type": "STRING",
+              "value": "cell"
+            }
+          ]
         },
         {
           "type": "FIELD",

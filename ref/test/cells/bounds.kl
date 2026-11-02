@@ -1,0 +1,6 @@
+-- An index past the end of an array cell panics, before the store.
+cell ring : [u8; 4]
+
+def put : usize -> u8 ->{Shared, Panic, !Alloc} Unit = \i c. setAt(ring, i, c)
+
+main = put 3 9; out(getAt(ring, 3) as i64); put 4 1; out(0); 0

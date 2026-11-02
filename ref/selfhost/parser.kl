@@ -42,6 +42,7 @@ data Field = Field(List u8, u64, u64)
 data Decl =
     DData(Bool, List u8, List (List u8), List Ctor) | DCodata(List u8, List (List u8), List Ctor)
   | DEffect(List u8, List Ctor) | DDef(List u8, Ty, Term) | DBitdata(List u8, List u8, List Field)
+  | DCell(List u8, List u8, Bool, u64, u64)
 
 -- Imports (module, qualifier), declarations (private?, declaration), main.
 data Module = Module(List (List u8, List u8), List (Bool, Decl), Option Term)
@@ -141,7 +142,7 @@ private def lastName : List (List u8) ->{Diverge} List u8 =
 
 private def startsDecl : List Token ->{Diverge} Bool =
   \ts. case tok ts of
-    { Keyword(w) -> member w (string.split ' ' "private linear data codata effect bitdata def")
+    { Keyword(w) -> member w (string.split ' ' "private linear data codata effect bitdata cell def")
     | _ -> false }
 
 private def declP : List Token ->{Diverge, Panic} ((Bool, Decl), List Token) =
@@ -154,6 +155,7 @@ private def declP : List Token ->{Diverge, Panic} ((Bool, Decl), List Token) =
       else if kwIs "codata" ts then codataP (next ts)
       else if kwIs "effect" ts then effectP (next ts)
       else if kwIs "bitdata" ts then bitdataP (next ts)
+      else if kwIs "cell" ts then cellP (next ts)
       else defP (expectKw "def" ts) in
     ((priv, d), ts)
 
@@ -204,6 +206,19 @@ private def fieldP : List Token ->{Diverge, Panic} (Field, List Token) =
     let (lo, ts) = natural (expect "@" ts) in
     let (hi, ts) = if symIs ".." ts then natural (next ts) else (lo, ts) in
     (Field(f, lo, hi - lo + 1), ts)
+
+-- cell name : u32 = 0, or cell name : [u8; 64] (= 0 by default); DCell(name, type, array?,
+-- length, initial value)
+private def cellP : List Token ->{Diverge, Panic} (Decl, List Token) =
+  \ts.
+    let (n, ts) = lower ts in
+    let ts = expect ":" ts in
+    let arr = symIs "[" ts in
+    let (it, ts) = lower (if arr then next ts else ts) in
+    let (len, ts) = if arr then natural (expect ";" ts) else (0, ts) in
+    let ts = if arr then expect "]" ts else ts in
+    let (v, ts) = if symIs "=" ts then natural (next ts) else (0, ts) in
+    (DCell(n, it, arr, len, v), ts)
 
 private def natural : List Token -> (u64, List Token) =
   \ts. case tok ts of { Num(v, w) -> (v, next ts) | _ -> (0, fail "expected a number" ts) }
@@ -292,7 +307,7 @@ private def atomTy : List Token ->{Diverge, Panic} (Ty, List Token) =
     else if startsQualUpper ts then (let (n, ts) = qualUpper ts in (TData(n, box Nil), ts))
     else if symIs "(" ts then
       (let (a, ts) = ty (next ts) in
-       if symIs "," ts then (let (b, ts) = ty (next ts) in (TPair(box a, box b), expect ")" ts))
+       if symIs "," ts then (let (b, ts) = tyTuple (next ts) in (TPair(box a, box b), expect ")" ts))
        else (a, expect ")" ts))
     else case tok ts of
       { Ident(n) -> (if isIntTy n then TInt(n) else TVar(n), next ts)
@@ -516,7 +531,7 @@ private def atom : List Token ->{Diverge, Panic} (Term, List Token) =
         if symIs "(" ts then
           (if symIs ")" (next ts) then (EUnit, next (next ts))
            else (let (e, ts) = expr (next ts) in
-                 if symIs "," ts then (let (b, ts) = expr (next ts) in (EPair(box e, box b), expect ")" ts))
+                 if symIs "," ts then (let (b, ts) = exprTuple (next ts) in (EPair(box e, box b), expect ")" ts))
                  else (e, expect ")" ts)))
         else (EUnit, fail "expected an expression" ts) }
 
@@ -572,7 +587,7 @@ private def patternP : List Token ->{Diverge, Panic} (Pattern, List Token) =
        (PCon(c, box ps), ts))
     else if symIs "(" ts then
       (let (p, ts) = patternP (next ts) in
-       let (q, ts) = patternP (expect "," ts) in
+       let (q, ts) = patTuple (expect "," ts) in
        (PPair(box p, box q), expect ")" ts))
     else (let (x, ts) = lower ts in (PVar(x), ts))
 
@@ -750,3 +765,16 @@ private def cocaseE : List Token ->{Diverge, Panic} (Term, List Token) =
 
 private def member : List u8 -> List (List u8) ->{Diverge} Bool =
   \w ws. case ws of { Nil -> false | Cons(k, rest) -> string.equal w k || member w (unbox rest) }
+
+-- The rest of a tuple after its first comma: (a, b, c) is (a, (b, c)).
+private def tyTuple : List Token ->{Diverge, Panic} (Ty, List Token) =
+  \ts. let (a, ts) = ty ts in
+    if symIs "," ts then (let (b, ts) = tyTuple (next ts) in (TPair(box a, box b), ts)) else (a, ts)
+
+private def exprTuple : List Token ->{Diverge, Panic} (Term, List Token) =
+  \ts. let (e, ts) = expr ts in
+    if symIs "," ts then (let (b, ts) = exprTuple (next ts) in (EPair(box e, box b), ts)) else (e, ts)
+
+private def patTuple : List Token ->{Diverge, Panic} (Pattern, List Token) =
+  \ts. let (p, ts) = patternP ts in
+    if symIs "," ts then (let (q, ts) = patTuple (next ts) in (PPair(box p, box q), ts)) else (p, ts)

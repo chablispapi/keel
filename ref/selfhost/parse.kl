@@ -44,7 +44,10 @@ def pDecl : Decl ->{IO, Diverge, Panic} Unit =
     | DDef(f, t, e) -> print "(def "; print f; putc(' '); pTy t; putc(' '); pTerm e; putc(')')
     | DBitdata(n, it, fs) ->
         print "(bitdata "; print n; putc(' '); print it;
-        items (\f. case f of { Field(k, lo, w) -> putc('('); print k; putc(' '); printU64 lo; putc(' '); printU64 w; putc(')') }) fs }
+        items (\f. case f of { Field(k, lo, w) -> putc('('); print k; putc(' '); printU64 lo; putc(' '); printU64 w; putc(')') }) fs
+    | DCell(n, it, arr, len, v) ->
+        print "(cell "; print n; putc(' '); print it; putc(' ');
+        (if arr then printU64 len else putc('-')); putc(' '); printU64 v; putc(')') }
 
 def pTy : Ty ->{IO, Diverge, Panic} Unit =
   \t. case t of

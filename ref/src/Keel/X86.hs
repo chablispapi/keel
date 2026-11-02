@@ -163,6 +163,8 @@ emitProgram decls mainTy (LProg funs statics mainF _ layouts consts _) = unlines
       ins ".quad 0"
       line "_keel_fl:"
       ins ".quad _keel_freelists"
+      line "_keel_cells:" -- one word per cell element (Keel.Syntax.cellSlots)
+      mapM_ (\v -> ins (".quad " ++ show v)) (cellInits decls)
       line "\t.bss"
       line "\t.p2align 3"
       line "_keel_freelists:"
@@ -589,6 +591,13 @@ rhsCode slots rhs = case rhs of
       Arith _ aop | aop `elem` [Div, Rem] -> divide it aop
       Arith ov aop -> arith it ov aop
       Bits bop -> bitwise it bop
+  RCell k v -> do
+    atom slots "r10" k
+    mapM_ (atom slots "rax") v
+    ins "lea r11, [rip + _keel_cells]"
+    case v of
+      Nothing -> ins "mov rax, qword ptr [r11 + 8*r10]"
+      Just _ -> ins "mov qword ptr [r11 + 8*r10], rax" >> ins "xor eax, eax"
   RCall f a -> do
     atom slots "rax" f
     atom slots "rdi" a

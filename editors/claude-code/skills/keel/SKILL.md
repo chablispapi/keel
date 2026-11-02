@@ -72,6 +72,10 @@ main = printInt (area (Rect(3, 4))); putc('\n'); 0
   - `Alloc`: building or holding a heap block. Every arrow allows it without saying so;
     `->{!Alloc}` forbids it, for code that must not touch the allocator. On RISC-V firmware,
     `def interrupt : usize ->{MMIO, !Alloc} Unit` is the interrupt handler (`test/firmware/interrupt.kl`).
+  - `Shared`: cells, the only mutable state outside functions. `cell n : u32 = 0` or
+    `cell buf : [u8; 64]`, read with `get(n)` / `getAt(buf, i)`, written with `set(n, v)` /
+    `setAt(buf, i, v)` (`test/cells/cells.kl`). They don't allocate, so an interrupt
+    handler and `main` can share them.
   - User effects: `effect E { op : A => B }`.
   `keelc check` prints the effects a definition actually has, so copy them from the error.
 - **Lists:** `Cons(x, box rest)` builds one, and `case xs of { Nil -> … | Cons(x, rest) -> … }`
@@ -100,6 +104,8 @@ Each of these has tripped up someone who had the spec open:
 | `if c then a else b; e` meaning `else (b; e)` | `;` binds looser than `if`, so `e` runs after either branch; often `expected Unit, got …` on the `then` branch | parenthesize the branch: `else (b; e)` |
 | `bitdata R : u8 { a @ 0, b @ 5 }` | parse error at the `,` | separate fields with `;`: `{ a @ 0 ; b @ 5 }` |
 | `!Alloc` on every arrow, as in `i64 ->{!Alloc} i64 ->{!Alloc} i64` | `only its last parameter's arrow can be !Alloc` | only the last: `i64 -> i64 ->{!Alloc} i64` |
+| `n + 1` with `cell n : u32` | `cell n is read with get(n) and written with set(n, v)` | `get(n) + 1`: a cell isn't a value |
+| `cell total : i64` | `a cell holds an integer of up to 32 bits, or a usize` | `u32`, `i32` or `usize` |
 | `def interrupt` doing `out(…)` when `main` never prints | `def interrupt has effects {IO} that main doesn't` | `main` must have the handler's effects: give it the operation too, or drop it from the handler |
 | `write8 p` with `p` a pair variable, in a `!Alloc` function | `… is !Alloc, but it uses p, which holds a heap block` | write the pair at the call, `write8(a, v)`: then the two words go in registers |
 | `p.x` on data | `can't tell the type before .x (got P); add a type annotation`. Ignore the hint: `.obs` is only for codata, and data has no field access | match: `case p of { P(x, _) -> x }` |

@@ -1,0 +1,32 @@
+-- State shared between an interrupt handler and main, in cells: each timer interrupt pushes
+-- the tick number into a ring buffer and advances head; main, which alone writes tail, drains
+-- it. Only the handler writes head and only main writes tail, and each access is one word,
+-- so neither needs a lock (spec/surface.md).
+
+def mstatus : usize = 0x300
+def mie : usize = 0x304
+def mtime : usize = 0x0200_BFF8
+def mtimecmp : usize = 0x0200_4000
+
+cell head : u32
+cell tail : u32
+cell ring : [u32; 8]
+
+def rearm : Unit ->{MMIO, Panic, !Alloc} Unit =
+  \u. write32(mtimecmp + 4, 0); write32(mtimecmp, read32(mtime) + 10_000)
+
+def interrupt : usize ->{MMIO, Shared, Panic, !Alloc} Unit =
+  \cause. let h = get(head) in
+    setAt(ring, h % 8, h); set(head, h + 1); rearm ()
+
+-- Wait for the next value, then take it: 0, 1, 2, … in order, whatever interrupts do meanwhile.
+def take : Unit ->{Shared, Hart, Panic, Diverge} u32 =
+  \u. let t = get(tail) in
+    if get(head) == t then (wfi(); take ())
+    else (let v = getAt(ring, t % 8) in set(tail, t + 1); v)
+
+def drain : u32 -> u32 ->{Shared, Hart, Panic, Diverge} u32 =
+  \n acc. if n == 0 then acc else drain (n - 1) (acc + take ())
+
+main = rearm (); csrSet(mie, 0x80); csrSet(mstatus, 0x8);
+       drain 20 0

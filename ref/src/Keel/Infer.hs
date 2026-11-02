@@ -34,6 +34,7 @@ data Sig = Sig
   , sDefs :: M.Map String Ty
   , sOps :: M.Map String (String, Ty, Ty) -- ^ operation ↦ (label, argument, result)
   , sBits :: BitsInfo
+  , sCells :: M.Map String (Integer, IntTy, Maybe Integer) -- ^ 'cellSlots'
   }
 
 -- | bitdata name ↦ (underlying integer, fields with low bit and width).
@@ -82,6 +83,7 @@ inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty
         , sDefs = M.fromList [(f, t) | Def f t _ <- userDecls]
         , sOps = M.fromList [(op, (l, a, r)) | (l, ops) <- builtinEffects ++ [(l, os) | Effect l os <- decls], (op, a, r) <- ops]
         , sBits = bitsInfo
+        , sCells = cellSlots userDecls
         }
     groups = recursiveGroups userDecls
     go = do
@@ -95,6 +97,13 @@ inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty
           (e', _) <- check env e body
           Just . Def f (resolveBits bitsInfo t) <$> finish env e'
         Bitdata {} -> pure Nothing
+        -- ponytail: a cell element is one word slot, so at most 32 bits (or usize) to fit on
+        -- RV32 too; i64 cells need two slots there.
+        Cell n it@(IntTy _ b) len v
+          | b > 32 -> failWith Mismatch ("cell " ++ n ++ " : " ++ prettyTy (TInt it) ++ ": a cell holds an integer of up to 32 bits, or a usize")
+          | v > snd (intRange it) -> failWith Mismatch ("cell " ++ n ++ ": " ++ show v ++ " does not fit in " ++ prettyTy (TInt it))
+          | len == Just 0 -> failWith Mismatch ("cell " ++ n ++ ": an array cell needs at least one element")
+          | otherwise -> pure (Just d)
         Data lin n ps cs -> pure (Just (Data lin n ps [(c, map (resolveBits bitsInfo) fs) | (c, fs) <- cs]))
         Codata n ps os -> pure (Just (Codata n ps [(o, resolveBits bitsInfo ot) | (o, ot) <- os]))
         Effect l ops -> pure (Just (Effect l [(op, resolveBits bitsInfo a, resolveBits bitsInfo r) | (op, a, r) <- ops]))
@@ -103,6 +112,19 @@ inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty
       (m, _, _) <- infer env main
       Program [d | Just d <- decls'] <$> finish env m
     startDef = modify (\s -> s {stUsed = M.keysSet (sDefs sig), stBinders = M.empty})
+
+-- | How a cell is used, for errors.
+cellUse :: String -> Maybe Integer -> String
+cellUse c len = case len of
+  Nothing -> "cell " ++ c ++ " is read with get(" ++ c ++ ") and written with set(" ++ c ++ ", v)"
+  Just _ -> "cell " ++ c ++ " is an array: read it with getAt(" ++ c ++ ", i) and write it with setAt(" ++ c ++ ", i, v)"
+
+-- | An access written like a call, c, (c, x) or (c, x, y): the cell's name and the rest.
+spread :: Term -> Maybe (String, [Term])
+spread a = case stripAt a of
+  Var c -> Just (c, [])
+  Pair c x | Var n <- stripAt c -> Just (n, case stripAt x of Pair i v -> [i, v]; _ -> [x])
+  _ -> Nothing
 
 -- Variables ---------------------------------------------------------------------------------
 
@@ -381,6 +403,7 @@ infer env tm = case tm of
           pure (TyApp x tys (map S.singleton effs), ty, diverge x)
         _ -> pure (Var x, t, diverge x)
     | M.member x (sOps sig) -> failWith Mismatch ("operation " ++ x ++ " must be applied: " ++ x ++ "(…)")
+    | Just (_, _, len) <- M.lookup x (sCells sig) -> failWith Mismatch (cellUse x len)
     | Just AEmpty <- lookup x arrayOps -> do
         elemTy <- freshTy
         pure (ArrayPrim AEmpty elemTy [], TData "Array" [elemTy], S.empty)
@@ -429,6 +452,40 @@ infer env tm = case tm of
     pure (If c' a' b', ta, S.unions [ec, ea, eb])
   Lam x t b -> lam Lam TFun x t b
   LLam x t b -> lam LLam TLFun x t b
+  -- Cells: get(c), set(c, v), getAt(c, i), setAt(c, i, v) read and write word slots; an
+  -- index past the end panics (the checked subtraction that computes the slot).
+  App (Var acc) a
+    | acc `elem` ["get", "set", "getAt", "setAt"]
+    , Nothing <- M.lookup acc (eLocals env)
+    , not (M.member acc (sDefs sig))
+    , Just (c, args) <- spread a
+    , Nothing <- M.lookup c (eLocals env)
+    , Just (off, it, len) <- M.lookup c (sCells sig) -> do
+        let load s = Convert it (Perform "%cellLoad" s)
+            store s v = Perform "%cellStore" (Pair s (Convert usize v))
+            slot n i = Prim (Arith Checked Sub) (IntLit usize (off + n - 1)) (Prim (Arith Checked Sub) (IntLit usize (n - 1)) i)
+            index i = case stripAt i of
+              NumLit Nothing _ -> check env i (TInt usize)
+              _ -> do
+                (i', ti, ei) <- infer env i
+                ti' <- zonk ti
+                case ti' of
+                  TInt _ -> pure (Convert usize i', ei)
+                  _ -> failWith Mismatch ("the index of " ++ acc ++ "(" ++ c ++ ", …) is a " ++ prettyTy ti' ++ ", not an integer")
+            shared = S.singleton sharedE
+        case (acc, len, args) of
+          ("get", Nothing, []) -> pure (load (IntLit usize off), TInt it, shared)
+          ("set", Nothing, [v]) -> do
+            (v', ev) <- check env v (TInt it)
+            pure (store (IntLit usize off) v', TUnit, shared <> ev)
+          ("getAt", Just n, [i]) -> do
+            (i', ei) <- index i
+            pure (load (slot n i'), TInt it, S.insert panicE (shared <> ei))
+          ("setAt", Just n, [i, v]) -> do
+            (i', ei) <- index i
+            (v', ev) <- check env v (TInt it)
+            pure (store (slot n i') v', TUnit, S.insert panicE (shared <> ei <> ev))
+          _ -> failWith Mismatch (cellUse c len)
   App (Var op) a
     | Nothing <- M.lookup op (eLocals env)
     , not (M.member op (sDefs sig))

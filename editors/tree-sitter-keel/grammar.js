@@ -33,7 +33,7 @@ module.exports = grammar({
       $.punctuation,
     ),
 
-    definition: $ => seq(optional('private'), 'def', field('name', $.identifier)),
+    definition: $ => seq(optional('private'), choice('def', 'cell'), field('name', $.identifier)),
     type_definition: $ => seq(
       optional('private'),
       optional('linear'),

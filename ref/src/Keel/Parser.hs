@@ -62,7 +62,7 @@ lexer =
           [ "data", "linear", "codata", "effect", "def", "main", "forall", "let", "in", "var"
           , "if", "then", "else", "case", "of", "cocase", "handle", "with", "box", "unbox"
           , "true", "false", "mut", "Box", "Unit", "Bool", "Free", "Lin"
-          , "bitdata", "land", "lor", "lxor", "lsl", "lsr", "as", "import", "private"
+          , "bitdata", "land", "lor", "lxor", "lsl", "lsr", "as", "import", "private", "cell"
           ]
       , Tok.reservedOpNames = []
       , Tok.caseSensitive = True
@@ -151,7 +151,7 @@ moduleP = do
 
 -- | A declaration, and where each name it declares is written.
 decl :: Parser (Decl, [(String, Pos)])
-decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
+decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> cellDecl <|> defDecl
   where
     -- A declared name and its position.
     site p = do
@@ -167,6 +167,19 @@ decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> defDecl
       fs <- braces (sepEndBy bitField semi)
       pure (Bitdata name it fs, [s])
     reserved' t = try (do n <- lower; if n == t then pure () else unexpected n)
+    intTy = choice [reserved' t $> i | (t, i) <- intTypes]
+    -- cell name : u32 = 0, or cell name : [u8; 64] (= 0 by default)
+    cellDecl = do
+      reserved "cell"
+      (name, s) <- site lower
+      op ":"
+      (it, len) <- brackets ((,) <$> intTy <* op ";" <*> (Just <$> natural)) <|> ((,Nothing) <$> intTy)
+      v <- option 0 (op "=" >> natural)
+      pure (Cell name it len v, [s])
+    natural = number >>= \n -> case n of
+      NumLit _ v -> pure v
+      IntLit _ v -> pure v
+      _ -> fail "expected a number"
     bitField = do
       f <- lower
       op "@"
@@ -214,7 +227,9 @@ pattern :: Parser Pat
 pattern =
   (PCon <$> qualUpper <*> option [] (parens (sepBy pattern comma)))
     <|> (PVar <$> lower)
-    <|> parens (PPair <$> pattern <* comma <*> pattern)
+    <|> parens (PPair <$> pattern <* comma <*> rest)
+  where
+    rest = do p <- pattern; option p (comma >> PPair p <$> rest)
 
 -- | Nested patterns to the core's flat cases (Wadler's match, in Peyton Jones, The
 -- Implementation of Functional Programming Languages, ch. 5): the first column's rows go in
@@ -303,8 +318,9 @@ atomTy =
     <|> (reserved "Unit" $> TUnit)
     <|> ((`TData` []) <$> qualUpper)
     <|> (named <$> lower)
-    <|> parens (do a <- ty; option a (comma >> TPair a <$> ty))
+    <|> parens tuple
   where
+    tuple = do a <- ty; option a (comma >> TPair a <$> tuple)
     named n = maybe (TVar n) TInt (lookup n intTypes)
 
 -- Expressions -----------------------------------------------------------------------------
@@ -485,12 +501,14 @@ atom =
     <|> (reserved "true" $> BoolLit True)
     <|> (reserved "false" $> BoolLit False)
     <|> try (parens (pure ()) $> UnitLit)
-    <|> parens (do e <- expr; option e (comma >> Pair e <$> expr))
+    <|> parens tuple
     <|> caseE
     <|> cocaseE
     <|> constructor
     <|> (Var <$> lower)
   where
+    -- (a, b, c) is (a, (b, c))
+    tuple = do e <- expr; option e (comma >> Pair e <$> tuple)
     constructor = do
       c <- qualUpper
       bitsLit c <|> do
