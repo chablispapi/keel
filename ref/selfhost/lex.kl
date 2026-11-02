@@ -13,6 +13,7 @@ def showTok : Tok ->{IO, Diverge, Panic} Unit =
     | Keyword(w) -> print "keyword "; print w
     | EffVar(w) -> print "effvar "; print w
     | Num(v, w) -> print "num "; printU64 v; print w
+    | Flt(v, e) -> print "float "; printU64 v; putc('e'); printInt e
     | Char(c) -> print "char "; printU64 (c as u64)
     | Str(s) -> print "str \""; quoted s; putc('"')
     | Sym(w) -> print "sym "; print w

@@ -41,7 +41,7 @@ compileX86 p = do
 
 -- | How to turn the assembly into a program on x86-64 Linux.
 linkCommand :: FilePath -> FilePath -> (String, [String])
-linkCommand s out = ("gcc", ["-no-pie", "-o", out, s])
+linkCommand s out = ("gcc", ["-no-pie", "-o", out, s, "-lm"])
 
 heapReserve :: Integer
 heapReserve = 14 * 1024 * 1024 * 1024
@@ -672,6 +672,52 @@ rhsCode slots rhs = case rhs of
     li "rax" (toInteger n)
     ins "call _keel_perform"
   RConv to a -> atom slots "rax" a >> canonical to
+  -- f64 lives in general registers as its bits; xmm0 and xmm1 hold it for the operation.
+  RFPrim op a b -> do
+    atom slots "r11" a
+    atom slots "r10" b
+    ins "movq xmm0, r11"
+    ins "movq xmm1, r10"
+    case op of
+      -- ucomisd: unordered (NaN) sets ZF, PF and CF, so == also needs PF clear.
+      Eq -> ins "ucomisd xmm0, xmm1" >> ins "sete al" >> ins "setnp r9b" >> ins "and al, r9b" >> ins "movzx eax, al"
+      Lt -> ins "ucomisd xmm1, xmm0" >> ins "seta al" >> ins "movzx eax, al"
+      Arith _ aop -> do
+        ins ((case aop of Add -> "addsd"; Sub -> "subsd"; Mul -> "mulsd"; _ -> "divsd") ++ " xmm0, xmm1")
+        ins "movq rax, xmm0"
+      _ -> error "float primitive"
+  RFOfInt it a -> do
+    atom slots "r11" a
+    if bits it == 64 && not (signed it)
+      then do
+        -- A u64 with the top bit set: halve it (keeping the low bit, so it rounds the same),
+        -- convert, double.
+        lBig <- newLabel
+        lDone <- newLabel
+        ins "test r11, r11"
+        ins ("js " ++ lBig)
+        ins "cvtsi2sd xmm0, r11"
+        ins ("jmp " ++ lDone)
+        line (lBig ++ ":")
+        ins "mov r9, r11"
+        ins "shr r9, 1"
+        ins "and r11d, 1"
+        ins "or r9, r11"
+        ins "cvtsi2sd xmm0, r9"
+        ins "addsd xmm0, xmm0"
+        line (lDone ++ ":")
+      else ins "cvtsi2sd xmm0, r11"
+    ins "movq rax, xmm0"
+  RFloat op as -> do
+    forM_ (zip ["r11", "r10"] as) $ \(r, a) -> atom slots r a
+    ins "movq xmm0, r11"
+    when (length as > 1) (ins "movq xmm1, r10")
+    case op of
+      FToInt it -> floatToInt it
+      FGe -> ins "ucomisd xmm0, xmm1" >> ins "setae al" >> ins "movzx eax, al" -- CF is set when unordered
+      FSqrt -> ins "sqrtsd xmm0, xmm0" >> ins "movq rax, xmm0"
+      FLibm f -> ins ("call " ++ f) >> ins "movq rax, xmm0"
+      _ -> error ("float operation " ++ show op ++ " is a copy")
   RArena True -> ins "call _keel_arena_open"
   RArena False -> ins "call _keel_arena_close"
   RArray ALength _ [a] -> atom slots "r11" a >> ins ("mov rax, " ++ mem "r11" 0)
@@ -769,6 +815,62 @@ divide it@(IntTy sgn n) aop = do
     li "r9" (snd (intRange it))
     ins "cmp rax, r9"
     ins "jg _keel_panic_overflow"
+
+-- | xmm0 truncated to an integer type in rax: saturating, NaN giving 0, as on AArch64.
+-- cvttsd2si gives 0x8000… for NaN and out of range, so that value is checked.
+floatToInt :: IntTy -> G ()
+floatToInt it@(IntTy sgn n) = do
+  lDone <- newLabel
+  if not sgn && n == 64
+    then do
+      -- From 2^63 up: subtract 2^63, convert, set the top bit back (all ones past 2^64).
+      lSmall <- newLabel
+      li "r9" 0x43e0000000000000
+      ins "movq xmm1, r9"
+      ins "ucomisd xmm0, xmm1"
+      ins ("jb " ++ lSmall) -- NaN too
+      ins "subsd xmm0, xmm1"
+      ins "cvttsd2si rax, xmm0"
+      li "r9" (2 ^ (63 :: Int))
+      ins "cmp rax, r9"
+      ins "mov r10, -1"
+      ins "cmove rax, r10"
+      ins "or rax, r9"
+      ins ("jmp " ++ lDone)
+      line (lSmall ++ ":")
+      signed64
+      ins "xor r9d, r9d"
+      ins "test rax, rax"
+      ins "cmovs rax, r9"
+    else do
+      signed64
+      when (n < 64) $ do
+        let (lo, hi) = intRange it
+        li "r9" hi
+        ins "cmp rax, r9"
+        ins "cmovg rax, r9"
+        li "r9" lo
+        ins "cmp rax, r9"
+        ins "cmovl rax, r9"
+  line (lDone ++ ":")
+  where
+    signed64 = do
+      lOk <- newLabel
+      lNaN <- newLabel
+      ins "cvttsd2si rax, xmm0"
+      li "r9" (2 ^ (63 :: Int))
+      ins "cmp rax, r9"
+      ins ("jne " ++ lOk)
+      ins "ucomisd xmm0, xmm0"
+      ins ("jp " ++ lNaN)
+      ins "xorpd xmm1, xmm1"
+      ins "ucomisd xmm0, xmm1"
+      ins ("jbe " ++ lOk) -- negative: 0x8000… is the minimum
+      li "rax" (2 ^ (63 :: Int) - 1)
+      ins ("jmp " ++ lOk)
+      line (lNaN ++ ":")
+      ins "xor eax, eax"
+      line (lOk ++ ":")
 
 -- | Re-extend rax to the canonical form of an integer type.
 canonical :: IntTy -> G ()
@@ -893,6 +995,7 @@ emitPrinter decls printers lbl t = do
   ins ("mov " ++ mem "rsp" 0 ++ ", rax") -- the value; [rsp + 8] an array's index
   case t of
     TInt (IntTy sgn _) -> ins (if sgn then "call _keel_print_i64" else "call _keel_print_u64")
+    TFloat -> ins "call _keel_print_x64" -- its IEEE bits, as the evaluator shows it
     TBool -> do
       lFalse <- newLabel
       lDone <- newLabel
@@ -1744,6 +1847,7 @@ emitRuntime used = do
   printer "_keel_print_str" "%s" -- rax = NUL-terminated string
   printer "_keel_print_i64" "%lld"
   printer "_keel_print_u64" "%llu"
+  printer "_keel_print_x64" "0x%llx"
 
   panic "_keel_panic_unhandled" "panic: unhandled operation (MMIO and Hart need a freestanding target)\n"
   panic "_keel_panic_div" "panic: division by zero\n"

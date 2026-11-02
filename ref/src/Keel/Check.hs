@@ -488,11 +488,32 @@ infer s rec ctx tm = case tm of
     unless (n >= lo && n <= hi) $ err Mismatch (show n ++ " does not fit " ++ prettyTy (TInt it))
     pure (TInt it, S.empty, S.empty)
   BoolLit _ -> pure (TBool, S.empty, S.empty)
+  FloatLit _ _ -> pure (TFloat, S.empty, S.empty)
+  FloatPrim op args -> do
+    let (tys, r) = floatOpType op
+    when (length tys /= length args) $ err Mismatch "float operation: wrong number of arguments"
+    rs <- case (op, args) of
+      (FOfInt, [e]) -> do
+        (te, ee, ue) <- infer s rec ctx e
+        case te of
+          TInt _ -> pure [(ee, ue)]
+          _ -> err Mismatch ("conversion of non-integer " ++ prettyTy te)
+      _ -> mapM (uncurry expect) (zip tys args)
+    u <- foldM join2 S.empty (map snd rs)
+    pure (r, S.unions (map fst rs), u)
   Prim op a b -> do
     (ta, ea, ua) <- infer s rec ctx a
     case ta of
       TInt _ -> pure ()
+      TFloat -> pure ()
       _ -> err Mismatch ("arithmetic on " ++ prettyTy ta)
+    -- f64 has + - * / (IEEE: inf and NaN, never a panic), == and <.
+    when (ta == TFloat) $ case op of
+      Arith Checked aop | aop /= Rem -> pure ()
+      Eq -> pure ()
+      Lt -> pure ()
+      _ -> err Mismatch "f64 has only + - * / and comparisons (no %, +% +| +? or bit operations)"
+    let float = ta == TFloat
     (eb, ub) <- expect ta b
     u <- join2 ua ub
     case op of
@@ -501,8 +522,9 @@ infer s rec ctx tm = case tm of
     let (t, extra) = case op of
           Eq -> (TBool, S.empty)
           Lt -> (TBool, S.empty)
+          Arith Checked _ | float -> (ta, S.empty)
           Arith Checked _ -> (ta, S.singleton panicE)
-          Arith _ aop | aop `elem` [Div, Rem] -> (ta, S.singleton panicE) -- rejected below
+          Arith _ aop | aop `elem` [Div, Rem] -> (ta, S.singleton panicE) -- rejected above
           Arith Optional _ -> (TData "Option" [ta], S.empty)
           Arith _ _ -> (ta, S.empty)
           Bits _ -> (ta, S.empty)

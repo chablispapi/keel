@@ -1,0 +1,14 @@
+-- std.float's C library functions (hosted targets only). The values are rounded to 6
+-- digits: run and build call the same libm, but x86 runs against another machine's.
+import std.float
+
+def micro : f64 -> i64 = \x. float.floor (x * 1000000.0 + 0.5) as i64
+
+main =
+  out(micro (float.exp 1.0));
+  out(micro (float.log 10.0));
+  out(micro (float.sin 1.0));
+  out(micro (float.cos 1.0));
+  out(micro (float.pow 2.0 0.5));
+  out(float.floor (-2.5) as i64);
+  micro (float.exp (float.log 3.0))

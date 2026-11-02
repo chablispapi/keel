@@ -256,6 +256,8 @@ exampleFiles =
   , ("test/syntax/ops.kl", (Just "72", "1\n0\n1\n2\n8\n3\n4\n9\n321\n"))
   , ("test/syntax/wildcard.kl", (Just "2405", ""))
   , ("test/syntax/prelude-names.kl", (Just "42", "42\n"))
+  , ("test/numeric/float.kl", (Just "0x3fd5555555555555", "0.30000000000000004\n1.5\n-0.25\n100\n0.001\n1.2345e-7\n6.02214076e23\n0.33333333333333332\ninf\n-inf\nnan\n0\n0\n1.2345678901234568e17\n4.9406564584124664e-324\n1.797693134862316e308\n0\n1\n0\n0\n1\n1\n1\n1\n2\n-2\n9223372036854775807\n-9223372036854775808\n0\n-1\n0\n10000000000000000\n255\n-128\n32767\n0\n4294967295\n-2147483648\n9007199254740992\n1.8446744073709552e19\n-9.223372036854776e18\n255\n4607182418800017408\n3.1415926535897932\n1.4142135623730952\nnan\n3.5\n-7\nnan\n5\n0.875\n9.75\n"))
+  , ("test/numeric/float-libm.kl", (Just "3000000", "2718282\n2302585\n841471\n540302\n1414214\n-3\n"))
   , ("examples/words.kl", (Just "-1234", "cat 2\ndog 1\non 1\nsat 1\nthe 3\n-9223372036854775808\n"))
   ]
 
@@ -443,7 +445,7 @@ x86Failures dir programs =
         [ "cd \"$(dirname \"$0\")\""
         , "for s in x*.s; do"
         , "  b=${s%.s}"
-        , "  if gcc -no-pie -o $b $s 2> $b.ccerr; then"
+        , "  if gcc -no-pie -o $b $s -lm 2> $b.ccerr; then"
         , "    KEEL_STATS=1 timeout 60 ./$b < $b.in > $b.out 2> $b.err; echo $? > $b.code"
         , "  else echo cc > $b.code; fi"
         , "done"
@@ -490,6 +492,7 @@ x86Failures dir programs =
 runRiscV :: RiscVTools -> Int -> FilePath -> Int -> (String, Program) -> IO [String]
 runRiscV tools xlen dir i (name, prog) = case (compile prog, compileRiscVAt xlen prog) of
   (Left e, _) -> pure [failMsg ("does not type-check: " ++ show e)]
+  (_, r) | Just why <- lookup (name, xlen) riscvRefusals -> pure [failMsg ("compiled, but " ++ why) | either (not . ("not supported" `isInfixOf`)) (const True) r]
   (_, Left e) -> pure [failMsg e]
   (Right mono, Right asm) ->
     buildRiscV tools (Virt xlen) (dir </> ("rv" ++ show xlen ++ "-" ++ show i)) asm >>= \case
@@ -508,6 +511,14 @@ runRiscV tools xlen dir i (name, prog) = case (compile prog, compileRiscVAt xlen
             ++ [failMsg ("leak: " ++ show stats) | code == ExitSuccess, fmap live stats /= Just 0]
   where
     failMsg msg = "FAIL [riscv" ++ (if xlen == 32 then "32" else "") ++ "] " ++ name ++ ": " ++ msg
+
+-- | Examples that RISC-V must refuse to compile (with "not supported"), by register width.
+riscvRefusals :: [((String, Int), String)]
+riscvRefusals =
+  [ (("test/numeric/float.kl", 32), "RV32 has no f64")
+  , (("test/numeric/float-libm.kl", 32), "RV32 has no f64")
+  , (("test/numeric/float-libm.kl", 64), "freestanding targets have no libm")
+  ]
 
 -- | The firmware examples drive the board themselves: (file, board, what is typed into the
 -- UART, the start of what it must print; a panic's exits with 101). The Pico 2's are only

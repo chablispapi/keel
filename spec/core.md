@@ -964,6 +964,22 @@ the value is `lo + (n − lo) mod (hi − lo + 1)` for the range `[lo, hi]` of �
 target gives it its width (`u64` on 64-bit targets, `u32` on 32-bit ones), and evaluation
 and lowering see only that width. Until then its literals must fit `u64`.
 
+**Floating point.** A base type `f64` (kind `Free`) of IEEE 754 doubles, with literals
+`r:f64`. `e₁ ⊕ e₂` with `⊕ ∈ { +, -, *, / }` (checked forms only) and `==`, `<` take two
+`f64`s, compute with round-to-nearest, and have effect `{}`: overflow gives infinity and an
+invalid operation NaN, never a panic. Comparisons follow IEEE: with NaN, `==` and `<` are false.
+The surface `>=` and `<=` are IEEE's too (false with NaN), not the negation of `<` they are
+for integers. Conversions: `e as f64` from any ι rounds to nearest; `e as ι` from `f64`
+truncates toward zero and saturates to ι's range, and NaN gives 0. `sqrt` is correctly rounded;
+the C library functions (`exp`, `log`, …) are whatever the platform's are, so the evaluator
+calls the same ones. None of this touches linearity or effects: the metatheory is unchanged.
+
+```
+         Γ₁ ⊢ e₁ : f64 ! ε₁    Γ₂ ⊢ e₂ : f64 ! ε₂
+ (FOp) ─────────────────────────────────────────────    (result Bool for == <)
+         Γ₁ ⋈ Γ₂ ⊢ e₁ ⊕ e₂ : f64 ! ε₁ ∪ ε₂
+```
+
 **MMIO.** A built-in effect label with four operations:
 
 | Operation | Type |

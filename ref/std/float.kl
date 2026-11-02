@@ -1,0 +1,43 @@
+-- Floating point: f64, IEEE 754 double precision. The operators + - * / == != < <= > >= work
+-- on f64 with IEEE semantics and no panics (1.0 / 0.0 is infinity, 0.0 / 0.0 is NaN, and NaN
+-- compares false to everything, itself included, except with !=). Convert with `n as f64`
+-- (rounds to nearest) and `x as i64` (truncates toward zero, saturates, NaN gives 0).
+--
+--   import std.float
+--   def hyp : f64 -> f64 -> f64 = \a b. float.sqrt (a * a + b * b)
+--
+-- sqrt and the bit conversions work everywhere; exp, log, pow, sin, cos and floor call the C
+-- library, so only hosted targets have them. No target has f64 on 32 bits yet.
+
+def sqrt : f64 -> f64 = \x. floatSqrt x
+
+def abs : f64 -> f64 = \x. floatFromBits (floatToBits x land 0x7fff_ffff_ffff_ffff)
+
+def isNaN : f64 -> Bool = \x. x != x
+
+-- The smaller and larger of two numbers; NaN if either is NaN.
+def min : f64 -> f64 -> f64 = \a b. if isNaN a || isNaN b then a + b else if b < a then b else a
+
+def max : f64 -> f64 -> f64 = \a b. if isNaN a || isNaN b then a + b else if a < b then b else a
+
+-- The IEEE bit pattern, and the f64 with this pattern.
+def toBits : f64 -> u64 = \x. floatToBits x
+
+def fromBits : u64 -> f64 = \b. floatFromBits b
+
+def infinity : f64 = floatFromBits 0x7ff0_0000_0000_0000
+
+def nan : f64 = floatFromBits 0x7ff8_0000_0000_0000
+
+-- C library functions: hosted targets only.
+def exp : f64 -> f64 = \x. floatExp x
+
+def log : f64 -> f64 = \x. floatLog x
+
+def pow : f64 -> f64 -> f64 = \x y. floatPow x y
+
+def sin : f64 -> f64 = \x. floatSin x
+
+def cos : f64 -> f64 = \x. floatCos x
+
+def floor : f64 -> f64 = \x. floatFloor x

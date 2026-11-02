@@ -1,6 +1,8 @@
 -- | Call-by-value, environment-based evaluator for Keel Core, stages 1–4
 -- (spec/core.md §1.4, §2.5, §3.4, §4.5). Types are erased: @f[τ̄]@ evaluates like @f@. Runs core programs; elaborate λK₃ first. Assumes a well-typed program; stuck states are impossible by
 -- Theorem 1.
+{-# LANGUAGE ForeignFunctionInterface #-}
+
 module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn, runProgramOn, runProgramAt) where
 
 import Control.Monad.Trans.Class (lift)
@@ -11,11 +13,15 @@ import Data.Foldable (toList)
 import Data.Maybe (fromMaybe)
 import Data.Map.Strict qualified as M
 import Data.Sequence qualified as Seq
+import Data.Word (Word64)
+import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 import Keel.Syntax
+import Numeric (showHex)
 
 data Value
   = VUnit
   | VInt IntTy Integer
+  | VFloat Double
   | VBool Bool
   | VClo Env String Term -- ^ ⟨ρ, x, e⟩, for both λ and λ° (linearity is erased)
   | VCon String [Value]
@@ -30,6 +36,7 @@ instance Show Value where
   show v = case v of
     VUnit -> "()"
     VInt _ n -> show n
+    VFloat d -> floatBits d
     VBool b -> if b then "true" else "false"
     VClo {} -> "<closure>"
     VCon c [] -> c
@@ -45,6 +52,7 @@ instance Show Value where
 instance Eq Value where
   VUnit == VUnit = True
   VInt t a == VInt u b = t == u && a == b
+  VFloat a == VFloat b = castDoubleToWord64 a == castDoubleToWord64 b
   VBool a == VBool b = a == b
   VCon c vs == VCon d ws = c == d && vs == ws
   VBox a == VBox b = a == b
@@ -119,6 +127,8 @@ eval hs env tm = case tm of
   TyApp f _ _ -> pure (env M.! f)
   UnitLit -> pure VUnit
   IntLit t n -> pure (VInt t n)
+  FloatLit m e -> pure (VFloat (floatValue m e))
+  FloatPrim op args -> floatOp op <$> mapM (eval hs env) args
   BoolLit b -> pure (VBool b)
   Convert to e -> do
     v <- eval hs env e
@@ -389,7 +399,56 @@ prim op (VInt t a) (VInt _ b) = case op of
     arith Add = (+)
     arith Sub = (-)
     arith Mul = (*)
+prim op (VFloat a) (VFloat b) = pure $ case op of
+  Eq -> VBool (a == b)
+  Lt -> VBool (a < b)
+  Arith _ Add -> VFloat (a + b)
+  Arith _ Sub -> VFloat (a - b)
+  Arith _ Mul -> VFloat (a * b)
+  Arith _ Div -> VFloat (a / b)
+  _ -> stuck "float primitive"
 prim _ _ _ = stuck "primitive on non-integers"
+
+-- | How a float shows as a result: its IEEE bits in hex, exact on every target (std.string's
+-- fromFloat writes it in decimal).
+floatBits :: Double -> String
+floatBits d = "0x" ++ showHex (castDoubleToWord64 d) ""
+
+floatOp :: FloatOp -> [Value] -> Value
+floatOp op args = case (op, args) of
+  (FOfInt, [VInt _ n]) -> VFloat (fromRational (toRational n))
+  (FToInt t, [VFloat d]) ->
+    let (lo, hi) = intRange t
+     in VInt t $
+          if isNaN d
+            then 0
+            else
+              if isInfinite d
+                then (if d > 0 then hi else lo)
+                else max lo (min hi (truncate d))
+  (FGe, [VFloat a, VFloat b]) -> VBool (a >= b)
+  (FSqrt, [VFloat d]) -> VFloat (sqrt d)
+  (FToBits, [VFloat d]) -> VInt u64 (toInteger (castDoubleToWord64 d))
+  (FFromBits, [VInt _ n]) -> VFloat (castWord64ToDouble (fromInteger n :: Word64))
+  (FLibm "pow", [VFloat a, VFloat b]) -> VFloat (c_pow a b)
+  (FLibm f, [VFloat d]) -> VFloat (libm f d)
+  _ -> stuck "float operation"
+  where
+    libm f = case f of
+      "exp" -> c_exp
+      "log" -> c_log
+      "sin" -> c_sin
+      "cos" -> c_cos
+      "floor" -> c_floor
+      _ -> stuck ("unknown libm function " ++ f)
+
+-- The C library's own functions, so that run and build agree exactly on one machine.
+foreign import ccall unsafe "math.h exp" c_exp :: Double -> Double
+foreign import ccall unsafe "math.h log" c_log :: Double -> Double
+foreign import ccall unsafe "math.h sin" c_sin :: Double -> Double
+foreign import ccall unsafe "math.h cos" c_cos :: Double -> Double
+foreign import ccall unsafe "math.h floor" c_floor :: Double -> Double
+foreign import ccall unsafe "math.h pow" c_pow :: Double -> Double -> Double
 
 stuck :: String -> a
 stuck msg = error ("stuck (ill-typed program?): " ++ msg)

@@ -76,6 +76,7 @@ def pTerm : Term ->{IO, Diverge, Panic} Unit =
     | EUnit -> print "()"
     | EBool(b) -> print (if b then "true" else "false")
     | ENum(neg, v, w) -> (case w of { Nil -> pNum neg v | _ -> print "(int "; print w; putc(' '); pNum neg v; putc(')') })
+    | EFloat(neg, v, x) -> print "(float "; pNum neg v; putc(' '); printInt x; putc(')')
     | EConvert(t, a) -> print "(as "; print t; putc(' '); pTerm (unbox a); putc(')')
     | EPrim(o, a, b) -> putc('('); print o; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
     | EIf(c, a, b) -> print "(if"; terms (Cons(unbox c, box Cons(unbox a, box Cons(unbox b, box Nil))))

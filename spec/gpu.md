@@ -1,10 +1,9 @@
 # Keel on the GPU: proposal
 
-**Status: proposal, nothing implemented.** Drafted 2026-10-30. Syntax in this file is a sketch
-and hasn't been through `keelc`; the parser, checker and back ends are unchanged.
+**Status: proposal; G1 partly implemented (f64).** Drafted 2026-10-30. Syntax in G2–G4 is a sketch
+and hasn't been through `keelc`; nothing of G2–G4 is implemented.
 
-Keel has no GPU target, no roadmap item for one, and no floating-point types (`spec/surface.md`,
-"Types"). This file proposes the smallest path from here to compute kernels written in Keel,
+Keel has no GPU target and no roadmap item for one. It has `f64` (G1, below) but not yet `f32`. This file proposes the smallest path from here to compute kernels written in Keel,
 in four steps that are each useful on their own.
 
 ## Fit with Keel's goals
@@ -80,6 +79,11 @@ Host side: `src/gpu.rs` (270 lines of Rust) creates buffers, binds them, dispatc
 on the quantiles.
 
 ## G1: floating point (CPU only)
+
+**Status: f64 implemented (2026-11-02)** as below, except: integer literals never become
+floats (write `1.0`), result values print as their bit pattern, `string.fromFloat` gives 17
+significant digits rather than the shortest form, and RV32 has no floats yet. `f32` is next: it
+needs a 4-byte array element kind that isn't sign- or zero-extended.
 
 Add `f32` and `f64` as base types of kind `Free`, beside `i8 … u64`.
 

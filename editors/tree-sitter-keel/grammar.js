@@ -48,11 +48,11 @@ module.exports = grammar({
       'handle', 'with', 'box', 'unbox', 'land', 'lor', 'lxor', 'lsl', 'lsr', 'as', 'Free', 'Lin',
     ),
     boolean: _ => choice('true', 'false'),
-    builtin_type: _ => choice('Box', 'Unit', 'Bool', ...intTypes),
+    builtin_type: _ => choice('Box', 'Unit', 'Bool', 'f64', ...intTypes),
 
-    number: _ => token(seq(
-      choice(/0x[0-9a-fA-F][0-9a-fA-F_]*/, /[0-9][0-9_]*/),
-      optional(choice(...intTypes)),
+    number: _ => token(choice(
+      seq(choice(/0x[0-9a-fA-F][0-9a-fA-F_]*/, /[0-9][0-9_]*/), optional(choice(...intTypes))),
+      /[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9][0-9_]*)?/,
     )),
     string: _ => /"([^"\\\n]|\\.)*"/,
     character: _ => /'([^'\\\n]|\\[^'\n]+)'/,

@@ -421,6 +421,9 @@ uses e = case e of
       RPerform2 _ _ a b -> av a ++ av b
       RCell k v -> av k ++ maybe [] av v
       RConv _ a -> av a
+      RFPrim _ a b -> av a ++ av b
+      RFOfInt _ a -> av a
+      RFloat _ as -> concatMap av as
       RArray _ _ as -> concatMap av as
       RIndex a i _ -> av a ++ av i
       RJoin a b -> av a ++ av b
@@ -1145,6 +1148,44 @@ rhsCode slots rhs = case rhs of
     -- Canonical values already have the right 64-bit pattern; narrow targets re-extend.
     atom slots "x0" a
     canonical to
+  -- f64 lives in general registers as its bits; d0 and d1 hold it for the operation.
+  RFPrim op a b -> do
+    atom slots "x9" a
+    atom slots "x10" b
+    ins "fmov d0, x9"
+    ins "fmov d1, x10"
+    case op of
+      Eq -> ins "fcmp d0, d1" >> ins "cset x0, eq"
+      Lt -> ins "fcmp d0, d1" >> ins "cset x0, mi" -- mi: less and ordered (NaN gives false)
+      Arith _ aop -> do
+        ins ((case aop of Add -> "fadd"; Sub -> "fsub"; Mul -> "fmul"; _ -> "fdiv") ++ " d0, d0, d1")
+        ins "fmov x0, d0"
+      _ -> error "float primitive"
+  RFOfInt it a -> do
+    atom slots "x9" a
+    ins ((if signed it then "scvtf" else "ucvtf") ++ " d0, x9")
+    ins "fmov x0, d0"
+  RFloat op as -> do
+    forM_ (zip ["x9", "x10"] as) $ \(r, a) -> atom slots r a
+    ins "fmov d0, x9"
+    when (length as > 1) (ins "fmov d1, x10")
+    case op of
+      -- fcvtz saturates to 64 bits with NaN giving 0; narrower types clamp on.
+      FToInt it@(IntTy sgn n) -> do
+        ins ((if sgn then "fcvtzs" else "fcvtzu") ++ " x0, d0")
+        when (n < 64) $ do
+          let (lo, hi) = intRange it
+          movImm "x9" hi
+          ins "cmp x0, x9"
+          ins ("csel x0, x0, x9, " ++ if sgn then "lt" else "lo")
+          when sgn $ do
+            movImm "x9" lo
+            ins "cmp x0, x9"
+            ins "csel x0, x0, x9, gt"
+      FGe -> ins "fcmp d0, d1" >> ins "cset x0, ge" -- ge: false when unordered
+      FSqrt -> ins "fsqrt d0, d0" >> ins "fmov x0, d0"
+      FLibm f -> ins ("bl _" ++ f) >> ins "fmov x0, d0"
+      _ -> error ("float operation " ++ show op ++ " is a copy")
   RPerform n a -> do
     atom slots "x1" a
     movImm "x0" (toInteger n)
@@ -1391,6 +1432,12 @@ emitPrinter decls printers lbl t = do
     TInt (IntTy sgn _) -> do
       ins "str x0, [sp]"
       l <- str (if sgn then "%lld" else "%llu")
+      address "x0" l
+      ins "bl _printf"
+    TFloat -> do
+      -- its IEEE bits, as the evaluator shows it
+      ins "str x0, [sp]"
+      l <- str "0x%llx"
       address "x0" l
       ins "bl _printf"
     TBool -> do

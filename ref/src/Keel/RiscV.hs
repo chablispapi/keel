@@ -57,7 +57,9 @@ compileRiscVFor :: Board -> Program -> Either String String
 compileRiscVFor board p = do
   let xlen = boardXlen board
   (decls, t, lp) <- prepareAt xlen False p
-  emitProgram board decls t lp
+  case [f | fun <- lMain lp : M.elems (lFuns lp), Bind _ (RFloat (FLibm f) _) _ <- subExprs (funBody fun)] of
+    f : _ -> Left ("not supported on this target: " ++ f ++ " (std.float's C library functions need a hosted target)")
+    [] -> emitProgram board decls t lp
 
 -- | The heap's and the stack's sizes in bytes. The Pico 2 has 520 KB of SRAM, which also holds
 -- the runtime's variables.
@@ -786,6 +788,53 @@ rhsCode slots rhs = case rhs of
   -- high half it had); a narrow one is the low word, re-extended.
   RConv to a | bits to == 64 -> wordSize >>= \w -> atom slots "a0" a >> when (w == 4) (atomHi slots "a1" a)
   RConv to a -> atom slots "a0" a >> canonical to
+  -- f64 (RV64 only) lives in integer registers as its bits; ft0 and ft1 hold it for the
+  -- operation (the trap handler saves them).
+  RFPrim op a b -> do
+    atom slots "t0" a
+    atom slots "t1" b
+    ins "fmv.d.x ft0, t0"
+    ins "fmv.d.x ft1, t1"
+    case op of
+      Eq -> ins "feq.d a0, ft0, ft1"
+      Lt -> ins "flt.d a0, ft0, ft1"
+      Arith _ aop -> do
+        ins ((case aop of Add -> "fadd.d"; Sub -> "fsub.d"; Mul -> "fmul.d"; _ -> "fdiv.d") ++ " ft0, ft0, ft1")
+        ins "fmv.x.d a0, ft0"
+      _ -> error "float primitive"
+  RFOfInt it a -> do
+    atom slots "t0" a
+    ins ((if signed it then "fcvt.d.l" else "fcvt.d.lu") ++ " ft0, t0")
+    ins "fmv.x.d a0, ft0"
+  RFloat op as -> do
+    forM_ (zip ["t0", "t1"] as) $ \(r, a) -> atom slots r a
+    ins "fmv.d.x ft0, t0"
+    case op of
+      -- fcvt saturates to 64 bits but gives the maximum for NaN: NaN is 0 here, as elsewhere;
+      -- narrower types clamp on.
+      FToInt it@(IntTy sgn n) -> do
+        lNum <- newLabel
+        ins ((if sgn then "fcvt.l.d" else "fcvt.lu.d") ++ " a0, ft0, rtz")
+        ins "feq.d t1, ft0, ft0"
+        ins ("bnez t1, " ++ lNum)
+        ins "li a0, 0"
+        line (lNum ++ ":")
+        when (n < 64) $ do
+          let (lo, hi) = intRange it
+          lHi <- newLabel
+          li "t1" hi
+          ins ((if sgn then "bge" else "bgeu") ++ " t1, a0, " ++ lHi)
+          ins "mv a0, t1"
+          line (lHi ++ ":")
+          when sgn $ do
+            lLo <- newLabel
+            li "t1" lo
+            ins ("bge a0, t1, " ++ lLo)
+            ins "mv a0, t1"
+            line (lLo ++ ":")
+      FGe -> ins "fmv.d.x ft1, t1" >> ins "fle.d a0, ft1, ft0"
+      FSqrt -> ins "fsqrt.d ft0, ft0" >> ins "fmv.x.d a0, ft0"
+      _ -> error ("float operation " ++ show op ++ " has no RISC-V code")
   -- Arrays: as in "Keel.AArch64".
   RArena True -> ins "call _keel_arena_open"
   RArena False -> ins "call _keel_arena_close"
@@ -1017,6 +1066,7 @@ emitPrinter decls printers lbl t = do
   let phys = physicalIndices (8 * w)
   case t of
     TInt (IntTy sgn n) -> ins ("call _keel_print_" ++ (if sgn then "i64" else "u64") ++ (if w == 4 && n == 64 then "w" else ""))
+    TFloat -> ins "call _keel_print_x64" -- its IEEE bits, as the evaluator shows it
     TBool -> do
       lFalse <- newLabel
       lDone <- newLabel
@@ -1177,10 +1227,13 @@ emitTrap handler = do
     [i] -> do
       let regs = "ra" : ["t" ++ show k | k <- [0 .. 6 :: Int]] ++ ["a" ++ show k | k <- [0 .. 7 :: Int]]
           hiWords = 32 `div` w -- _keel_hi's size
-          frame = 16 * (((length regs + 1 + hiWords) * w + 15) `div` 16)
+          fregs = if w == 8 then ["ft0", "ft1"] else [] -- f64 operands (RV64 only, with the FPU on)
+          fat k = show ((length regs + 1 + hiWords + k) * w) ++ "(sp)"
+          frame = 16 * (((length regs + 1 + hiWords + length fregs) * w + 15) `div` 16)
           at k = show (k * w) ++ "(sp)"
       ins ("addi sp, sp, -" ++ show frame)
       forM_ (zip [0 ..] regs) $ \(k, r) -> ins ("sd " ++ r ++ ", " ++ at k)
+      forM_ (zip [0 ..] fregs) $ \(k, r) -> ins ("fsd " ++ r ++ ", " ++ fat k)
       ins "csrr a1, mcause"
       ins "bgez a1, _keel_trap_fatal" -- an exception: mret would run the faulting instruction again
       let globals = (length regs, "_keel_handlers") : [(length regs + 1 + k, "_keel_hi+" ++ show (k * w)) | k <- [0 .. hiWords - 1]]
@@ -1190,6 +1243,7 @@ emitTrap handler = do
       ins ("call _kf_" ++ show i)
       forM_ globals $ \(k, g) -> ins ("ld t1, " ++ at k) >> ins ("la t0, " ++ g) >> ins "sd t1, 0(t0)"
       forM_ (zip [0 ..] regs) $ \(k, r) -> ins ("ld " ++ r ++ ", " ++ at k)
+      forM_ (zip [0 ..] fregs) $ \(k, r) -> ins ("fld " ++ r ++ ", " ++ fat k)
       ins ("addi sp, sp, " ++ show frame)
       ins "mret"
     _ -> ins "j _keel_trap_fatal"
@@ -1204,6 +1258,8 @@ emitStart printers t = do
   ins "la sp, _keel_stack_top"
   ins "la t0, _keel_trap"
   ins "csrw mtvec, t0"
+  rv64 <- (== 8) <$> wordSize
+  when rv64 $ ins "li t0, 0x2000" >> ins "csrs mstatus, t0" -- mstatus.FS = Initial: the FPU on
   ins "li a0, 0"
   ins "call _kf_main"
   ins "addi sp, sp, -16"
@@ -2075,6 +2131,32 @@ emitRuntime = do
   ins "sb a4, 0(a2)"
   ins "bnez a0, .L_u64_loop"
   ins "mv a0, a2"
+  ins "call _keel_print_str"
+  ins "ld ra, 40(sp)"
+  ins "addi sp, sp, 48"
+  ins "ret"
+
+  fn "_keel_print_x64" -- a0 = value, printed as 0x and hex digits (RV64)
+  ins "addi sp, sp, -48"
+  ins "sd ra, 40(sp)"
+  ins "addi a2, sp, 32"
+  ins "sb zero, 0(a2)"
+  line ".L_x64_loop:"
+  ins "andi a4, a0, 15"
+  ins "srli a0, a0, 4"
+  ins "addi a4, a4, 48"
+  ins "li a3, 58"
+  ins "blt a4, a3, .L_x64_digit"
+  ins "addi a4, a4, 39" -- past '9': a–f
+  line ".L_x64_digit:"
+  ins "addi a2, a2, -1"
+  ins "sb a4, 0(a2)"
+  ins "bnez a0, .L_x64_loop"
+  ins "li a4, 120" -- 'x'
+  ins "sb a4, -1(a2)"
+  ins "li a4, 48" -- '0'
+  ins "sb a4, -2(a2)"
+  ins "addi a0, a2, -2"
   ins "call _keel_print_str"
   ins "ld ra, 40(sp)"
   ins "addi sp, sp, 48"

@@ -10,7 +10,9 @@
 -- > main = ...
 module Keel.Parser (parseProgram, parseModule, parseLibrary) where
 
+import Control.Monad (when)
 import Data.Char (isUpper)
+import Data.Maybe (fromMaybe)
 import Data.Functor (($>))
 import Data.Set qualified as S
 import Keel.Syntax
@@ -112,25 +114,38 @@ intTypes = [("i8", i8), ("i16", i16), ("i32", i32), ("i64", i64), ("u8", u8), ("
 -- literal is @-@ before a number at the start of an operand (see 'appE'), so @n -1@ still
 -- means @n - 1@.
 number :: Parser Term
-number = Tok.lexeme lexer $ try $ do
-  n <- hex <|> decimal
-  suffix <- optionMaybe (choice [try (string s <* notFollowedBy alphaNum) $> t | (s, t) <- intTypes])
-  notFollowedBy alphaNum
-  pure (maybe (NumLit Nothing n) (`IntLit` n) suffix)
+number = Tok.lexeme lexer $ try (floating <|> integer)
   where
     hex = try (string "0x") >> digitsIn 16 hexDigit
     decimal = digitsIn 10 digit
-    digitsIn base d = do
+    digitsIn base d = fst <$> digitsCount base d
+    -- The value and how many digits.
+    digitsCount base d = do
       ds <- (:) <$> d <*> many (d <|> (char '_' >> d))
-      pure (foldl (\acc c -> acc * base + toInteger (digitValue c)) 0 ds)
+      pure (foldl (\acc c -> acc * base + toInteger (digitValue c)) 0 ds, toInteger (length ds))
     digitValue c
       | c >= 'a' = fromEnum c - fromEnum 'a' + 10
       | c >= 'A' = fromEnum c - fromEnum 'A' + 10
       | otherwise = fromEnum c - fromEnum '0'
+    -- @1.5@, @2.0@, @1e-30@: a fraction, an exponent or both; f64.
+    floating = try $ do
+      (n, _) <- digitsCount 10 digit
+      frac <- optionMaybe (try (char '.' >> digitsCount 10 digit))
+      ex <- optionMaybe (try (oneOf "eE" >> (option id (char '-' $> negate <|> char '+' $> id) <*> decimal)))
+      when (frac == Nothing && ex == Nothing) (fail "not a float")
+      notFollowedBy alphaNum
+      let (f, k) = fromMaybe (0, 0) frac
+      pure (FloatLit (n * 10 ^ k + f) (fromMaybe 0 ex - k))
+    integer = do
+      n <- hex <|> decimal
+      suffix <- optionMaybe (choice [try (string s <* notFollowedBy alphaNum) $> t | (s, t) <- intTypes])
+      notFollowedBy alphaNum
+      pure (maybe (NumLit Nothing n) (`IntLit` n) suffix)
 
 negative :: Term -> Term
 negative (NumLit t n) = NumLit t (negate n)
 negative (IntLit t n) = IntLit t (negate n)
+negative (FloatLit m e) = FloatLit (negate m) e
 negative e = e
 
 -- Declarations ------------------------------------------------------------------------------
@@ -321,6 +336,7 @@ atomTy =
     <|> parens tuple
   where
     tuple = do a <- ty; option a (comma >> TPair a <$> tuple)
+    named "f64" = TFloat
     named n = maybe (TVar n) TInt (lookup n intTypes)
 
 -- Expressions -----------------------------------------------------------------------------
@@ -413,7 +429,7 @@ cmpE = do
     swapped x y
       | plain x && plain y = Prim Lt y x
       | otherwise = Let "l%" x (Let "r%" y (Prim Lt (Var "r%") (Var "l%")))
-    plain e = case stripAt e of Var _ -> True; IntLit _ _ -> True; NumLit _ _ -> True; _ -> False
+    plain e = case stripAt e of Var _ -> True; IntLit _ _ -> True; NumLit _ _ -> True; FloatLit _ _ -> True; _ -> False
 
 addE, mulE :: Parser Term
 addE = chainl1 mulE (arithOp [("+", Add), ("-", Sub)])
@@ -423,12 +439,13 @@ mulE = chainl1 convE (arithOp [("*", Mul)] <|> divOp <|> bitOp)
 divOp :: Parser (Term -> Term -> Term)
 divOp = (op "/" $> Prim (Arith Checked Div)) <|> (op "%" $> Prim (Arith Checked Rem))
 
--- | @e as u8@: wrapping integer conversion, binding tighter than the operators.
+-- | @e as u8@: wrapping integer conversion, binding tighter than the operators. @e as f64@
+-- converts an integer to a float; @e as ι@ of a float is sorted out by inference.
 convE :: Parser Term
 convE = do
   e <- appE
-  ts <- many (reserved "as" >> choice [try (do n <- lower; maybe (unexpected n) pure (lookup n intTypes))])
-  pure (foldl (flip Convert) e ts)
+  ts <- many (reserved "as" >> choice [try (do n <- lower; maybe (if n == "f64" then pure Nothing else unexpected n) (pure . Just) (lookup n intTypes))])
+  pure (foldl (\x t -> maybe (FloatPrim FOfInt [x]) (`Convert` x) t) e ts)
 
 -- | Bitwise operators, written as words (as in OCaml) since @&@ is a borrow.
 bitOp :: Parser (Term -> Term -> Term)

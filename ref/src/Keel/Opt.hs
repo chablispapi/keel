@@ -65,6 +65,7 @@ thinPositions (Program decls main) = Program [thinDecl d | d <- decls] (thin mai
       Proj {} -> True
       Handle {} -> True
       Convert {} -> True
+      FloatPrim {} -> True
       Con _ _ (_ : _) -> True
       _ -> False
 
@@ -296,6 +297,8 @@ simplify (Program decls main) = evalState go (0 :: Int)
       UnitLit -> True
       BoolLit _ -> True
       IntLit _ _ -> True
+      FloatLit _ _ -> True
+      FloatPrim FFromBits [b] | IntLit _ _ <- stripAt b -> True
       Con _ _ [] -> True
       ArrayPrim AEmpty _ [] -> True
       _ -> False

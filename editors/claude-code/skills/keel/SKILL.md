@@ -84,6 +84,10 @@ main = printInt (area (Rect(3, 4))); putc('\n'); 0
   newline). Numbers become text with `string.fromInt n`.
 - **Integers:** widths are inferred from context, otherwise `i64`. Convert with `e as u8`, which
   wraps. Use `+%` to wrap, `+|` to saturate, `+?` to get an `Option`.
+- **Floats:** `f64` only, with literals `1.5`, `2.0`, `1e-9`. `+ - * /` and comparisons never
+  panic (IEEE: `inf`, `NaN`). Convert with `n as f64` and `x as i64` (truncates, saturates).
+  `import std.float` for `float.sqrt`, `abs`, `min`, `max`, `isNaN`, and on hosted targets
+  `exp`, `log`, `pow`, `sin`, `cos`, `floor`. Print with `string.fromFloat x`. Not on RV32.
 
 ## Mistakes you will make
 
@@ -104,6 +108,9 @@ Each of these has tripped up someone who had the spec open:
 | `if c then a else b; e` meaning `else (b; e)` | `;` binds looser than `if`, so `e` runs after either branch; often `expected Unit, got …` on the `then` branch | parenthesize the branch: `else (b; e)` |
 | `bitdata R : u8 { a @ 0, b @ 5 }` | parse error at the `,` | separate fields with `;`: `{ a @ 0 ; b @ 5 }` |
 | `!Alloc` on every arrow, as in `i64 ->{!Alloc} i64 ->{!Alloc} i64` | `only its last parameter's arrow can be !Alloc` | only the last: `i64 -> i64 ->{!Alloc} i64` |
+| `x + 1` or `x * 2` with `x : f64` | `expected f64, got an integer` | `x + 1.0`: an integer literal is never a float |
+| `x % 2.0`, `x +% y` or `x land y` on `f64` | `f64 has only + - * / and comparisons` | `x - float.floor (x / 2.0) * 2.0` for a remainder (hosted) |
+| `printInt x` or `out(x)` with `x : f64` | `expected i64, got f64` | `println (string.fromFloat x)`, or `out(x as i64)` |
 | `n + 1` with `cell n : u32` | `cell n is read with get(n) and written with set(n, v)` | `get(n) + 1`: a cell isn't a value |
 | `cell total : i64` | `a cell holds an integer of up to 32 bits, or a usize` | `u32`, `i32` or `usize` |
 | `def interrupt` doing `out(…)` when `main` never prints | `def interrupt has effects {IO} that main doesn't` | `main` must have the handler's effects: give it the operation too, or drop it from the handler |

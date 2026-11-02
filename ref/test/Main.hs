@@ -68,6 +68,11 @@ positionCases =
   , ("position: an interrupt handler with effects main lacks", "def interrupt : usize ->{IO, !Alloc} Unit = \\c. out(1)\nmain = 0\n", Unhandled, (1, 45))
   , ("position: a cell used as a value", "cell n : u32\nmain = n + 1\n", Mismatch, (2, 8))
   , ("position: !Alloc on an early arrow", "def add : i64 ->{!Alloc} i64 ->{Panic, !Alloc} i64 = \\a b. a + b\nmain = add 1 2\n", EffectMismatch, (1, 54))
+  , ("position: % on f64", "def f : f64 -> f64 = \\x. x % 2.0\nmain = 0\n", Mismatch, (1, 26))
+  , ("position: +% on f64", "def f : f64 -> f64 = \\x. x +% 1.0\nmain = 0\n", Mismatch, (1, 26))
+  , ("position: a bit operation on f64", "def f : f64 -> f64 = \\x. x land 1.0\nmain = 0\n", Mismatch, (1, 26))
+  , ("position: an integer literal as f64", "def f : f64 -> f64 = \\x. x + 1\nmain = 0\n", Mismatch, (1, 30))
+  , ("position: f64 converted to f64", "def f : f64 -> f64 = \\x. x as f64\nmain = 0\n", Mismatch, (1, 26))
   , ("position: integer used as a condition", "main =\n  let x = 5 in\n  if x then 1 else 2\n", Mismatch, (3, 6))
   , ( "position: reference captured by a closure"
     , "main = var x = 1 in let g = \\u. x in g ()\n"

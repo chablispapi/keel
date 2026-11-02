@@ -31,6 +31,71 @@ def fromInt : i64 ->{Diverge, Panic} List u8 =
   \n. if n < 0 then Cons(45, box (digitsOnto (((0 - (n + 1)) as u64) + 1) Nil))
       else digitsOnto (n as u64) Nil
 
+-- Decimal, to 17 significant digits (enough to read the same f64 back) without trailing
+-- zeros: 1.5, -0.25, 100, 0.001, 1.2345e-7, 6.02214076e23, inf, nan. Plain notation from
+-- 0.00001 up to 17 digits before the point, scientific otherwise.
+-- ponytail: scales with one multiplication or division by an exact power of ten (a few for
+-- exponents beyond ±22), so the 17th digit can be one off from C's %.17g, the same on every
+-- target; port Ryu for exact shortest output.
+def fromFloat : f64 ->{Diverge, Panic} List u8 =
+  \x. if x != x then "nan"
+      else if (floatToBits x) lsr 63 == 1 then Cons(45, box (magnitude (0.0 - x)))
+      else magnitude x
+
+private def magnitude : f64 ->{Diverge, Panic} List u8 =
+  \x. if x == 0.0 then "0"
+      else if x == floatFromBits 0x7ff0_0000_0000_0000 then "inf"
+      else
+        let (m, e) = digitsAt x (estimate x 0) in
+        layout (reverse (dropZeros (reverse (digitsOnto m Nil)))) e
+
+-- About where x's first digit is: 10^e.
+private def estimate : f64 -> i64 ->{Diverge, Panic} i64 =
+  \y e. if y >= 10.0 then estimate (y / 10.0) (e + 1) else if y < 1.0 then estimate (y * 10.0) (e - 1) else e
+
+-- x's 17 significant digits as an integer, and the power of ten of the first one.
+private def digitsAt : f64 -> i64 ->{Diverge, Panic} (u64, i64) =
+  \x e.
+    let y = scaleBy x (16 - e) in
+    if y >= 1e17 then digitsAt x (e + 1) else if y < 1e16 then digitsAt x (e - 1) else (y as u64, e)
+
+-- x·10^s; every f64 in [1e16, 1e17) is an integer.
+private def scaleBy : f64 -> i64 ->{Diverge, Panic} f64 =
+  \x s. if s > 22 then scaleBy (x * 1e22) (s - 22)
+        else if s < -22 then scaleBy (x / 1e22) (s + 22)
+        else if s >= 0 then x * pow10 s 1.0
+        else x / pow10 (0 - s) 1.0
+
+-- 10^k, exact for k ≤ 22.
+private def pow10 : i64 -> f64 ->{Diverge, Panic} f64 = \k acc. if k < 1 then acc else pow10 (k - 1) (acc * 10.0)
+
+private def dropZeros : List u8 ->{Diverge} List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == 48 then dropZeros (unbox rest) else Cons(c, rest) }
+
+-- Digits d₁d₂… with d₁ in the 10^e place.
+private def layout : List u8 -> i64 ->{Diverge, Panic} List u8 =
+  \ds e.
+    if e >= 17 || e < -5 then
+      (case ds of
+        { Nil -> Nil
+        | Cons(d, rest) ->
+            let r = unbox rest in
+            let tail = Cons(101, box (fromInt e)) in
+            case r of { Nil -> Cons(d, box tail) | _ -> Cons(d, box Cons(46, box (append r tail))) } })
+    else if e < 0 then Cons(48, box Cons(46, box (zerosOnto (0 - e - 1) ds)))
+    else whole ds e
+
+-- The digits for 10^e down to 10^0 (zeros past the end), then a point and the rest, if any.
+private def whole : List u8 -> i64 ->{Diverge, Panic} List u8 =
+  \ds e. case ds of
+    { Nil -> zerosOnto (e + 1) Nil
+    | Cons(d, rest) ->
+        if e == 0 then (case unbox rest of { Nil -> Cons(d, box Nil) | r -> Cons(d, box Cons(46, box r)) })
+        else Cons(d, box (whole (unbox rest) (e - 1))) }
+
+private def zerosOnto : i64 -> List u8 ->{Diverge, Panic} List u8 =
+  \n acc. if n < 1 then acc else zerosOnto (n - 1) (Cons(48, box acc))
+
 private def digitsValue : i64 -> List u8 ->{Diverge, Panic} Option i64 =
   \acc s. case s of
     { Nil -> Some(acc)

@@ -70,7 +70,7 @@ buildRiscV tools board out asm = do
       ld = out <.> "ld"
       arch
         | boardXlen board == 32 = ["--target=riscv32-unknown-elf", "-march=rv32imac", "-mabi=ilp32"]
-        | otherwise = ["--target=riscv64-unknown-elf", "-march=rv64imac", "-mabi=lp64"]
+        | otherwise = ["--target=riscv64-unknown-elf", "-march=rv64imafdc", "-mabi=lp64"]
   writeFile s asm
   writeFile ld (linkerScript board)
   (c1, _, e1) <- readProcessWithExitCode (toolClang tools) (arch ++ ["-mno-relax", "-c", s, "-o", o]) ""

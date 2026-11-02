@@ -269,6 +269,10 @@
     "named": false
   },
   {
+    "type": "f64",
+    "named": false
+  },
+  {
     "type": "false",
     "named": false
   },

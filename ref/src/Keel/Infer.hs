@@ -282,6 +282,10 @@ check env tm expected = do
     (Lam x t b, TFun p e r) -> lamAgainst Lam x t b p e r
     (Lam x t b, TLFun p e r) -> lamAgainst Lam x t b p e r
     (NumLit Nothing n, TInt _) -> pure (NumLit (Just ex) n, S.empty)
+    (If c (BoolLit False) (BoolLit True), _) | Just _ <- notLess c -> do
+      (tm', t, eff) <- infer env tm
+      rel True t ex
+      pure (tm', eff)
     (Con c [] args, TData d tys) | Just (d', _) <- M.lookup c (sCons sig), d == d' -> conTerm c tys args
     (Cocase d [] bs, TData d' tys) | d == d' -> cocaseTerm d tys bs
     (If c a b, _) -> do
@@ -408,6 +412,7 @@ infer env tm = case tm of
         elemTy <- freshTy
         pure (ArrayPrim AEmpty elemTy [], TData "Array" [elemTy], S.empty)
     | Just op <- lookup x arrayOps -> arrayArity op >>= \n -> failWith Mismatch (x ++ " must be applied to its " ++ show n ++ " arguments (std.array has it as a function)")
+    | Just op <- lookup x floatOps -> failWith Mismatch (x ++ " must be applied to its " ++ show (length (fst (floatOpType op))) ++ " arguments (std.float has it as a function)")
     | otherwise -> failWith Unbound x
   TyApp f tys effs -> case M.lookup f (sDefs sig) of
     Just (TForall vs es body) | length tys == length vs -> do
@@ -426,20 +431,39 @@ infer env tm = case tm of
       _ -> pure ()
     pure (NumLit (Just m) n, m, S.empty)
   NumLit (Just t) _ -> pure (tm, t, S.empty)
+  FloatLit _ _ -> pure (tm, TFloat, S.empty)
   Convert to e -> do
     (e', te, ee) <- infer env e
     zt <- zonk te
     case zt of
-      TInt _ -> pure ()
-      TMeta _ -> pure () -- a literal: defaults to i64
+      TInt _ -> pure (Convert to e', TInt to, ee)
+      TMeta _ -> pure (Convert to e', TInt to, ee) -- a literal: defaults to i64
+      TFloat -> pure (FloatPrim (FToInt to) [e'], TInt to, ee)
       _ -> failWith Mismatch ("conversion of non-integer " ++ prettyTy zt)
-    pure (Convert to e', TInt to, ee)
+  FloatPrim FOfInt [e] -> do
+    (e', te, ee) <- infer env e
+    zt <- zonk te
+    case zt of
+      TInt _ -> pure (FloatPrim FOfInt [e'], TFloat, ee)
+      TMeta _ -> pure (FloatPrim FOfInt [e'], TFloat, ee)
+      TFloat -> failWith Mismatch "e as f64: e is already f64"
+      _ -> failWith Mismatch ("conversion of non-integer " ++ prettyTy zt)
+  -- a >= b and a <= b, which the parser wrote as not (a < b): at f64, IEEE's >=.
+  FloatPrim FGe [a, b] -> do
+    (a', ta, ea) <- infer env a
+    (b', eb) <- check env b ta
+    za <- zonk ta
+    pure (if za == TFloat then FloatPrim FGe [a', b'] else If (Prim Lt a' b') (BoolLit False) (BoolLit True), TBool, S.union ea eb)
+  If c (BoolLit False) (BoolLit True) | Just ge <- notLess c -> infer env ge
+  FloatPrim op args -> infer env (foldl App (Var (concat [n | (n, o) <- floatOps, o == op])) args)
   Prim op a b -> do
     (a', ta, ea) <- infer env a
     (b', eb) <- check env b ta
+    za <- zonk ta
     let (t, extra) = case op of
           Eq -> (TBool, S.empty)
           Lt -> (TBool, S.empty)
+          Arith Checked _ | za == TFloat -> (ta, S.empty) -- IEEE: inf and NaN, no panics
           Arith Checked _ -> (ta, S.singleton panicE)
           Arith Optional _ -> (TData "Option" [ta], S.empty)
           Arith _ _ -> (ta, S.empty)
@@ -503,6 +527,16 @@ infer env tm = case tm of
         case call of
           App f' _ -> pure (ArrayPrim AArena r [f'], r, eff)
           _ -> failWith Mismatch "arena takes a function of Unit: arena (\\u. e)"
+  App _ _
+    | (Var x, args) <- appSpine tm
+    , Nothing <- M.lookup x (eLocals env)
+    , not (M.member x (sDefs sig))
+    , Just op <- lookup x floatOps -> do
+        let (tys, r) = floatOpType op
+        when (length args /= length tys) $
+          failWith Mismatch (x ++ " takes " ++ show (length tys) ++ " arguments, given " ++ show (length args))
+        rs <- zipWithM (check env) args tys
+        pure (FloatPrim op (map fst rs), r, S.unions (map snd rs))
   App _ _
     | (Var x, args) <- appSpine tm
     , Nothing <- M.lookup x (eLocals env)
@@ -643,6 +677,16 @@ infer env tm = case tm of
       (x', t) <- local env x
       rel False p (refTy t)
       pure (ctor x', S.empty)
+
+-- | The parser's @a >= b@ and @a <= b@: @not (a < b)@ (its branches are bare literals, which
+-- no written @if@ has), possibly with the operands bound first. 'FGe' in place of the
+-- comparison; inference turns it back for integers.
+notLess :: Term -> Maybe Term
+notLess c = case c of
+  At p e -> At p <$> notLess e
+  Let x e b -> Let x e <$> notLess b
+  Prim Lt a b -> Just (FloatPrim FGe [a, b])
+  _ -> Nothing
 
 -- Finishing -------------------------------------------------------------------------------
 

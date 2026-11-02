@@ -16,9 +16,9 @@ data Ty =
   | TForall(List (List u8, List u8), List (List u8), Box Ty) | TRef(Box Ty) | TMut(Box Ty)
 
 -- Names are byte strings. A number is its sign, magnitude and width suffix ("" when the
--- width is inferred); characters are u8 numbers.
+-- width is inferred); characters are u8 numbers. A float is its sign and m·10^e, as written.
 data Term =
-    EVar(List u8) | EUnit | EBool(Bool) | ENum(Bool, u64, List u8)
+    EVar(List u8) | EUnit | EBool(Bool) | ENum(Bool, u64, List u8) | EFloat(Bool, u64, i64)
   | EConvert(List u8, Box Term) | EPrim(List u8, Box Term, Box Term)
   | EIf(Box Term, Box Term, Box Term) | ELam(List u8, Ty, Box Term) | EApp(Box Term, Box Term)
   | ELet(List u8, Box Term, Box Term) | ELetPair(List u8, List u8, Box Term, Box Term)
@@ -310,7 +310,7 @@ private def atomTy : List Token ->{Diverge, Panic} (Ty, List Token) =
        if symIs "," ts then (let (b, ts) = tyTuple (next ts) in (TPair(box a, box b), expect ")" ts))
        else (a, expect ")" ts))
     else case tok ts of
-      { Ident(n) -> (if isIntTy n then TInt(n) else TVar(n), next ts)
+      { Ident(n) -> (if isIntTy n || string.equal n "f64" then TInt(n) else TVar(n), next ts)
       | _ -> (TUnit, fail "expected a type" ts) }
 
 private def isIntTy : List u8 ->{Diverge} Bool =
@@ -429,7 +429,7 @@ private def swapped : Term -> Term -> Term =
     if plain a && plain b then EPrim("<", box b, box a)
     else ELet("l%", box a, box ELet("r%", box b, box EPrim("<", box EVar("r%"), box EVar("l%"))))
 
-private def plain : Term -> Bool = \e. case e of { EVar(x) -> true | ENum(n, v, w) -> true | _ -> false }
+private def plain : Term -> Bool = \e. case e of { EVar(x) -> true | ENum(n, v, w) -> true | EFloat(n, v, x) -> true | _ -> false }
 
 private def addE : List Token ->{Diverge, Panic} (Term, List Token) =
   \ts. let (a, ts) = mulE ts in addRest a ts
@@ -462,7 +462,7 @@ private def convRest : Term -> List Token ->{Diverge, Panic} (Term, List Token) 
   \e ts.
     if kwIs "as" ts then
       (case tok (next ts) of
-        { Ident(t) -> if isIntTy t then convRest (EConvert(t, box e)) (next (next ts)) else (e, fail "expected an integer type" (next ts))
+        { Ident(t) -> if isIntTy t || string.equal t "f64" then convRest (EConvert(t, box e)) (next (next ts)) else (e, fail "expected an integer type" (next ts))
         | _ -> (e, fail "expected an integer type" (next ts)) })
     else (e, ts)
 
@@ -472,7 +472,7 @@ private def appE : List Token ->{Diverge, Panic} (Term, List Token) =
       if kwIs "box" ts then (let (e, ts) = postfix (next ts) in (EBox(box e), ts))
       else if kwIs "unbox" ts then (let (e, ts) = postfix (next ts) in (EUnbox(box e), ts))
       else if symIs "-" ts then
-        (case tok (next ts) of { Num(v, w) -> (ENum(true, v, w), next (next ts)) | _ -> postfix ts })
+        (case tok (next ts) of { Num(v, w) -> (ENum(true, v, w), next (next ts)) | Flt(v, x) -> (EFloat(true, v, x), next (next ts)) | _ -> postfix ts })
       else postfix ts in
     args h ts
 
@@ -492,7 +492,7 @@ private def borrow : List Token ->{Diverge} (Term, List Token) =
 
 private def startsAtom : List Token ->{Diverge} Bool =
   \ts. case tok ts of
-    { Str(s) -> true | Char(c) -> true | Num(v, w) -> true | Ident(x) -> true | Upper(x) -> true
+    { Str(s) -> true | Char(c) -> true | Num(v, w) -> true | Flt(v, x) -> true | Ident(x) -> true | Upper(x) -> true
     | Keyword(w) -> member w (string.split ' ' "true false case cocase")
     | Sym(s) -> string.equal s "("
     | _ -> false }
@@ -519,6 +519,7 @@ private def atom : List Token ->{Diverge, Panic} (Term, List Token) =
     { Str(s) -> (strTerm s, next ts)
     | Char(c) -> (ENum(false, c as u64, "u8"), next ts)
     | Num(v, w) -> (ENum(false, v, w), next ts)
+    | Flt(v, x) -> (EFloat(false, v, x), next ts)
     | Keyword(w) ->
         if string.equal w "true" then (EBool(true), next ts)
         else if string.equal w "false" then (EBool(false), next ts)

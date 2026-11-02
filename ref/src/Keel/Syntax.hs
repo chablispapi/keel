@@ -48,6 +48,7 @@ data Ty
   = TUnit
   | TBool
   | TInt IntTy
+  | TFloat           -- ^ f64, IEEE 754 double
   | TFun Ty Eff Ty   -- ^ τ →ε σ, free closure
   | TLFun Ty Eff Ty  -- ^ τ ⊸ε σ, linear closure
   | TData String [Ty] -- ^ data or codata type applied to type arguments
@@ -78,6 +79,38 @@ data BitOp = And | Or | Xor | Shl | Shr
 
 data Prim = Arith Overflow ArithOp | Bits BitOp | Eq | Lt
   deriving (Eq, Show)
+
+-- | Operations on f64 besides 'Prim' (whose checked @+ - * /@, @==@ and @<@ also take f64,
+-- with IEEE semantics and no panics). 'FOfInt' is @e as f64@ from any integer type, rounding
+-- to nearest; 'FToInt' is @e as ι@ from f64, truncating and saturating, NaN giving 0. The
+-- libm functions call the C library: hosted targets only. 'FGe' is @a >= b@ (and @b <= a@),
+-- false when either is NaN: the parser writes those as @not (a < b)@, which "Keel.Infer"
+-- turns into 'FGe' at f64.
+data FloatOp = FOfInt | FToInt IntTy | FSqrt | FToBits | FFromBits | FLibm String | FGe
+  deriving (Eq, Show)
+
+-- | A float literal's value, correctly rounded.
+floatValue :: Integer -> Integer -> Double
+floatValue m e = fromRational (if e >= 0 then fromInteger (m * 10 ^ e) else fromInteger m / fromInteger (10 ^ negate e))
+
+-- | The names float operations are written with, applied to all their arguments; "std.float"
+-- wraps them as ordinary functions.
+floatOps :: [(String, FloatOp)]
+floatOps =
+  [("floatSqrt", FSqrt), ("floatToBits", FToBits), ("floatFromBits", FFromBits)]
+    ++ [("float" ++ n, FLibm f) | (n, f) <- [("Exp", "exp"), ("Log", "log"), ("Sin", "sin"), ("Cos", "cos"), ("Pow", "pow"), ("Floor", "floor")]]
+
+-- | A float operation's argument types and result type (all pure). 'FOfInt' takes any integer:
+-- the checker sees to it.
+floatOpType :: FloatOp -> ([Ty], Ty)
+floatOpType op = case op of
+  FOfInt -> ([TInt i64], TFloat)
+  FToInt i -> ([TFloat], TInt i)
+  FToBits -> ([TFloat], TInt u64)
+  FFromBits -> ([TInt u64], TFloat)
+  FLibm "pow" -> ([TFloat, TFloat], TFloat)
+  FGe -> ([TFloat, TFloat], TBool)
+  _ -> ([TFloat], TFloat)
 
 -- | Operations on the built-in @Array a@ (M5): a growable array of one-word elements, updated
 -- in place when the array is not shared and copied when it is (spec/memory.md).
@@ -113,6 +146,8 @@ data Term
   | IntLit IntTy Integer
   | NumLit (Maybe Ty) Integer -- ^ literal whose width is inferred, front end only
   | Convert IntTy Term        -- ^ e as ι: wrapping conversion between integer types
+  | FloatLit Integer Integer  -- ^ m·10^e, as written: @1.50@ is 150·10^-2
+  | FloatPrim FloatOp [Term]  -- ^ a float operation applied to all its arguments
   | BoolLit Bool
   | Prim Prim Term Term
   | ArrayPrim ArrayOp Ty [Term] -- ^ an array operation at an element type, applied to all its arguments
@@ -160,6 +195,7 @@ children :: Term -> [Term]
 children tm = case tm of
   Prim _ a b -> [a, b]
   ArrayPrim _ _ as -> as
+  FloatPrim _ as -> as
   If c a b -> [c, a, b]
   Lam _ _ b -> [b]
   LLam _ _ b -> [b]
@@ -187,6 +223,7 @@ descend :: (Term -> Term) -> Term -> Term
 descend f tm = case tm of
   Prim op a b -> Prim op (f a) (f b)
   ArrayPrim op t as -> ArrayPrim op t (map f as)
+  FloatPrim op as -> FloatPrim op (map f as)
   If c a b -> If (f c) (f a) (f b)
   Lam x t b -> Lam x t (f b)
   LLam x t b -> LLam x t (f b)
@@ -214,6 +251,7 @@ descendM :: (Monad m) => (Term -> m Term) -> Term -> m Term
 descendM f tm = case tm of
   Prim op a b -> Prim op <$> f a <*> f b
   ArrayPrim op t as -> ArrayPrim op t <$> mapM f as
+  FloatPrim op as -> FloatPrim op <$> mapM f as
   If c a b -> If <$> f c <*> f a <*> f b
   Lam x t b -> Lam x t <$> f b
   LLam x t b -> LLam x t <$> f b
@@ -295,6 +333,7 @@ resolveWord w (Program decls main) = Program (map decl decls) (term main)
     term tm = descend term $ case tm of
       IntLit i n -> IntLit (it i) n
       Convert i e -> Convert (it i) e
+      FloatPrim (FToInt i) as -> FloatPrim (FToInt (it i)) as
       Lam x t b -> Lam x (ty t) b
       LLam x t b -> LLam x (ty t) b
       Con c ts as -> Con c (map ty ts) as
@@ -325,6 +364,7 @@ prettyTy t = case t of
   TUnit -> "Unit"
   TBool -> "Bool"
   TInt (IntTy False 0) -> "usize"
+  TFloat -> "f64"
   TInt (IntTy s n) -> (if s then "i" else "u") ++ show n
   TFun a e b -> paren a ++ " →" ++ prettyRow e ++ " " ++ prettyTy b
   TLFun a e b -> paren a ++ " ⊸" ++ prettyRow e ++ " " ++ prettyTy b

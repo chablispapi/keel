@@ -32,6 +32,7 @@ ty t = case t of
   TUnit -> "Unit"
   TBool -> "Bool"
   TInt it -> intTy it
+  TFloat -> "f64"
   TFun a e b -> list ["->", ty a, list (S.toList e), ty b]
   TLFun a e b -> list ["-o", ty a, list (S.toList e), ty b]
   TData n [] -> n
@@ -51,6 +52,9 @@ term tm = case tm of
   IntLit it n -> list ["int", intTy it, show n]
   NumLit _ n -> show n
   Convert it e -> list ["as", intTy it, term e]
+  FloatLit m e -> list ["float", show m, show e]
+  FloatPrim FOfInt [e] -> list ["as", "f64", term e]
+  FloatPrim {} -> error "the parser makes no other float primitives"
   BoolLit b -> if b then "true" else "false"
   Prim p a b -> list [prim p, term a, term b]
   ArrayPrim {} -> error "the parser makes no array primitives"

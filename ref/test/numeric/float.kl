@@ -1,0 +1,79 @@
+-- f64 on every 64-bit target: arithmetic, IEEE comparisons, saturating conversions, sqrt,
+-- arrays and data holding floats, and string.fromFloat. The result prints as its bits.
+import std.float
+import std.string
+import std.array
+
+data Point = P(f64, f64)
+
+def norm : Point -> f64 = \p. case p of { P(x, y) -> float.sqrt (x * x + y * y) }
+
+def sumFrom : Array f64 -> i64 -> f64 ->{Panic, Diverge} f64 =
+  \xs i acc. if i == array.length xs then acc else sumFrom xs (i + 1) (acc + array.get xs i)
+
+def show : f64 ->{IO, Diverge, Panic} Unit = \x. println (string.fromFloat x)
+
+def flag : Bool ->{IO} Unit = \b. out(if b then 1 else 0)
+
+main =
+  let nan = float.nan in
+  let inf = float.infinity in
+  -- arithmetic and printing
+  show (0.1 + 0.2);
+  show 1.5;
+  show (-0.25);
+  show 100.0;
+  show 0.001;
+  show 1.2345e-7;
+  show 6.02214076e23;
+  show (1.0 / 3.0);
+  show (2.0 / 0.0);
+  show (-1.0 / 0.0);
+  show (0.0 / 0.0);
+  show (0.0 - 0.0);
+  show (-0.0);
+  show 123456789012345678.0;
+  show 5e-324;
+  show 1.7976931348623157e308;
+  -- comparisons: NaN is unordered
+  flag (nan == nan);
+  flag (nan != nan);
+  flag (nan < 1.0);
+  flag (nan >= 1.0);
+  flag (1.0 < inf);
+  flag (-0.0 == 0.0);
+  flag (2.5 <= 2.5);
+  flag (float.isNaN (inf - inf));
+  -- conversions: truncate, saturate, NaN gives 0
+  out(2.9 as i64);
+  out(-2.9 as i64);
+  out(1e30 as i64);
+  out(-1e30 as i64);
+  out(nan as i64);
+  out((1e30 as u64) as i64);
+  out((-5.0 as u64) as i64);
+  out((1e19 as u64 / 1000) as i64);
+  out((300.5 as u8) as i64);
+  out((-300.5 as i8) as i64);
+  out((70000.0 as i16) as i64);
+  out((-1.0 as u32) as i64);
+  out((5e9 as u32) as i64);
+  out((-5e9 as i32) as i64);
+  show (9007199254740993 as f64);
+  show (18446744073709551615u64 as f64);
+  show (-9223372036854775807 as f64);
+  show (255u8 as f64);
+  -- bits, sqrt, abs, min, max
+  out((float.toBits 1.0) as i64);
+  show (float.fromBits 0x4009_21fb_5444_2d18);
+  show (float.sqrt 2.0);
+  show (float.sqrt (-1.0));
+  show (float.abs (-3.5));
+  show (float.min 2.0 (-7.0));
+  show (float.max 2.0 nan);
+  -- data and arrays
+  show (norm (P(3.0, 4.0)));
+  let xs = array.push (array.push (array.push array.empty 0.5) 0.25) 0.125 in
+  show (sumFrom xs 0 0.0);
+  show (array.get (array.set xs 1 9.75) 1);
+  1.0 / 3.0

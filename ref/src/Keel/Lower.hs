@@ -24,6 +24,7 @@ import Data.List (delete, elemIndex, nub, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set qualified as S
+import GHC.Float (castDoubleToWord64)
 import Keel.Syntax
 
 data Atom
@@ -91,6 +92,9 @@ data Rhs
   | RPerform2 Int Integer Atom Atom     -- ^ the same with a pair of words (of this layout), built only for a handler
   | RCell Atom (Maybe Atom)             -- ^ read word slot k of the cells, or write a word there (giving 0)
   | RConv IntTy Atom                    -- ^ wrap a canonical integer into another integer type
+  | RFPrim Prim Atom Atom               -- ^ + - * / == < on f64 (as its bits in a word)
+  | RFOfInt IntTy Atom                  -- ^ an integer of this type as f64, rounded to nearest
+  | RFloat FloatOp [Atom]               -- ^ FToInt, FSqrt or a libm call ('FToBits' and 'FFromBits' are copies)
   | RArray ArrayOp Elem [Atom]          -- ^ an array operation, by how the array holds its elements
   | RArena Bool                         -- ^ open (True) or close the innermost arena
   | RIndex Atom Atom Elem               -- ^ element i of an array, known to be in bounds ("Keel.Range")
@@ -397,6 +401,16 @@ expr info env tm k = case tm of
   UnitLit -> k (AInt 0)
   BoolLit b -> k (AInt (if b then 1 else 0))
   IntLit _ n -> k (AInt n)
+  -- f64 is a word of IEEE bits; 64-bit targets only.
+  FloatLit m e -> noFloat32 >> k (AInt (toInteger (castDoubleToWord64 (floatValue m e))))
+  FloatPrim op args -> noFloat32 >> subs args (\vs -> case (op, vs) of
+    (FToBits, [v]) -> k v
+    (FFromBits, [v]) -> k v
+    (FOfInt, [v]) | [a] <- args -> case typeOf info env a of
+      TInt it -> bindRhs (RFOfInt it v)
+      t -> lift (Left ("conversion of " ++ prettyTy t))
+    _ -> bindRhs (RFloat op vs))
+  Prim op a b | TFloat <- typeOf info env a -> noFloat32 >> sub a (\va -> sub b $ \vb -> bindRhs (RFPrim op va vb))
   Prim op a b -> case typeOf info env a of
     TInt it -> do
       -- @+?@'s None and Some, which the back ends build
@@ -566,6 +580,9 @@ expr info env tm k = case tm of
 
     branch env' e = expr info env' e (pure . Ret)
 
+    -- ponytail: f64 on 32-bit targets would take two words like i64; add it when one needs floats.
+    noFloat32 = when (iWord info == 32) (unsupported "f64 on a 32-bit target")
+
     bindRhs rhs = do
       x <- newVar "t" ty
       modify (\s -> s {lsLocs = maybe id (M.insert x) (lsPos s) (lsLocs s)})
@@ -638,6 +655,8 @@ typeOf info env tm = case tm of
   Prim _ a _ -> go a
   ArrayPrim op t _ -> let (_, r, _) = arrayOpType op t in r
   Convert to _ -> TInt to
+  FloatLit _ _ -> TFloat
+  FloatPrim op _ -> snd (floatOpType op)
   If _ a _ -> go a
   Lam x t b -> TFun t S.empty (typeOf info (M.insert x (x, t) env) b)
   LLam x t b -> TLFun t S.empty (typeOf info (M.insert x (x, t) env) b)
@@ -922,6 +941,9 @@ exprAtoms e = case e of
       RPerform2 _ _ a b -> [a, b]
       RCell k v -> k : maybe [] pure v
       RConv _ a -> [a]
+      RFPrim _ a b -> [a, b]
+      RFOfInt _ a -> [a]
+      RFloat _ as -> as
       RArray _ _ as -> as
       RIndex a i _ -> [a, i]
       RJoin a b -> [a, b]

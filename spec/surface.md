@@ -54,7 +54,7 @@ type variables, operations and observations.
 
 | Syntax | Meaning |
 |---|---|
-| `i8` … `i64`, `u8` … `u64`, `usize`, `Bool`, `Unit` | base types; `usize` is as wide as an address on the target (32 or 64 bits) |
+| `i8` … `i64`, `u8` … `u64`, `usize`, `f64`, `Bool`, `Unit` | base types; `usize` is as wide as an address on the target (32 or 64 bits); `f64` is an IEEE 754 double (below) |
 | `a -> b`, `a ->{Panic, 'e} b` | function, with effects |
 | `a ->{MMIO, !Alloc} b` | a function that never allocates (below) |
 | `a -o b`, `a -o{IO} b` | linear (one-shot) function |
@@ -104,11 +104,13 @@ prints it, and means the same as leaving it out.
 | `getc ()` | read one byte of input (effect `Input`): `0`–`255`, or `-1` at the end |
 | `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs; `(a, b, c)` is `(a, (b, c))`, in types and `case` patterns too |
 | `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
+| `1.5`, `2.0`, `1e-30`, `-6.5e3` | `f64` literals: a point or an exponent (an integer literal is never an `f64`) |
 | `"Hi!\n"` | a `List u8` of the string's UTF-8 bytes (Haskell-style escapes) |
 | `'a'`, `'\n'` | an ASCII character as a `u8` (in expressions only; in types `'a` is an effect variable) |
 | `/`, `%` | division truncating toward zero, remainder; panic on division by zero and `min / -1` |
 | `x land y`, `lor`, `lxor`, `lsl`, `lsr` | bitwise and, or, xor, shifts (logical for unsigned types, arithmetic for signed) |
 | `e as u8` | wrapping conversion between integer types |
+| `n as f64`, `x as i32` | integer to `f64` (rounded to nearest); `f64` to integer (toward zero, saturating, NaN gives 0) |
 | `s.thr_empty`, `s.raw`, `LineStatus(x)`, `LineStatus { thr_empty = 1 }` | bitdata field, raw value, from raw, from fields |
 | `+ - *`, `+% -% *%`, `+\| -\| *\|`, `+? -? *?` | checked, wrapping, saturating, Option arithmetic |
 | `==`, `<`, `!=`, `>`, `<=`, `>=` | comparisons (the last four are written with `==`, `<` and `if`; operands still evaluate left to right) |
@@ -209,7 +211,8 @@ other: `import std.map`, then `map.insert`.
 | `std.array` | `Array a`: growable arrays with constant-time indexing. `empty`, `make n x`, `length`, `get`, `set`, `push`, `pop`, `fromList`, `toList`, `foldl` |
 | `std.file` | `read path`: a file's bytes as `Option (List u8)` (`None` if it can't be opened); `write path bytes` and `appendTo path bytes` (`false` if it can't be written); `open`, `getByte`, `create`, `openAppend`, `put`, `close` to stream (effect `Files`) |
 | `std.loop` | an event loop: `run init step` drives a pure `step : s -> Event -> (s, List Command)`. Events: `Start`, `Listening`, `Accepted`, `Connected`, `Failed`, `Received`, `Closed`, `Timer`; commands: `Listen`, `Connect`, `Send`, `Close`, `After`, `Stop`; `ipv4 127 0 0 1` (effect `Net`; `examples/echo.kl`, `examples/timers.kl`) |
-| `std.string` | for `List u8`: `compare`, `equal`, `fromInt`, `parseInt` (`Option i64`), `split`, `lines`, `join`, `isDigit`, `isSpace`, `isAlpha` |
+| `std.string` | for `List u8`: `compare`, `equal`, `fromInt`, `fromFloat`, `parseInt` (`Option i64`), `split`, `lines`, `join`, `isDigit`, `isSpace`, `isAlpha` |
+| `std.float` | `f64`: `sqrt`, `abs`, `min`, `max`, `isNaN`, `infinity`, `nan`, `toBits`, `fromBits`; `exp`, `log`, `pow`, `sin`, `cos`, `floor` (hosted targets) |
 
 ```
 import std.map
@@ -225,6 +228,17 @@ def count : List (List u8) -> map.Map (List u8) i64 ->{Diverge, Panic} map.Map (
 
 `examples/words.kl` counts the words on stdin this way. Keys and values are `Free`
 (copyable).
+
+**Floats.** `f64` has `+ - * /` and the six comparisons, with IEEE 754 semantics: they never
+panic (`1.0 / 0.0` is infinity, `0.0 / 0.0` NaN), and NaN is unordered, so every comparison
+with it is false except `!=`. There are no `%`, `+% +| +?` forms or bit operations on `f64`.
+`std.float` has `sqrt`, `abs`, `min`, `max`, `isNaN`, `infinity`, `nan`, `toBits` and
+`fromBits` (the IEEE bit pattern as `u64`), and, on hosted targets only, `exp`, `log`, `pow`,
+`sin`, `cos` and `floor` from the C library. `string.fromFloat` writes 17 significant digits
+without trailing zeros (`0.30000000000000004`, `1.5`, `6.02214076e23`). A program whose result is
+an `f64` prints its bit pattern (`result: 0x3ff8000000000000`), which is exact on every target.
+RISC-V runs `f64` on RV64 with the D extension; RV32 and the Pico 2 reject it for now.
+`-0.0` written as a literal is `0.0` (`float.fromBits 0x8000_0000_0000_0000` is negative zero).
 
 **Arrays** are values: `array.set xs 0 x` returns an array and leaves `xs` as it was. Under the
 hood an array nothing else references is updated in place, so a loop that threads one array
