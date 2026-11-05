@@ -62,6 +62,15 @@
           "name": "identifier"
         },
         {
+          "type": "ALIAS",
+          "content": {
+            "type": "STRING",
+            "value": "queue"
+          },
+          "named": true,
+          "value": "identifier"
+        },
+        {
           "type": "SYMBOL",
           "name": "operator"
         },
@@ -90,22 +99,53 @@
           "type": "CHOICE",
           "members": [
             {
-              "type": "STRING",
-              "value": "def"
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": "def"
+                    },
+                    {
+                      "type": "STRING",
+                      "value": "cell"
+                    }
+                  ]
+                },
+                {
+                  "type": "FIELD",
+                  "name": "name",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "identifier"
+                  }
+                }
+              ]
             },
             {
-              "type": "STRING",
-              "value": "cell"
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "queue"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "name",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "identifier"
+                  }
+                },
+                {
+                  "type": "STRING",
+                  "value": ":"
+                }
+              ]
             }
           ]
-        },
-        {
-          "type": "FIELD",
-          "name": "name",
-          "content": {
-            "type": "SYMBOL",
-            "name": "identifier"
-          }
         }
       ]
     },
@@ -548,7 +588,12 @@
       "name": "comment"
     }
   ],
-  "conflicts": [],
+  "conflicts": [
+    [
+      "definition",
+      "_item"
+    ]
+  ],
   "precedences": [],
   "externals": [],
   "inline": [],

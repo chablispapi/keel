@@ -11,6 +11,8 @@ module.exports = grammar({
   name: 'keel',
 
   extras: $ => [/\s/, $.comment],
+  // queue is a keyword only at the start of a declaration (std.loop has a variable queue).
+  conflicts: $ => [[$.definition, $._item]],
   word: $ => $.identifier,
 
   rules: {
@@ -29,11 +31,15 @@ module.exports = grammar({
       $.constructor,
       $.effect_variable,
       $.identifier,
+      alias('queue', $.identifier),
       $.operator,
       $.punctuation,
     ),
 
-    definition: $ => seq(optional('private'), choice('def', 'cell'), field('name', $.identifier)),
+    definition: $ => seq(optional('private'), choice(
+      seq(choice('def', 'cell'), field('name', $.identifier)),
+      seq('queue', field('name', $.identifier), ':'),
+    )),
     type_definition: $ => seq(
       optional('private'),
       optional('linear'),

@@ -176,6 +176,10 @@
     "named": false
   },
   {
+    "type": ":",
+    "named": false
+  },
+  {
     "type": ";",
     "named": false
   },
@@ -362,6 +366,10 @@
   },
   {
     "type": "private",
+    "named": false
+  },
+  {
+    "type": "queue",
     "named": false
   },
   {

@@ -8,7 +8,7 @@
 (type_definition name: (constructor) @type)
 (import module: (module_name) @namespace)
 
-["def" "cell" "private"] @keyword.function
+["def" "cell" "queue" "private"] @keyword.function
 ["data" "codata" "effect" "bitdata" "linear"] @keyword.storage.type
 "import" @keyword.control.import
 ((keyword) @keyword.control.conditional (#any-of? @keyword.control.conditional "if" "then" "else" "case" "of"))
