@@ -65,7 +65,7 @@ private def go : forall (s : Free) 'e. (s -> Event ->{'e} (s, List Command)) -> 
         | Some(p) -> let (ev, d2) = p in go step s (Cons(ev, box Nil)) d2 } }
 
 -- Carry out the commands in order; the events they cause go after those already waiting.
-private def exec : List Command -> Drv -> List Event ->{Net, Diverge, Panic} Next =
+private def exec : List Command -> Drv -> List Event ->{Net, Panic} Next =
   \cmds d queue. case cmds of
     { Nil -> Going(d, queue)
     | Cons(c, rest) -> case c of
@@ -86,18 +86,18 @@ private def exec : List Command -> Drv -> List Event ->{Net, Diverge, Panic} Nex
             let at = clockMs () + ms in
             (case d of { Drv(next, socks, timers, rot) -> exec (unbox rest) (Drv(next, socks, insertTimer at tag timers, rot)) queue }) } }
 
-private def later : List Event -> Event ->{Diverge} List Event = \q e. append q (Cons(e, box Nil))
+private def later : List Event -> Event -> List Event = \q e. append q (Cons(e, box Nil))
 
 -- Number a new socket.
-private def add : Drv -> Socket ->{Diverge, Panic} (Drv, i64) =
+private def add : Drv -> Socket ->{Panic} (Drv, i64) =
   \d sock. case d of
     { Drv(next, socks, timers, rot) -> (Drv(next + 1, map.insert compareInt next sock socks, timers, rot), next) }
 
-private def update : Drv -> i64 -> Socket ->{Diverge} Drv =
+private def update : Drv -> i64 -> Socket -> Drv =
   \d conn sock. case d of { Drv(next, socks, timers, rot) -> Drv(next, map.insert compareInt conn sock socks, timers, rot) }
 
 -- Queue bytes on a connection (not one being closed) and send what it takes now.
-private def enqueue : Drv -> i64 -> Array u8 ->{Net, Diverge, Panic} Drv =
+private def enqueue : Drv -> i64 -> Array u8 ->{Net, Panic} Drv =
   \d conn bytes. case d of
     { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
         { Some(sock) -> (case sock of
@@ -107,7 +107,7 @@ private def enqueue : Drv -> i64 -> Array u8 ->{Net, Diverge, Panic} Drv =
         | None -> d } }
 
 -- Close a connection once its queue is sent; a listener at once.
-private def closing : Drv -> i64 ->{Net, Diverge, Panic} Drv =
+private def closing : Drv -> i64 ->{Net, Panic} Drv =
   \d conn. case d of
     { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
         { Some(sock) -> (case sock of
@@ -117,7 +117,7 @@ private def closing : Drv -> i64 ->{Net, Diverge, Panic} Drv =
 
 -- Send what the connection takes without waiting; close it if Close came and nothing is left.
 -- A failed send means the peer is gone: the queue is dropped, and the next read reports it.
-private def flush : Drv -> i64 ->{Net, Diverge, Panic} Drv =
+private def flush : Drv -> i64 ->{Net, Panic} Drv =
   \d conn. case d of
     { Drv(next, socks, timers, rot) -> case map.lookup compareInt conn socks of
         { Some(sock) -> (case sock of
@@ -133,7 +133,7 @@ private def flush : Drv -> i64 ->{Net, Diverge, Panic} Drv =
 -- the first are sent.
 private data Sending = Sent(List (Array u8), i64) | Broken
 
-private def sendQueue : i64 -> List (Array u8) -> i64 ->{Net, Diverge, Panic} Sending =
+private def sendQueue : i64 -> List (Array u8) -> i64 ->{Net, Panic} Sending =
   \fd out from. case out of
     { Nil -> Sent(Nil, 0)
     | Cons(bytes, rest) ->
@@ -143,7 +143,7 @@ private def sendQueue : i64 -> List (Array u8) -> i64 ->{Net, Diverge, Panic} Se
         else Sent(Cons(bytes, rest), from + n) }
 
 -- Close a socket and forget its number.
-private def forget : Drv -> i64 ->{Net, Diverge} Drv =
+private def forget : Drv -> i64 ->{Net} Drv =
   \d conn. case d of
     { Drv(next, socks, timers, rot) ->
         (case map.lookup compareInt conn socks of { Some(sock) -> sockClose(socketFd sock) | None -> () });
@@ -151,7 +151,7 @@ private def forget : Drv -> i64 ->{Net, Diverge} Drv =
 
 private def socketFd : Socket -> i64 = \sock. case sock of { Listener(fd, tag) -> fd | Conn(fd, out, from, shut) -> fd }
 
-private def insertTimer : i64 -> i64 -> List (i64, i64) ->{Diverge} List (i64, i64) =
+private def insertTimer : i64 -> i64 -> List (i64, i64) -> List (i64, i64) =
   \at tag ts. case ts of
     { Nil -> Cons((at, tag), box Nil)
     | Cons(t, rest) -> let (at2, tag2) = t in
@@ -198,7 +198,7 @@ private def poll : Drv -> i64 ->{Net, Diverge, Panic} Option (Event, Drv) =
 
 -- Each socket for pollWait: its fd · 4, plus 1 to read (a listener, or a connection not being
 -- closed) and 2 to write (a connection with bytes queued).
-private def fdsOf : List (i64, Socket) -> Array i32 ->{Diverge, Panic} Array i32 =
+private def fdsOf : List (i64, Socket) -> Array i32 ->{Panic} Array i32 =
   \xs acc. case xs of
     { Nil -> acc
     | Cons(p, rest) -> let (conn, sock) = p in
@@ -207,21 +207,21 @@ private def fdsOf : List (i64, Socket) -> Array i32 ->{Diverge, Panic} Array i32
           | Listener(fd, tag) -> 1 } in
         fdsOf (unbox rest) (array.push acc ((socketFd sock * 4 + wants) as i32)) }
 
-private def nth : forall (a : Free). i64 -> List a ->{Diverge, Panic} Option a =
+private def nth : forall (a : Free). i64 -> List a ->{Panic} Option a =
   \i xs. case xs of { Nil -> None | Cons(x, rest) -> if i == 0 then Some(x) else nth (i - 1) (unbox rest) }
 
-private def drop : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
+private def drop : forall (a : Free). i64 -> List a ->{Panic} List a =
   \k xs. if k == 0 then xs else case xs of { Nil -> Nil | Cons(x, rest) -> drop (k - 1) (unbox rest) }
 
-private def take : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
+private def take : forall (a : Free). i64 -> List a ->{Panic} List a =
   \k xs. if k == 0 then Nil else case xs of { Nil -> Nil | Cons(x, rest) -> Cons(x, box (take (k - 1) (unbox rest))) }
 
-private def rotate : forall (a : Free). i64 -> List a ->{Diverge, Panic} List a =
+private def rotate : forall (a : Free). i64 -> List a ->{Panic} List a =
   \k xs. let n = prelude.length xs in if n == 0 then xs else (let r = k % n in append (drop r xs) (take r xs))
 
 -- Close every socket.
-private def shutdown : Drv ->{Net, Diverge} Unit =
+private def shutdown : Drv ->{Net} Unit =
   \d. case d of { Drv(next, socks, timers, rot) -> closeAll (map.toList socks) }
 
-private def closeAll : List (i64, Socket) ->{Net, Diverge} Unit =
+private def closeAll : List (i64, Socket) ->{Net} Unit =
   \xs. case xs of { Nil -> () | Cons(p, rest) -> let (conn, sock) = p in sockClose(socketFd sock); closeAll (unbox rest) }

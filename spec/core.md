@@ -397,9 +397,18 @@ must still have equal types.
   arrow inside its own definition, following other data types transitively. Otherwise
   `data T = MkT(T → i64)` would allow self-application and a loop with no recursive definition.
 
-Recursion is *marked*, not yet *checked*: a structurally recursive function such as `map`
-still carries `Diverge`. A totality checker that removes `Diverge` from provably terminating
-recursion is future work (`notes.md` §13).
+- **Structural recursion terminates** (`Termination.hs`). A group loses `Diverge` when each
+  member f has a parameter position iₓ such that every reference to a member g inside a member
+  f is a call `g a₀ … aₙ` (n ≥ i_g) whose argument a_{i_g} is a *part* of f's parameter i_f:
+  a variable bound by a `case` on that parameter or on a part of it, possibly through `unbox`
+  and `let`. Data values are finite (no laziness, no cycles) and strict positivity rules out
+  a loop without a recursive definition, so every chain of such calls ends. `map`, `length`,
+  `foldl`, `append`, std.map's tree functions and mutual recursion such as `evens`/`odds`
+  pass; `f xs`, `f (Cons(x, rest))`, `f (n - 1)` on an integer and `twice f k` don't. This is
+  the structural rule of Agda's termination checker (Abel's foetus), without lexicographic
+  orders or size-change graphs, so `ackermann` and recursion that swaps two parameters still
+  diverge. The same check runs in inference and in the core checker, at every stage of
+  `compile`; a `var` that is ever assigned is never a part.
 
 ### 2.5 Operational semantics
 

@@ -5,14 +5,14 @@
 --   map.insert string.compare "key" 1 m
 
 -- Byte order, which is code point order for UTF-8.
-def compare : List u8 -> List u8 ->{Diverge} Ordering =
+def compare : List u8 -> List u8 -> Ordering =
   \a b. case a of
     { Nil -> case b of { Nil -> Equal | Cons(y, ys) -> Less }
     | Cons(x, xs) -> case b of
         { Nil -> Greater
         | Cons(y, ys) -> if x < y then Less else if y < x then Greater else compare (unbox xs) (unbox ys) } }
 
-def equal : List u8 -> List u8 ->{Diverge} Bool =
+def equal : List u8 -> List u8 -> Bool =
   \a b. case compare a b of { Equal -> true | Less -> false | Greater -> false }
 
 def isDigit : u8 -> Bool = \c. if c < 48 then false else c < 58
@@ -69,7 +69,7 @@ private def scaleBy : f64 -> i64 ->{Diverge, Panic} f64 =
 -- 10^k, exact for k ≤ 22.
 private def pow10 : i64 -> f64 ->{Diverge, Panic} f64 = \k acc. if k < 1 then acc else pow10 (k - 1) (acc * 10.0)
 
-private def dropZeros : List u8 ->{Diverge} List u8 =
+private def dropZeros : List u8 -> List u8 =
   \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == 48 then dropZeros (unbox rest) else Cons(c, rest) }
 
 -- Digits d₁d₂… with d₁ in the 10^e place.
@@ -96,14 +96,14 @@ private def whole : List u8 -> i64 ->{Diverge, Panic} List u8 =
 private def zerosOnto : i64 -> List u8 ->{Diverge, Panic} List u8 =
   \n acc. if n < 1 then acc else zerosOnto (n - 1) (Cons(48, box acc))
 
-private def digitsValue : i64 -> List u8 ->{Diverge, Panic} Option i64 =
+private def digitsValue : i64 -> List u8 ->{Panic} Option i64 =
   \acc s. case s of
     { Nil -> Some(acc)
     | Cons(c, rest) -> if isDigit c then digitsValue (acc * 10 + (c as i64) - 48) (unbox rest) else None }
 
 -- A decimal number with an optional leading -, or None. Panics on overflow.
 -- ponytail: -9223372036854775808 overflows (it is parsed as -(9223372036854775808)).
-def parseInt : List u8 ->{Diverge, Panic} Option i64 =
+def parseInt : List u8 ->{Panic} Option i64 =
   \s. case s of
     { Nil -> None
     | Cons(c, rest) ->
@@ -114,10 +114,10 @@ def parseInt : List u8 ->{Diverge, Panic} Option i64 =
         else digitsValue 0 (Cons(c, rest)) }
 
 -- The pieces between separators: split 44 "a,,b" is ["a", "", "b"].
-def split : u8 -> List u8 ->{Diverge} List (List u8) =
+def split : u8 -> List u8 -> List (List u8) =
   \sep s. splitOnto sep s Nil
 
-private def splitOnto : u8 -> List u8 -> List u8 ->{Diverge} List (List u8) =
+private def splitOnto : u8 -> List u8 -> List u8 -> List (List u8) =
   \sep s piece. case s of
     { Nil -> Cons(reverse piece, box Nil)
     | Cons(c, rest) ->
@@ -125,7 +125,7 @@ private def splitOnto : u8 -> List u8 -> List u8 ->{Diverge} List (List u8) =
         else splitOnto sep (unbox rest) (Cons(c, box piece)) }
 
 -- Lines without their newlines; a final newline doesn't start an empty line.
-def lines : List u8 ->{Diverge} List (List u8) =
+def lines : List u8 -> List (List u8) =
   \s. case reverse s of
     { Nil -> Nil
     | Cons(c, rest) -> if c == 10 then split 10 (reverse (unbox rest)) else split 10 s }

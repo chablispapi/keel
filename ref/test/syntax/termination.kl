@@ -1,0 +1,35 @@
+-- Structural recursion terminates (spec/core.md §2.4): none of these says Diverge, and main
+-- has none. Recursion on a part of a parameter: one list or two subtrees, two steps at a
+-- time, mutual (evens and odds), on the second parameter, and from inside a λ.
+data Tree = Leaf | Node(Box Tree, i64, Box Tree)
+
+def length : forall (a : Free). List a -> i64 =
+  \xs. case xs of { Nil -> 0 | Cons(_, rest) -> 1 +% length (unbox rest) }
+
+def map : forall a b 'e. (a ->{'e} b) -> List a ->{'e} List b =
+  \f xs. case xs of { Nil -> Nil | Cons(x, rest) -> Cons(f x, box (map f (unbox rest))) }
+
+def sumTree : Tree -> i64 =
+  \t. case t of { Leaf -> 0 | Node(l, x, r) -> sumTree (unbox l) +% x +% sumTree (unbox r) }
+
+def pairs : List i64 -> i64 =
+  \xs. case xs of { Cons(a, Cons(b, rest)) -> a +% b +% pairs (unbox rest) | _ -> 0 }
+
+def evens : List i64 -> i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> x +% odds (unbox rest) }
+def odds : List i64 -> i64 =
+  \xs. case xs of { Nil -> 0 | Cons(_, rest) -> evens (unbox rest) }
+
+def sumAcc : i64 -> List i64 -> i64 =
+  \acc xs. case xs of { Nil -> acc | Cons(x, rest) -> sumAcc (acc +% x) (unbox rest) }
+
+def later : List i64 -> i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> let k = \(u : Unit). later (unbox rest) in x +% k () }
+
+main = out(length (Cons(1, box Cons(2, box Nil))));
+       out(sumTree (Node(box Leaf, 5, box Node(box Leaf, 6, box Leaf))));
+       out(pairs (Cons(1, box Cons(2, box Cons(3, box Nil)))));
+       out(evens (Cons(1, box Cons(2, box Cons(3, box Nil)))));
+       out(sumAcc 0 (Cons(4, box Cons(5, box Nil))));
+       out(later (Cons(7, box Cons(8, box Nil))));
+       length (map (\x. x +% 1) (Cons(1, box Nil)))

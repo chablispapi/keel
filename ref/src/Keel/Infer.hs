@@ -27,6 +27,7 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.Check (ErrKind (..), TypeError (..), atPos, recursiveGroups)
 import Keel.Syntax
+import Keel.Termination (terminatingGroups)
 
 data Sig = Sig
   { sData :: M.Map String (Bool, [String], [(String, [Ty])])
@@ -143,7 +144,7 @@ inferDecls queues userDecls main = evalStateT go (St 0 M.empty M.empty S.empty M
         , sCells = cellSlots userDecls
         , sQueues = queues
         }
-    groups = recursiveGroups userDecls
+    groups = terminatingGroups userDecls (recursiveGroups userDecls)
     go = do
       decls' <- forM userDecls $ \d -> case d of
         Def f t e -> do

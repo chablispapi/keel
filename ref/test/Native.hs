@@ -221,6 +221,7 @@ exampleFiles =
   , ("test/memory/reuse-fast.kl", (Just "374", ""))
   , ("test/opt/capture.kl", (Just "10354", "10\n20\n30\n"))
   , ("test/opt/handlers.kl", (Just "5", "70\n108\n101\n"))
+  , ("test/syntax/termination.kl", (Just "1", "2\n11\n3\n4\n9\n15\n"))
   , ("test/memory/packed.kl", (Just "(13144, Node(1, box Leaf, box Node(2, box Leaf, box Leaf)))", ""))
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
   , ("test/memory/array-grow.kl", (Just "4485076", ""))

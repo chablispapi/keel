@@ -13,6 +13,7 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
 import Keel.Syntax
+import Keel.Termination (terminatingGroups)
 
 data ErrKind
   = Mismatch
@@ -145,7 +146,8 @@ type Usage = S.Set String
 checkProgram :: Program -> TC (Ty, Eff)
 checkProgram (Program decls main) = do
   sig <- buildSig decls
-  let groups = recursiveGroups decls
+  -- §2.4: a group that recurses only on smaller arguments terminates: no Diverge.
+  let groups = terminatingGroups decls (recursiveGroups decls)
   forM_ [(f, t, e) | Def f t e <- decls] $ \(f, t, e) -> do
     let (vs, es, body) = case t of
           TForall vs' es' b -> (vs', es', b)

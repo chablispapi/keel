@@ -76,6 +76,7 @@ positionCases =
     , Unhandled
     , (3, 25)
     )
+  , ("position: recursion on the same argument", "data L = N | C(i64, Box L)\ndef f : L -> i64 = \\xs. f xs\nmain = 0\n", EffectMismatch, (2, 20))
   , ("position: a cell used as a value", "cell n : u32\nmain = n + 1\n", Mismatch, (2, 8))
   , ("position: !Alloc on an early arrow", "def add : i64 ->{!Alloc} i64 ->{Panic, !Alloc} i64 = \\a b. a + b\nmain = add 1 2\n", EffectMismatch, (1, 54))
   , ("position: % on f64", "def f : f64 -> f64 = \\x. x % 2.0\nmain = 0\n", Mismatch, (1, 26))

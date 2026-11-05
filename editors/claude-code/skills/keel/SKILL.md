@@ -67,7 +67,9 @@ main = printInt (area (Rect(3, 4))); putc('\n'); 0
   `let (a, b) = p in e` takes a pair apart, and `e1; e2` is sequencing. `if` always has an `else`.
 - **Effects:** they go in the arrow, `a ->{IO, Panic, Diverge} b`. The ones you'll use most:
   - `Panic`: checked arithmetic (`+ - *` panic on overflow), `/`, array indexing.
-  - `Diverge`: any recursion, and calling `map`, `length` and other recursive functions.
+  - `Diverge`: recursion that isn't on a part of a parameter (a variable a `case` bound from
+    it), such as counting an integer down or reading until end of input. Recursion on a list
+    or tree (`length (unbox rest)`), and calling `map`, `length` or `foldl`, needs none.
   - `IO`: output. `Input`: reading stdin. `Files` and `Net`: files and sockets.
   - `Alloc`: building or holding a heap block. Every arrow allows it without saying so;
     `->{!Alloc}` forbids it, for code that must not touch the allocator. On RISC-V firmware,
@@ -98,7 +100,7 @@ Each of these has tripped up someone who had the spec open:
 
 | You write | What happens | Write instead |
 |---|---|---|
-| a recursive def typed `i64 -> i64` | `EffectMismatch … got i64 →{Diverge, Panic} i64` | the effects from the error: `i64 ->{Panic, Diverge} i64` |
+| a def recursing on an integer (`f (n - 1)`) or a rebuilt value, typed `i64 -> i64` | `EffectMismatch … got i64 →{Diverge, Panic} i64` | the effects from the error: `i64 ->{Panic, Diverge} i64`. Recursion on a `case`-bound part of a parameter needs no `Diverge` |
 | `f (unbox rest)` forgotten, as in `f rest` | `expected List[…], got Box List[…]` | `f (unbox rest)`: pattern variables of `Box` fields stay boxes |
 | `box f x` | `applying a non-function of type Box (…)` | `box (f x)` |
 | `g None (Some(4))` | parses as `g (None(Some(4)))`: a constructor takes the parenthesized argument after it, even across a space | `g (None) (Some(4))` |

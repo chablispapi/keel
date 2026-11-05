@@ -27,10 +27,10 @@ def push : forall (a : Free). Array a -> a -> Array a = \xs x. arrayPush xs x
 -- Remove the last element, panicking on an empty array.
 def pop : forall (a : Free). Array a ->{Panic} Array a = \xs. arrayPop xs
 
-private def pushAll : forall (a : Free). Array a -> List a ->{Diverge} Array a =
+private def pushAll : forall (a : Free). Array a -> List a -> Array a =
   \xs l. case l of { Nil -> xs | Cons(x, rest) -> pushAll (arrayPush xs x) (unbox rest) }
 
-def fromList : forall (a : Free). List a ->{Diverge} Array a = \l. pushAll arrayEmpty l
+def fromList : forall (a : Free). List a -> Array a = \l. pushAll arrayEmpty l
 
 private def toListFrom : forall (a : Free). i64 -> Array a -> List a ->{Diverge, Panic} List a =
   \i xs acc. if i < 1 then acc else toListFrom (i - 1) xs (Cons(arrayGet xs (i - 1), box acc))
