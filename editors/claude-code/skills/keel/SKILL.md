@@ -75,7 +75,10 @@ main = printInt (area (Rect(3, 4))); putc('\n'); 0
   - `Shared`: cells, the only mutable state outside functions. `cell n : u32 = 0` or
     `cell buf : [u8; 64]`, read with `get(n)` / `getAt(buf, i)`, written with `set(n, v)` /
     `setAt(buf, i, v)` (`test/cells/cells.kl`). They don't allocate, so an interrupt
-    handler and `main` can share them.
+    handler and `main` can share them. For messages from the handler to `main`, use a
+    queue: `queue rx : [Rx; 16]`, `post(rx, Byte(b))` in the handler and
+    `case receive(rx) of { Byte(b) -> … | Lost(n) -> … | Empty -> … }` in `main`
+    (`test/cells/queue.kl`).
   - User effects: `effect E { op : A => B }`.
   `keelc check` prints the effects a definition actually has, so copy them from the error.
 - **Lists:** `Cons(x, box rest)` builds one, and `case xs of { Nil -> … | Cons(x, rest) -> … }`
@@ -114,6 +117,8 @@ Each of these has tripped up someone who had the spec open:
 | `n + 1` with `cell n : u32` | `cell n is read with get(n) and written with set(n, v)` | `get(n) + 1`: a cell isn't a value |
 | `cell total : i64` | `a cell holds an integer of up to 32 bits, or a usize` | `u32`, `i32` or `usize` |
 | `def interrupt` doing `out(…)` when `main` never prints | `def interrupt has effects {IO} that main doesn't` | `main` must have the handler's effects: give it the operation too, or drop it from the handler |
+| `case receive(rx) of { Byte(b) -> … \| _ -> … }` | `receive(rx): _ would hide a message` | an alternative for each message, plus `Lost(n)` and `Empty` |
+| `post(rx, m)` with `m` a variable, or `post` in a function `main` calls | `m is a Rx constructor written out there`, or `only def interrupt, and what it calls, posts to a queue` | `post(rx, Byte(b))`, in the handler's side only |
 | `write8 p` with `p` a pair variable, in a `!Alloc` function | `… is !Alloc, but it uses p, which holds a heap block` | write the pair at the call, `write8(a, v)`: then the two words go in registers |
 | `p.x` on data | `can't tell the type before .x (got P); add a type annotation`. Ignore the hint: `.obs` is only for codata, and data has no field access | match: `case p of { P(x, _) -> x }` |
 

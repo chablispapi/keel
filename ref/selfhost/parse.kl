@@ -47,7 +47,8 @@ def pDecl : Decl ->{IO, Diverge, Panic} Unit =
         items (\f. case f of { Field(k, lo, w) -> putc('('); print k; putc(' '); printU64 lo; putc(' '); printU64 w; putc(')') }) fs
     | DCell(n, it, arr, len, v) ->
         print "(cell "; print n; putc(' '); print it; putc(' ');
-        (if arr then printU64 len else putc('-')); putc(' '); printU64 v; putc(')') }
+        (if arr then printU64 len else putc('-')); putc(' '); printU64 v; putc(')')
+    | DQueue(n, d, len) -> print "(queue "; print n; putc(' '); print d; putc(' '); printU64 len; putc(')') }
 
 def pTy : Ty ->{IO, Diverge, Panic} Unit =
   \t. case t of

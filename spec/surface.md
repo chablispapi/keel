@@ -43,6 +43,7 @@ codata Ord a { lt : a -> a -> Bool }
 bitdata LineStatus : u8 { thr_empty @ 5 ; parity @ 1..2 }
 effect MMIO { read : i64 => i64 ; write : W => Unit }
 cell head : u32 = 0                 -- static state: one integer, or [u8; 64] for an array
+queue rx : [Rx; 16]                 -- messages from def interrupt to main (below)
 def name : type = expression        -- top-level definitions need a type
 main = expression
 ```
@@ -446,6 +447,41 @@ load or store of a word, so an interrupt never splits it: a handler and `main` c
 buffer with no lock when only the handler writes `head` and only `main` writes `tail`
 (`test/firmware/cells.kl`). Anything that updates several cells at once is the program's
 job (turn interrupts off in `mstatus` around it).
+
+**Queues** carry messages from `def interrupt` to `main`, in cells. `queue rx : [Rx; 16]`
+holds up to 16 messages of the data type `Rx`, whose constructors are the messages:
+
+```
+data Rx = Byte(u8) | Overrun
+queue rx : [Rx; 16]
+
+def interrupt : usize ->{MMIO, Shared, !Alloc} Unit = \c. post(rx, Byte(read8(uart)))
+
+def next : Unit ->{Shared, Panic} i64 = \u.
+  case receive(rx) of
+    { Byte(b) -> b as i64 | Overrun -> -1
+    | Lost(n) -> 0 - n as i64      -- n messages were dropped since the last Lost
+    | Empty -> 0 }
+```
+
+- `Rx` has no type parameters, isn't `linear`, and each field is an integer of up to 32 bits
+  or a `usize`. The capacity is a power of two, up to 2^31. `queue` is a keyword only at the
+  start of a declaration.
+- `post(rx, C(e, …))` is `Unit ! Shared` and never allocates: the constructor is written out
+  there and never built. When the queue is full, the message is dropped and counted.
+- `case receive(rx) of { … }` has one alternative per message, plus `Lost(n)` and `Empty`,
+  each once, with variables for fields and no `_`: nothing can be missed or dropped unseen.
+  `Lost(n)` (`n : u32`) comes first whenever messages were dropped since the last one;
+  `Empty` when there's nothing. A message's fields are read and its slot freed before its
+  alternative runs, so the alternative may receive again. It is `! Shared, Panic`.
+- Only `def interrupt`, and what it calls, may `post`; only what `main` calls without going
+  through `def interrupt` may `receive`. Each of the queue's words then has one writer, and
+  each access is one load or store, so neither side needs a lock (hosted, `main` may call
+  `interrupt` itself, which is how `test/cells/queue.kl` tests one).
+- `receive` doesn't wait. Waiting is `Empty -> wfi(); …`, but an interrupt that comes between
+  the check and the `wfi` is taken then, and `wfi` sleeps until the next one
+  (`test/firmware/queue.kl`, where the timer always comes again). Waiting without that gap
+  needs interrupts off around the check, and Hart has no `csrClear` yet.
 
 **bitdata** declares a register layout over an integer type: fields are a bit (`@ 5`) or an
 inclusive range (`@ 1..2`). A bitdata type is distinct from its integer while type checking

@@ -1038,3 +1038,13 @@ into `%cellStore(k, v as usize)`, and the array forms into the same at slot
 `(k + n − 1) − ((n − 1) − i)`, whose checked subtraction panics for i ≥ n. A store's pair is
 a register pair (above), so neither operation is `Alloc`. Lowering makes each one a load or a
 store of the slot.
+
+**Queues** (`spec/surface.md`) are cells too: inference replaces `queue q : [D; n]` with the
+cells `q%head`, `q%tail`, `q%lost`, `q%seen : u32`, `q%tag : [u32; n]` and, for D's longest
+constructor of k fields, `q%f0 … q%f(k−1) : [usize; n]`, names no program can write. The
+counters wrap (`+%`), and the slot of counter c is `c land (n − 1)`. `post(q, Cⱼ(e₁, …))`
+evaluates the eᵢ, then with h = head: if h −% tail = n it adds 1 to lost; otherwise it stores
+j and the eᵢ (as usize) at h's slot, then h +% 1 in head. `case receive(q) of` is, with
+l = lost: if l −% seen ≠ 0, seen := l and the `Lost` alternative with n = l −% seen; else
+with t = tail, if head = t the `Empty` alternative; else the fields of t's slot, converted
+back to their types, tail := t +% 1, and the alternative of the slot's tag.

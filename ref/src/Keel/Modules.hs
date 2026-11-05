@@ -176,6 +176,7 @@ resolveModule scope self path (Module imports decls main _) = do
       Def f t e -> let p = listToMaybe [q | At q _ <- universe e] in Def (r f) <$> ty p t <*> term p S.empty e
       Bitdata n it fs -> Right (Bitdata (r n) it fs)
       Cell n it len v -> Right (Cell (r n) it len v)
+      Queue n dn len -> (\dn' -> Queue (r n) dn' len) <$> name top dn
       where
         r n = own M.! n
         top = Just (path, 1, 1)

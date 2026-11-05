@@ -237,6 +237,7 @@ exampleFiles =
   , ("test/syntax/tuples.kl", (Just "14", ""))
   , ("test/cells/cells.kl", (Just "301", "12\n-3\n1\n"))
   , ("test/cells/bounds.kl", (Nothing, "9\n"))
+  , ("test/cells/queue.kl", (Just "0", "314\n-1\n10\n100\n"))
   , ("test/syntax/const-ops.kl", (Just "930031494736259442", ""))
   , ("test/memory/array32.kl", (Just "142081499369", ""))
   , ("test/memory/array32-print.kl", (Just "[-5, -5, 2147483647, -2147483648]", ""))
@@ -556,6 +557,8 @@ firmwareExamples =
   , ("test/firmware/interrupt.kl", Virt 32, "", "1\nresult: 2000001000000\n")
   , ("test/firmware/cells.kl", Virt 64, "", "result: 190\n")
   , ("test/firmware/cells.kl", Virt 32, "", "result: 190\n")
+  , ("test/firmware/queue.kl", Virt 64, "", "result: 190\n")
+  , ("test/firmware/queue.kl", Virt 32, "", "result: 190\n")
   , ("examples/firmware/pico/blink.kl", Pico2, "", "")
   ]
 

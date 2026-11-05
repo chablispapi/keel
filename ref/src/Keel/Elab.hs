@@ -40,6 +40,7 @@ checkRefs (Program decls main) = do
     Def _ t e -> tyOk t >> places M.empty e
     Bitdata {} -> pure () -- removed by inference
     Cell {} -> pure ()
+    Queue {} -> pure () -- removed by inference
   places M.empty main
 
 -- | References may appear only as the parameter type of an arrow.
@@ -127,6 +128,7 @@ elaborate (Program decls main) = evalState (Program <$> mapM decl decls <*> top 
       Def f t e -> Def f (elabTy t) <$> top e
       Bitdata {} -> pure d
       Cell {} -> pure d
+      Queue {} -> pure d
     top e = expr M.empty e (\_ v -> pure v)
 
 -- | @&τ →ε σ@ and @&mut τ →ε σ@ both become @τ →ε σ ⊗ τ@.

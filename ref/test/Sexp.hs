@@ -23,6 +23,7 @@ decl d = case d of
   Def f t e -> list ["def", f, ty t, term e]
   Bitdata n it fs -> list (["bitdata", n, intTy it] ++ [list [f, show lo, show w] | (f, lo, w) <- fs])
   Cell n it len v -> list ["cell", n, intTy it, maybe "-" show len, show v]
+  Queue n dn len -> list ["queue", n, dn, show len]
 
 intTy :: IntTy -> String
 intTy it = prettyTy (TInt it)

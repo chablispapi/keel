@@ -21,6 +21,7 @@ module Keel.Infer (inferProgram, freeVars) where
 import Control.Monad (forM, forM_, unless, when, zipWithM, zipWithM_)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict (StateT (..), evalStateT, get, gets, modify, put)
+import Data.Bits ((.&.))
 import Data.List (isPrefixOf)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
@@ -35,6 +36,7 @@ data Sig = Sig
   , sOps :: M.Map String (String, Ty, Ty) -- ^ operation ↦ (label, argument, result)
   , sBits :: BitsInfo
   , sCells :: M.Map String (Integer, IntTy, Maybe Integer) -- ^ 'cellSlots'
+  , sQueues :: M.Map String (Integer, String, [(String, [IntTy])]) -- ^ queue ↦ (capacity, message type, its constructors)
   }
 
 -- | bitdata name ↦ (underlying integer, fields with low bit and width).
@@ -71,7 +73,62 @@ inferProgram :: Program -> Either TypeError Program
 inferProgram = inferCore . implicitAlloc
 
 inferCore :: Program -> Either TypeError Program
-inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty M.empty [] bitsInfo)
+inferCore (Program queueDecls main) = do
+  queues <- M.fromList <$> sequence [(,) q <$> queueInfo q d n | Queue q d n <- queueDecls]
+  queueSides queues queueDecls main
+  let userDecls = concat [maybe [d] (\(n, _, cs) -> queueCells q n (maximum (0 : map (length . snd) cs))) (M.lookup q queues) | d <- queueDecls, let q = case d of Queue n _ _ -> n; _ -> ""]
+  inferDecls queues userDecls main
+  where
+    queueInfo q d n = case [(lin, ps, cs) | Data lin d' ps cs <- queueDecls, d' == d] of
+      [] -> qErr ("queue " ++ q ++ ": " ++ d ++ " is not a data type")
+      (lin, ps, cs) : _
+        | lin -> qErr ("queue " ++ q ++ ": a message is copied out of the queue, so " ++ d ++ " can't be linear")
+        | not (null ps) -> qErr ("queue " ++ q ++ ": " ++ d ++ " can't have type parameters")
+        | n < 1 || n > 2 ^ (31 :: Int) || n .&. (n - 1) /= 0 -> qErr ("queue " ++ q ++ ": the capacity " ++ show n ++ " must be a power of two, up to 2^31")
+        | c : _ <- [c | (c, _) <- cs, c `elem` ["Lost", "Empty"]] -> qErr ("queue " ++ q ++ ": " ++ c ++ " is an alternative of every receive, so a message can't be called " ++ c)
+        | otherwise -> (n,d,) <$> mapM (\(c, fs) -> (c,) <$> mapM (field c) fs) cs
+    field c f = case f of
+      TInt it | bits it <= 32 -> Right it
+      _ -> qErr ("queue message " ++ c ++ ": a field is an integer of up to 32 bits, or a usize, not " ++ prettyTy f)
+    qErr msg = Left (TypeError Mismatch msg Nothing)
+
+-- | Only def interrupt, and what it calls, posts to a queue; only main's side (what main
+-- calls, without going through def interrupt) receives. Then each cell has one writer.
+queueSides :: M.Map String a -> [Decl] -> Term -> Either TypeError ()
+queueSides queues decls main = case [msg | (f, e) <- ("main", main) : M.toList defs, msg <- wrong f e] of
+  msg : _ -> Left (TypeError Mismatch msg Nothing)
+  [] -> Right ()
+  where
+    defs = M.fromList [(f, e) | Def f _ e <- decls]
+    calls e = S.toList (freeVars e `S.intersection` M.keysSet defs)
+    reach seen [] = seen
+    reach seen (f : fs)
+      | f `S.member` seen = reach seen fs
+      | otherwise = reach (S.insert f seen) (calls (defs M.! f) ++ fs)
+    fromMain = reach (S.singleton interruptDef) (calls main)
+    fromIrq = reach S.empty [interruptDef | M.member interruptDef defs]
+    wrong f e =
+      [ "post(" ++ q ++ ", …) is in " ++ (if f == "main" then "main" else f ++ ", which main calls") ++ ": only def interrupt, and what it calls, posts to a queue"
+      | f == "main" || (f /= interruptDef && f `S.member` fromMain)
+      , App (Var "post") a <- universe e
+      , Just (q, _) <- [spread a]
+      , M.member q queues
+      ]
+        ++ [ "receive(" ++ q ++ ") is in " ++ (if f == interruptDef then f else f ++ ", which def interrupt calls") ++ ": only main's side receives from a queue"
+           | f `S.member` fromIrq
+           , Case s _ <- universe e
+           , App (Var "receive") a <- [unAt s]
+           , Var q <- [unAt a]
+           , M.member q queues
+           ]
+
+-- | A term without the positions around it (but keeping those inside).
+unAt :: Term -> Term
+unAt (At _ e) = unAt e
+unAt e = e
+
+inferDecls :: M.Map String (Integer, String, [(String, [IntTy])]) -> [Decl] -> Term -> Either TypeError Program
+inferDecls queues userDecls main = evalStateT go (St 0 M.empty M.empty S.empty M.empty [] bitsInfo)
   where
     decls = optionDecl : arrayDecl : userDecls
     bitsInfo = M.fromList [(b, (it, fs)) | Bitdata b it fs <- userDecls]
@@ -84,6 +141,7 @@ inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty
         , sOps = M.fromList [(op, (l, a, r)) | (l, ops) <- builtinEffects ++ [(l, os) | Effect l os <- decls], (op, a, r) <- ops]
         , sBits = bitsInfo
         , sCells = cellSlots userDecls
+        , sQueues = queues
         }
     groups = recursiveGroups userDecls
     go = do
@@ -97,6 +155,7 @@ inferCore (Program userDecls main) = evalStateT go (St 0 M.empty M.empty S.empty
           (e', _) <- check env e body
           Just . Def f (resolveBits bitsInfo t) <$> finish env e'
         Bitdata {} -> pure Nothing
+        Queue {} -> pure Nothing -- made into cells above
         -- ponytail: a cell element is one word slot, so at most 32 bits (or usize) to fit on
         -- RV32 too; i64 cells need two slots there.
         Cell n it@(IntTy _ b) len v
@@ -125,6 +184,65 @@ spread a = case stripAt a of
   Var c -> Just (c, [])
   Pair c x | Var n <- stripAt c -> Just (n, case stripAt x of Pair i v -> [i, v]; _ -> [x])
   _ -> Nothing
+
+-- | @receive(q)@ as a case's scrutinee: the queue.
+receiveOf :: Env -> Term -> Maybe String
+receiveOf env s = case unAt s of
+  App (Var "receive") a
+    | Nothing <- M.lookup "receive" (eLocals env)
+    , not (M.member "receive" (sDefs (eSig env)))
+    , Var q <- unAt a
+    , M.member q (sQueues (eSig env)) -> Just q
+  _ -> Nothing
+
+-- | @case receive(q) of { C(x, …) -> e | … | Lost(n) -> e | Empty -> e }@ as cell accesses:
+-- first the messages lost since the last Lost (n of them, a u32), then Empty, then the
+-- message at tail, whose fields are read before tail moves on.
+receiveTerm :: Env -> String -> [(String, [String], Term)] -> I Term
+receiveTerm env q alts = do
+  let (n, d, cs) = sQueues (eSig env) M.! q
+      want = [(c, length fs) | (c, fs) <- cs] ++ [("Lost", 1), ("Empty", 0)]
+      names = [c | (c, _, _) <- alts]
+  forM_ alts $ \(c, xs, _) -> case lookup c want of
+    Nothing -> failWith Mismatch ("receive(" ++ q ++ "): " ++ (if c == "_" then "_ would hide a message" else c ++ " is not a " ++ d ++ " message") ++ "; list each of " ++ unwords (map fst want))
+    Just k -> when (length xs /= k) $ failWith Mismatch ("receive(" ++ q ++ "): " ++ c ++ " has " ++ show k ++ " fields, given " ++ show (length xs))
+  case [c | (c, _) <- want, c `notElem` names] ++ [c | (c : rest) <- tails' names, c `elem` rest] of
+    [] -> pure ()
+    c : _ -> failWith NonExhaustive ("receive(" ++ q ++ ") lists " ++ c ++ (if c `elem` names then " twice" else " nowhere") ++ ": each of " ++ unwords (map fst want) ++ " once")
+  let arm c = case [(xs, b) | (c', xs, b) <- alts, c' == c] of
+        a : _ -> a
+        [] -> ([], UnitLit) -- unreachable: checked above
+      v = Var
+      cell c = Var (q ++ "%" ++ c)
+      get' c = App (Var "get") (cell c)
+      set' c e = App (Var "set") (Pair (cell c) e)
+      getAt' c i = App (Var "getAt") (Pair (cell c) i)
+      bind x e b = if x == "_" then b else Let x e b
+      eq a b = Prim Eq a b
+      msg (j, (c, fs)) =
+        let (xs, b) = arm c
+         in (eq (v "rcv%k") (NumLit Nothing j), foldr (\(i, (x, f)) r -> bind x (Convert f (getAt' ("f" ++ show i) (v "rcv%i"))) r) (Seq (set' "tail" (Prim (Arith Wrap Add) (v "rcv%t") (NumLit Nothing 1))) b) (zip [0 :: Int ..] (zip xs fs)))
+      chain = case reverse (map msg (zip [0 ..] cs)) of
+        (_, lastArm) : rest -> foldl (\r (t, a) -> If t a r) lastArm rest
+        [] -> snd (arm "Empty")
+      (lostX, lostB) = case arm "Lost" of
+        (x : _, b) -> (x, b)
+        ([], b) -> ("_", b)
+  pure $
+    Let "rcv%l" (get' "lost") $
+      Let "rcv%d" (Prim (Arith Wrap Sub) (v "rcv%l") (get' "seen")) $
+        If
+          (eq (v "rcv%d") (NumLit Nothing 0))
+          ( Let "rcv%t" (get' "tail") $
+              If (eq (get' "head") (v "rcv%t")) (snd (arm "Empty")) $
+                Let "rcv%i" (Prim (Bits And) (v "rcv%t") (NumLit Nothing (n - 1))) $
+                  Let "rcv%k" (getAt' "tag" (v "rcv%i")) chain
+          )
+          (Seq (set' "seen" (v "rcv%l")) (bind lostX (v "rcv%d") lostB))
+  where
+    tails' xs = case xs of
+      [] -> []
+      _ : rest -> xs : tails' rest
 
 -- Variables ---------------------------------------------------------------------------------
 
@@ -302,7 +420,9 @@ check env tm expected = do
       (a', ea) <- check env a TUnit
       (b', eb) <- check env b ex
       pure (Seq a' b', ea <> eb)
-    (Case e alts, _) -> caseTerm e alts (Just ex)
+    (Case e alts, _)
+      | Just q <- receiveOf env e -> receiveTerm env q alts >>= \r -> check env r ex
+      | otherwise -> caseTerm e alts (Just ex)
     _ -> do
       (tm', t, eff) <- infer env tm
       rel True t ex
@@ -510,6 +630,40 @@ infer env tm = case tm of
             (v', ev) <- check env v (TInt it)
             pure (store (slot n i') v', TUnit, S.insert panicE (shared <> ei <> ev))
           _ -> failWith Mismatch (cellUse c len)
+  -- post(q, C(e, …)) (spec/surface.md, "Queues"): the arguments, then the tag and fields
+  -- in the slot at head, then head moves on; a full queue counts the message as lost.
+  App (Var "post") a
+    | Nothing <- M.lookup "post" (eLocals env)
+    , not (M.member "post" (sDefs sig))
+    , Just (q, args) <- spread a
+    , Just (n, d, cs) <- M.lookup q (sQueues sig) -> case map unAt args of
+        [Con c [] es] | Just (j, fs) <- lookup c [(c', (j, fs)) | (j, (c', fs)) <- zip [0 ..] cs] -> do
+          when (length es /= length fs) $
+            failWith Mismatch (c ++ " has " ++ show (length fs) ++ " fields, given " ++ show (length es))
+          rs <- zipWithM (check env) es (map TInt fs)
+          (xs, _) <- binders env [("post%" ++ show i, TInt f) | (i, f) <- zip [0 :: Int ..] fs]
+          (h, _) <- binder env "post%h" (TInt u32)
+          let off c' = case M.lookup (q ++ "%" ++ c') (sCells sig) of
+                Just (o, _, _) -> o
+                Nothing -> error ("queue cell " ++ q ++ "%" ++ c')
+              load c' = Convert u32 (Perform "%cellLoad" (IntLit usize (off c')))
+              store k v = Perform "%cellStore" (Pair k (Convert usize v))
+              at c' = Prim (Arith Wrap Add) (IntLit usize (off c')) (Convert usize (Prim (Bits And) (Var h) (IntLit u32 (n - 1))))
+              wrapAdd x = Prim (Arith Wrap Add) x (IntLit u32 1)
+              full = Prim Eq (Prim (Arith Wrap Sub) (Var h) (load "tail")) (IntLit u32 n)
+              put' =
+                foldr1 Seq $
+                  store (at "tag") (IntLit u32 j)
+                    : [store (at ("f" ++ show i)) (Var x) | (i, x) <- zip [0 :: Int ..] xs]
+                    ++ [store (IntLit usize (off "head")) (wrapAdd (Var h))]
+              body = Let h (load "head") (If full (store (IntLit usize (off "lost")) (wrapAdd (load "lost"))) put')
+          pure (foldr (\(x, (e', _)) b -> Let x e' b) body (zip xs rs), TUnit, S.insert sharedE (S.unions (map snd rs)))
+        _ -> failWith Mismatch ("post(" ++ q ++ ", m): m is a " ++ d ++ " constructor written out there, as in post(" ++ q ++ ", " ++ concat (take 1 (map fst cs)) ++ "(…))")
+  App (Var "receive") a
+    | Nothing <- M.lookup "receive" (eLocals env)
+    , not (M.member "receive" (sDefs sig))
+    , Var q <- unAt a
+    , M.member q (sQueues sig) -> failWith Mismatch ("receive(" ++ q ++ ") is only the scrutinee of a case with one alternative per message and no _: case receive(" ++ q ++ ") of { C(x, …) -> … | Lost(n) -> … | Empty -> … }")
   App (Var op) a
     | Nothing <- M.lookup op (eLocals env)
     , not (M.member op (sDefs sig))
@@ -603,6 +757,7 @@ infer env tm = case tm of
     (d, fields, tys') <- conInfo env c tys
     rs <- zipWithM (check env) args (map (inst env c tys') fields)
     pure (Con c tys' (map fst rs), TData d tys', S.unions (map snd rs))
+  Case e alts | Just q <- receiveOf env e -> receiveTerm env q alts >>= infer env
   Case e alts -> do
     (t, c', eff) <- caseOf env e alts Nothing
     pure (c', t, eff)

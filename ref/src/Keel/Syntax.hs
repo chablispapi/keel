@@ -330,6 +330,7 @@ resolveWord w (Program decls main) = Program (map decl decls) (term main)
       Def f t e -> Def f (ty t) (term e)
       Bitdata n i fs -> Bitdata n (it i) fs
       Cell n i len v -> Cell n (it i) len v
+      Queue {} -> d
     term tm = descend term $ case tm of
       IntLit i n -> IntLit (it i) n
       Convert i e -> Convert (it i) e
@@ -402,6 +403,7 @@ data Decl
   | Def String Ty Term
   | Bitdata String IntTy [(String, Int, Int)] -- ^ name, underlying integer, fields (low bit, width); front end only
   | Cell String IntTy (Maybe Integer) Integer -- ^ name, element type, array length (Nothing: one), initial value
+  | Queue String String Integer -- ^ name, message data type, capacity; front end only ("Keel.Infer" makes it cells)
   deriving (Eq, Show)
 
 data Program = Program [Decl] Term
@@ -531,6 +533,15 @@ cellSlots decls = M.fromList (zip names (zip3 (scanl (+) 0 sizes) tys lens))
     tys = [i | (_, i, _) <- cells]
     lens = [len | (_, _, len) <- cells]
     sizes = [fromMaybe 1 len | (_, _, len) <- cells]
+
+-- | A queue's cells (spec/surface.md, "Queues"), for a message type with at most k fields:
+-- the interrupt alone writes head, lost, the tags and the fields, main alone writes tail and
+-- seen, so each word has one writer and needs no lock.
+queueCells :: String -> Integer -> Int -> [Decl]
+queueCells q n k =
+  [Cell (q ++ "%" ++ c) u32 Nothing 0 | c <- ["head", "tail", "lost", "seen"]]
+    ++ Cell (q ++ "%tag") u32 (Just n) 0
+    : [Cell (q ++ "%f" ++ show i) usize (Just n) 0 | i <- [0 .. k - 1]]
 
 -- | The cell area's initial words, slot by slot.
 cellInits :: [Decl] -> [Integer]

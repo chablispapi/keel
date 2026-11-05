@@ -42,7 +42,7 @@ data Field = Field(List u8, u64, u64)
 data Decl =
     DData(Bool, List u8, List (List u8), List Ctor) | DCodata(List u8, List (List u8), List Ctor)
   | DEffect(List u8, List Ctor) | DDef(List u8, Ty, Term) | DBitdata(List u8, List u8, List Field)
-  | DCell(List u8, List u8, Bool, u64, u64)
+  | DCell(List u8, List u8, Bool, u64, u64) | DQueue(List u8, List u8, u64)
 
 -- Imports (module, qualifier), declarations (private?, declaration), main.
 data Module = Module(List (List u8, List u8), List (Bool, Decl), Option Term)
@@ -143,6 +143,7 @@ private def lastName : List (List u8) ->{Diverge} List u8 =
 private def startsDecl : List Token ->{Diverge} Bool =
   \ts. case tok ts of
     { Keyword(w) -> member w (string.split ' ' "private linear data codata effect bitdata cell def")
+    | Ident(w) -> string.equal w "queue"
     | _ -> false }
 
 private def declP : List Token ->{Diverge, Panic} ((Bool, Decl), List Token) =
@@ -156,6 +157,7 @@ private def declP : List Token ->{Diverge, Panic} ((Bool, Decl), List Token) =
       else if kwIs "effect" ts then effectP (next ts)
       else if kwIs "bitdata" ts then bitdataP (next ts)
       else if kwIs "cell" ts then cellP (next ts)
+      else if isQueue ts then queueP (next ts)
       else defP (expectKw "def" ts) in
     ((priv, d), ts)
 
@@ -219,6 +221,18 @@ private def cellP : List Token ->{Diverge, Panic} (Decl, List Token) =
     let ts = if arr then expect "]" ts else ts in
     let (v, ts) = if symIs "=" ts then natural (next ts) else (0, ts) in
     (DCell(n, it, arr, len, v), ts)
+
+-- queue is a keyword only at the start of a declaration (std.loop has a variable queue)
+private def isQueue : List Token ->{Diverge} Bool =
+  \ts. case tok ts of { Ident(w) -> string.equal w "queue" | _ -> false }
+
+-- queue name : [Message; 16]; DQueue(name, message type, capacity)
+private def queueP : List Token ->{Diverge, Panic} (Decl, List Token) =
+  \ts.
+    let (n, ts) = lower ts in
+    let (d, ts) = qualUpper (expect "[" (expect ":" ts)) in
+    let (len, ts) = natural (expect ";" ts) in
+    (DQueue(n, d, len), expect "]" ts)
 
 private def natural : List Token -> (u64, List Token) =
   \ts. case tok ts of { Num(v, w) -> (v, next ts) | _ -> (0, fail "expected a number" ts) }

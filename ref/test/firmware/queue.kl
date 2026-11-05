@@ -1,0 +1,30 @@
+-- test/firmware/cells.kl with a queue: each timer interrupt posts the tick number, and main
+-- receives them, sleeping in wfi while the queue is empty. The queue's cells and their one
+-- writer each are the compiler's (spec/surface.md, "Queues").
+
+def mstatus : usize = 0x300
+def mie : usize = 0x304
+def mtime : usize = 0x0200_BFF8
+def mtimecmp : usize = 0x0200_4000
+
+data Timer = Tick(u32)
+
+queue ticks : [Timer; 8]
+cell count : u32
+
+def rearm : Unit ->{MMIO, Panic, !Alloc} Unit =
+  \u. write32(mtimecmp + 4, 0); write32(mtimecmp, read32(mtime) + 10_000)
+
+def interrupt : usize ->{MMIO, Shared, Panic, !Alloc} Unit =
+  \cause. let n = get(count) in set(count, n +% 1); post(ticks, Tick(n)); rearm ()
+
+-- The sum of the next n ticks: 0 + 1 + … in order. A lost tick would be a bug: it panics.
+def drain : u32 -> u32 ->{Shared, Hart, Panic, Diverge} u32 =
+  \n acc. if n == 0 then acc else
+    case receive(ticks) of
+      { Tick(t) -> drain (n - 1) (acc + t)
+      | Lost(k) -> 1 / 0
+      | Empty -> wfi(); drain n acc }
+
+main = rearm (); csrSet(mie, 0x80); csrSet(mstatus, 0x8);
+       drain 20 0

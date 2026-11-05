@@ -1,0 +1,25 @@
+-- A queue from the interrupt side to main's (spec/surface.md, "Queues"). Hosted, main calls
+-- interrupt itself: each call posts the cause as a message. Four slots, so the sixth post in
+-- a row is lost, and main hears of it before the messages left.
+data Rx = Byte(u8) | Tick(u32, i8) | Stop
+
+queue rx : [Rx; 4]
+
+def interrupt : usize ->{Shared, !Alloc} Unit =
+  \cause. if cause == 0 then post(rx, Stop)
+    else if cause < 256 then post(rx, Byte(cause as u8))
+    else post(rx, Tick(cause as u32, -2))
+
+-- What main makes of each message, until Stop or an empty queue.
+def drain : i64 ->{Shared, Panic, Diverge, IO} i64 =
+  \acc. case receive(rx) of
+    { Byte(b) -> drain (acc + b as i64)
+    | Tick(t, d) -> drain (acc + t as i64 + d as i64)
+    | Stop -> out(acc); 0
+    | Lost(n) -> out(0 - n as i64); drain acc
+    | Empty -> acc }
+
+main = interrupt 7; interrupt 300; interrupt 9; out(drain 0);
+       interrupt 1; interrupt 2; interrupt 3; interrupt 4; interrupt 5;
+       out(drain 0);
+       interrupt 0; interrupt 1; drain 100

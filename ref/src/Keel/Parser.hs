@@ -166,7 +166,7 @@ moduleP = do
 
 -- | A declaration, and where each name it declares is written.
 decl :: Parser (Decl, [(String, Pos)])
-decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> cellDecl <|> defDecl
+decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> cellDecl <|> queueDecl <|> defDecl
   where
     -- A declared name and its position.
     site p = do
@@ -191,6 +191,13 @@ decl = dataDecl <|> codataDecl <|> effectDecl <|> bitdataDecl <|> cellDecl <|> d
       (it, len) <- brackets ((,) <$> intTy <* op ";" <*> (Just <$> natural)) <|> ((,Nothing) <$> intTy)
       v <- option 0 (op "=" >> natural)
       pure (Cell name it len v, [s])
+    -- queue name : [Message; 16]; queue is a keyword only here (std.loop has a variable queue)
+    queueDecl = do
+      reserved' "queue"
+      (name, s) <- site lower
+      op ":"
+      (d, n) <- brackets ((,) <$> qualUpper <* op ";" <*> natural)
+      pure (Queue name d n, [s])
     natural = number >>= \n -> case n of
       NumLit _ v -> pure v
       IntLit _ v -> pure v

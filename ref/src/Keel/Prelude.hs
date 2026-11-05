@@ -103,6 +103,7 @@ declared d = case d of
   Def f _ _ -> S.singleton f
   Bitdata n _ _ -> S.singleton n
   Cell n _ _ _ -> S.singleton n
+  Queue n _ _ -> S.singleton n
 
 -- | Names a declaration refers to: free variables, constructors and types. (A parameter that
 -- happens to share a user definition's name is not a mention.)
@@ -114,6 +115,7 @@ mentions d = case d of
   Effect _ ops -> S.unions [tyNames a <> tyNames r | (_, a, r) <- ops]
   Bitdata {} -> S.empty
   Cell {} -> S.empty
+  Queue _ dn _ -> S.singleton dn
   where
     termNames tm = case tm of
       Con c _ _ -> [c]
