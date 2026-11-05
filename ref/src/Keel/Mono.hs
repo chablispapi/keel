@@ -9,7 +9,7 @@ import Control.Monad (forM_, unless)
 import Data.List (intercalate)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
-import Keel.Check (ErrKind (..), TypeError (..), checkProgram, recursiveGroups)
+import Keel.Check (ErrKind (..), TypeError (..), checkProgram, localTypes, recursiveGroups)
 import Keel.Elab (checkRefs, elaborate)
 import Keel.Opt (optimizeWith)
 import Keel.Syntax
@@ -40,6 +40,7 @@ monomorphize (Program decls main) = do
       others = [d | d <- decls, not (isDef d)]
       seeds = concatMap (\(_, _, e) -> instancesIn e) monoDefs ++ instancesIn main
       instances = specialize poly M.empty seeds
+  noAccidentalHandling decls (concatMap requestsAt (main : [e | (_, _, e) <- monoDefs] ++ [e | (_, e) <- M.elems instances]))
   pure $
     Program
       ( others
@@ -69,6 +70,60 @@ specialize poly done ((f, tys, effs) : rest)
          in specialize poly (M.insert name (substTy tv ev body, e') done) (instancesIn e' ++ rest)
   where
     name = mangle f tys effs
+
+-- | A polymorphic definition that handles l around code whose effects mention its effect
+-- variable 'e can't be instantiated with l in 'e: that code's l operations, which are the
+-- caller's, would reach the definition's own handler instead of the caller's. Keel has no
+-- lift to make them skip it (spec/core.md §4.4, "Accidental handling"), so this is an error.
+-- 'e counts as mentioned when a variable, λ or instantiation in the handled code has it in
+-- its type: a little more than the code's effect, never less.
+noAccidentalHandling :: [Decl] -> [(String, [Eff], Maybe Pos)] -> Either TypeError ()
+noAccidentalHandling decls requests = case [(msg, maybe mp Just p) | (f, effs, p) <- requests, (msg, mp) <- clashes f effs] of
+  (msg, p) : _ -> Left (TypeError Unhandled msg p)
+  [] -> Right ()
+  where
+    handled = M.fromList [(f, (es, handlers e)) | Def f (TForall _ es@(_ : _) _) e <- decls]
+    -- Each handler's label, and each effect variable its handled code mentions, with where.
+    handlers e =
+      let lt = localTypes decls e
+          mentions tm = case tm of
+            Var x -> maybe S.empty effVars (M.lookup x lt)
+            Lam _ t _ -> effVars t
+            LLam _ t _ -> effVars t
+            TyApp _ _ es' -> S.unions [S.filter isEffVar e' | e' <- es']
+            _ -> S.empty
+       in [ (l, M.toList (M.fromListWith (\_ first -> first) [(v, p) | (tm, p) <- positioned Nothing b, v <- S.toList (mentions tm)]))
+          | Handle l b _ <- universe e
+          ]
+    positioned p tm = (tm, p) : case tm of
+      At q e -> positioned (Just q) e
+      _ -> concatMap (positioned p) (children tm)
+    clashes f effs = case M.lookup f handled of
+      Nothing -> []
+      Just (es, hs) ->
+        let ev = M.fromList (zip es effs)
+         in [ (f ++ " handles " ++ l ++ " around code with effect " ++ v ++ ", and here " ++ v ++ " has " ++ l ++ ": that code's " ++ l ++ " operations would reach " ++ f ++ "'s handler, not the caller's. Handle them before passing the code to " ++ f, mp)
+            | (l, vs) <- hs
+            , (v, mp) <- vs
+            , l `S.member` M.findWithDefault S.empty v ev
+            ]
+    effVars t = case t of
+      TFun a e b -> S.filter isEffVar e <> effVars a <> effVars b
+      TLFun a e b -> S.filter isEffVar e <> effVars a <> effVars b
+      TData _ as -> S.unions (map effVars as)
+      TBox a -> effVars a
+      TPair a b -> effVars a <> effVars b
+      TForall _ _ b -> effVars b
+      _ -> S.empty
+
+-- | Instantiations requested by a term, with where (the innermost position around each).
+requestsAt :: Term -> [(String, [Eff], Maybe Pos)]
+requestsAt = go Nothing
+  where
+    go p tm = case tm of
+      At q e -> go (Just q) e
+      TyApp f _ effs -> [(f, effs, p)]
+      _ -> concatMap (go p) (children tm)
 
 -- | Instantiations requested by a term.
 instancesIn :: Term -> [(String, [Ty], [Eff])]

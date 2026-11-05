@@ -119,6 +119,7 @@ Each of these has tripped up someone who had the spec open:
 | `def interrupt` doing `out(…)` when `main` never prints | `def interrupt has effects {IO} that main doesn't` | `main` must have the handler's effects: give it the operation too, or drop it from the handler |
 | `case receive(rx) of { Byte(b) -> … \| _ -> … }` | `receive(rx): _ would hide a message` | an alternative for each message, plus `Lost(n)` and `Empty` |
 | `post(rx, m)` with `m` a variable, or `post` in a function `main` calls | `m is a Rx constructor written out there`, or `only def interrupt, and what it calls, posts to a queue` | `post(rx, Byte(b))`, in the handler's side only |
+| a `forall 'e` function that handles `Log` around a `'e` argument, called with a `Log`-performing function | `quiet handles Log around code with effect 'e, and here 'e has Log` | handle the argument's `Log` before passing it: `quiet (\u. handle … with Log { … })` |
 | `write8 p` with `p` a pair variable, in a `!Alloc` function | `… is !Alloc, but it uses p, which holds a heap block` | write the pair at the call, `write8(a, v)`: then the two words go in registers |
 | `p.x` on data | `can't tell the type before .x (got P); add a type annotation`. Ignore the hint: `.obs` is only for codata, and data has no field access | match: `case p of { P(x, _) -> x }` |
 

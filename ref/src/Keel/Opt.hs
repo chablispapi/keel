@@ -14,14 +14,21 @@
 --    floats out; both keep call-by-value evaluation order. Likewise a pair or constructor taken
 --    apart where it is built (@let (x, y) = (a, b) in e@, @case C(a) of { C(x) -> e | … }@)
 --    becomes @let@s of its components: no block is allocated.
--- 4. __Dead definitions__ (not reachable from @main@) are removed.
+-- 4. __Handler elimination.__ A handler goes away when nothing it handles needs it at run
+--    time: it is pushed through lets, ifs and cases to the operations it handles, which become
+--    their clauses, and dropped around code that can't perform its label (the rules
+--    (handle.let), (handle.do) and (handle.v) of Sieczkowski, Pyzik and Biernacki, "A general
+--    fine-grained reduction theory for effect handlers", JFP 2026; Keel's clauses resume in
+--    tail position, so their return clause is the identity). All or nothing: a handler that is
+--    still needed somewhere stays where it was, so no clause ever needs a lift.
+-- 5. __Dead definitions__ (not reachable from @main@) are removed.
 --
 -- Inlined code is renamed apart, since the core forbids shadowing. The result is checked
 -- again by the core checker ("Keel.Mono".compile).
 module Keel.Opt (optimize, optimizeWith) where
 
 import Control.Monad (forM)
-import Control.Monad.Trans.State.Strict (State, evalState, get, gets, modify, put, runState)
+import Control.Monad.Trans.State.Strict (State, evalState, get, gets, modify, put, runState, state)
 import Data.List (intercalate)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
@@ -303,6 +310,72 @@ simplify (Program decls main) = evalState go (0 :: Int)
       ArrayPrim AEmpty _ [] -> True
       _ -> False
 
+    defTys = M.fromList [(f, t) | Def f t _ <- decls]
+    opLabel = M.fromList [(op, l) | (l, ops) <- builtinEffects ++ [(l, os) | Effect l os <- decls], (op, _, _) <- ops]
+
+    -- Can evaluating tm perform an operation of l (that no handler inside tm catches)?
+    -- ponytail: a call is known only when its head is a definition; any other call may.
+    mayPerform l tm = case tm of
+      At _ e -> mayPerform l e
+      Perform op a -> M.lookup op opLabel == Just l || mayPerform l a
+      App {} -> callPerforms l tm || any (mayPerform l) (snd (spine tm))
+      Handle l' b cs -> (l' /= l && mayPerform l b) || any (\(_, _, c) -> mayPerform l c) cs
+      Lam {} -> False
+      LLam {} -> False
+      Cocase {} -> False
+      Proj {} -> True
+      ArrayPrim AArena _ _ -> True
+      _ -> any (mayPerform l) (children tm)
+
+    -- Does the call itself (not its arguments) perform l?
+    callPerforms l tm = case spine tm of
+      (Var g, args) | Just t <- M.lookup g defTys -> l `S.member` S.unions [e | (_, e, _) <- fst (arrows (length args) t)]
+      _ -> True
+
+    -- A term that evaluates its children in order, where it stands, then does something that
+    -- doesn't perform l: the handler goes into each child ((handle.let) with the lets implicit).
+    strict l tm = case tm of
+      Prim {} -> True
+      Pair {} -> True
+      Con {} -> True
+      Box _ -> True
+      Unbox _ -> True
+      Convert {} -> True
+      FloatPrim {} -> True
+      ArrayPrim op _ _ -> op /= AArena
+      Perform op _ -> M.lookup op opLabel /= Just l
+      App {} -> not (callPerforms l tm)
+      _ -> False
+
+    -- handle tm with l {cs} without the handler, if no part of tm needs it.
+    unhandle l cs tm
+      | not (mayPerform l tm) = pure (Just tm)
+      | otherwise = case tm of
+          At p e -> fmap (At p) <$> unhandle l cs e
+          Perform op a | Just (x, b) <- lookup op [(o, (x, b)) | (o, x, b) <- cs] -> do
+            a' <- unhandle l cs a
+            traverse (\a'' -> rename (Let x a'' b)) a'
+          Let x a b -> both (Let x) a b
+          LetPair x y a b -> both (LetPair x y) a b
+          If c a b -> do
+            c' <- unhandle l cs c
+            ab <- both (,) a b
+            pure (If <$> c' <*> fmap fst ab <*> fmap snd ab)
+          Case e alts -> do
+            e' <- unhandle l cs e
+            bs <- mapM (unhandle l cs . (\(_, _, b) -> b)) alts
+            pure (Case <$> e' <*> sequence [(c,xs,) <$> b | ((c, xs, _), b) <- zip alts bs])
+          _ | strict l tm -> do
+                cs' <- mapM (unhandle l cs) (children tm)
+                pure (fill tm <$> sequence cs')
+          _ -> pure Nothing
+      where
+        fill t xs = evalState (descendM (const (state (\ys -> case ys of y : rest -> (y, rest); [] -> (UnitLit, [])))) t) xs
+        both k a b = do
+          a' <- unhandle l cs a
+          b' <- unhandle l cs b
+          pure (k <$> a' <*> b')
+
     go = do
       decls' <- forM decls $ \d -> case d of
         Def f t e -> Def f t <$> rounds 4 e
@@ -327,6 +400,8 @@ simplify (Program decls main) = evalState go (0 :: Int)
           e' <- rename e
           beta e' a
         App f a -> beta f a
+        -- Each handled operation becomes a copy of its clause: at most 8, for code size.
+        Handle l b cs | length [() | Perform op _ <- universe b, op `elem` [o | (o, _, _) <- cs]] <= 8 -> fromMaybe tm' <$> unhandle l cs b
         -- A pair or constructor taken apart where it is built: no block, its components bound
         -- in order (the core forbids shadowing, so no component sees the new names).
         LetPair x y e b | Pair p q <- stripAt e -> pure (Let x p (Let y q b))

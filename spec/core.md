@@ -845,6 +845,24 @@ may only be instantiated at the caller's own type variables. For example,
 `depth : ∀a. Nested a → i64` calling `depth[List a]` is rejected; `pmap` calling
 `pmap[a, b]` is fine. Effect arguments are unrestricted.
 
+**Accidental handling is rejected** (`Unhandled`). A polymorphic definition can handle a label
+around code whose effect is its effect variable:
+
+```
+def quiet : ∀'e. (Unit →{'e} i64) →{'e} i64 = λf. handle (log(100); f ()) with Log { log x → () }
+```
+
+`quiet[{Log}]` would catch the caller's `log`s in `quiet`'s own handler: instantiating `'e`
+would change what the program does, not just its type. Calculi with `lift` (Koka's `mask`)
+make such operations skip the nearest handler, and `lift` can't be expressed with the other
+constructs (Sieczkowski, Pyzik and Biernacki, "A general fine-grained reduction theory for
+effect handlers", JFP 2026, §2.4). Keel has no `lift`: its effects are sets, which can't say
+which of two `Log`s an operation means. So an instance `f[τ̄; ε̄]` is an error when `f` handles
+`l` around code that mentions an effect variable `ρ` (a variable, λ or instantiation there has
+`ρ` in its type) and `ε̄` gives `ρ` a set containing `l`. Every instance whose meaning would
+change is rejected, and no other. The error points at the code; handling the operations
+before passing them in (`quiet (λu. handle … with Log { … })`) is the fix.
+
 **Output.** No `∀`, no instantiation, and no type variable in any definition or in `main`
 (`isClosed`). Data and codata declarations stay parameterized: they are layout *templates*,
 and the backend lays out `List[i64]` and `List[Token]` separately, as Rust does with

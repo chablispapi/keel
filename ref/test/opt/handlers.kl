@@ -1,0 +1,15 @@
+-- Handler elimination (Keel.Opt): once twice is inlined, every operation under each handler is
+-- in sight, so the handlers become their clauses and nothing is allocated (a handler frame
+-- and its clauses are blocks). The nested case checks that a clause's own sample goes to the
+-- handler outside it, as without the rewrite.
+effect Sensor { sample : i64 => i64 }
+
+def twice : i64 ->{Sensor, Panic} i64 = \i. sample(i) + sample(i + 1)
+
+def pick : Bool ->{Sensor, Panic} i64 = \b. if b then sample(1) else 7
+
+main =
+  out(handle twice 3 with Sensor { sample i -> i * 10 });
+  out(handle (let a = pick true in a + pick false) with Sensor { sample i -> i + 100 });
+  out(handle (handle sample(1) with Sensor { sample i -> sample(i) + 1 }) with Sensor { sample i -> i * 100 });
+  handle 5 with Sensor { sample i -> 0 }

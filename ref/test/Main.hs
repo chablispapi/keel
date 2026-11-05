@@ -66,6 +66,16 @@ positionCases =
   , ("position: !Alloc and a partial application", "def add : i64 -> i64 ->{Panic, !Alloc} i64 = \\a b. a + b\ndef f : i64 ->{Panic, !Alloc} i64 = \\n. let h = add n in h 1\nmain = f 1\n", EffectMismatch, (2, 49))
   , ("position: an interrupt handler that may allocate", "def interrupt : usize -> Unit = \\c. ()\nmain = 0\n", Mismatch, (1, 33))
   , ("position: an interrupt handler with effects main lacks", "def interrupt : usize ->{IO, !Alloc} Unit = \\c. out(1)\nmain = 0\n", Unhandled, (1, 45))
+  , ( "position: a handler that would catch its caller's operations"
+    , unlines
+        [ "effect Log { log : i64 => Unit }"
+        , "def quiet : forall 'e. (Unit ->{'e} i64) ->{'e} i64 ="
+        , "  \\f. handle (log(100); f ()) with Log { log x -> () }"
+        , "main = handle quiet (\\u. log(7); 1) with Log { log x -> out(x) }"
+        ]
+    , Unhandled
+    , (3, 25)
+    )
   , ("position: a cell used as a value", "cell n : u32\nmain = n + 1\n", Mismatch, (2, 8))
   , ("position: !Alloc on an early arrow", "def add : i64 ->{!Alloc} i64 ->{Panic, !Alloc} i64 = \\a b. a + b\nmain = add 1 2\n", EffectMismatch, (1, 54))
   , ("position: % on f64", "def f : f64 -> f64 = \\x. x % 2.0\nmain = 0\n", Mismatch, (1, 26))

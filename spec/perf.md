@@ -112,6 +112,19 @@ is what notes.md §16 promised for explicit dictionaries + monomorphization. The
 is type-checked again, and the test runner checks it computes the same result as the
 unoptimized one on every test.
 
+**Handler elimination** (`unhandle` in `ref/src/Keel/Opt.hs`). After inlining, a `handle`
+whose operations are all in sight is replaced by its clauses: it goes through `let`, `if`,
+`case` and the arguments of strict operations to each operation it handles, which becomes a
+copy of its clause (at most 8), and is dropped around code that can't perform its label.
+These are the rules (handle.let), (handle.do) and (handle.v) of Sieczkowski, Pyzik and
+Biernacki (JFP 2026), proven to preserve observational equivalence; Keel's clauses resume in
+tail position, so the return clause is the identity. It is all or nothing: a handler still
+needed anywhere (an operation reached through a call it can't see into) stays as it was, so a
+clause never has to skip the handler it came from. A handler costs a frame and a closure per
+clause, so `test/opt/handlers.kl` goes from 4 allocations to none. Handlers around recursive
+functions, such as `handle average 4 0 with Sensor`, stay: that needs a copy of the function
+specialized on the handler.
+
 **Specialization on capturing λs** (`liftClosed` and `specialize` in `ref/src/Keel/Opt.hs`).
 A λ argument that captures locals, `map (\x. x + k) xs`, is lifted to `lam'n = \k. \x. x + k`
 and passed as the partial application `lam'n k`; the call then uses
