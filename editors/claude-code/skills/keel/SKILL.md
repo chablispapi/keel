@@ -108,6 +108,7 @@ Each of these has tripped up someone who had the spec open:
 | `Cons('+', rest)` in a pattern | parse error: literals only work as the top-level alternatives | `Cons(c, rest) -> if c == '+' then … else …` |
 | `map.insert k v m` | type error: no type classes | pass the comparison: `map.insert compareInt k v m`, `string.compare` for strings |
 | an unused linear value | `Dropped: x is linear but unused` | consume it (pass it on, or match it to the end) |
+| `_ -> …` covering constructors with linear fields | `Dropped: _ drops Full's linear field of type Tok; list Full to use it` | list those constructors and consume their fields |
 | `arena (\u. buildList 10)` | `arena: the result is a pointer` | return a number from it: `arena (\u. length (buildList 10))` |
 | a fallthrough nested pattern on `linear data` | `a linear value can't be matched twice` | cover every constructor at each level |
 | `if c then a else b; e` meaning `else (b; e)` | `;` binds looser than `if`, so `e` runs after either branch; often `expected Unit, got …` on the `then` branch | parenthesize the branch: `else (b; e)` |

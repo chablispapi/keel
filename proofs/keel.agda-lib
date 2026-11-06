@@ -1,0 +1,3 @@
+name: keel-proofs
+depend: standard-library
+include: .

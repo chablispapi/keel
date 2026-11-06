@@ -343,6 +343,14 @@ cases =
   , ("default branch", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "C" [] [int 5]) [("A", [], int 1), ("_", [], int 2)]), ok (VInt i64 2))
   , ("listed branch before a default", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "A" [] []) [("A", [], int 1), ("_", [], int 2)]), ok (VInt i64 1))
   , ("default covering nothing", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "A" [] []) [("A", [], int 1), ("B", [], int 1), ("C", ["n"], Var "n"), ("_", [], int 2)]), Rejects NonExhaustive)
+  , ( "default dropping a linear field"
+    , Program [token, Data True "Bag" [] [("Full", [tTok]), ("Half", [tTok]), ("Empty", [])]] (Case (Con "Empty" [] []) [("Empty", [], int 0), ("_", [], int 1)])
+    , Rejects Dropped
+    )
+  , ( "default covering only free fields of linear data"
+    , Program [token, consume, Data True "Bag" [] [("Full", [tTok]), ("Count", [tI]), ("Empty", [])]] (Case (Con "Full" [] [Con "Token" [] []]) [("Full", ["t"], App (Var "consume") (Var "t")), ("_", [], int 2)])
+    , ok (VInt i64 1)
+    )
   , ("default not last", Program [Data False "ABC" [] [("A", []), ("B", []), ("C", [tI])]] (Case (Con "A" [] []) [("_", [], int 2), ("A", [], int 1)]), Rejects NonExhaustive)
   , ("type mismatch", Program [] (add (int 1) (BoolLit True)), Rejects Mismatch)
   , ("shadowing", Program [] (Let "x" (int 1) (Let "x" (int 2) (Var "x"))), Rejects Shadowing)

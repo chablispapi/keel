@@ -2,7 +2,8 @@
 
 Keel is a linear, effect-typed language for systems code. This repository has its compiler,
 `keelc` (Haskell, in `ref/`), its specification (`spec/`), a parser written in Keel
-(`ref/selfhost/`), and editor support (`editors/`).
+(`ref/selfhost/`), editor support (`editors/`), and λK₁ formalized in Agda (`proofs/`; a
+change to `spec/core.md` §1 updates it, and `agda Everything.agda` there must pass).
 
 ## Writing Keel
 

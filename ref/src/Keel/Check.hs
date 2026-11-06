@@ -616,7 +616,11 @@ infer s rec ctx tm = case tm of
       [] -> unless exact $ err NonExhaustive ("case must match each of " ++ show (map fst ctors) ++ " exactly once")
       [[]] | covered, [c | (c, _, _) <- alts] == listed ++ ["_"] -> pure ()
       _ -> err NonExhaustive ("case must match some of " ++ show (map fst ctors) ++ " once each, then one default _ for the rest")
-    rs <- forM alts $ \(c, xs, body) -> do
+    -- The default binds nothing, so every constructor it covers must have only free fields.
+    unless (null defaults) $
+      forM_ [(c, t) | (c, fs) <- ctors, c `notElem` listed, t <- map inst fs, kindOf s t == Lin] $ \(c, t) ->
+        err Dropped ("_ drops " ++ c ++ "'s linear field of type " ++ prettyTy t ++ "; list " ++ c ++ " to use it")
+    rs <-forM alts $ \(c, xs, body) -> do
       let fields = fromMaybe [] (lookup c ctors) -- present: checked against ctors above
       when (length xs /= length fields) $ err Mismatch (c ++ ": wrong number of pattern variables")
       bind (zip xs (map inst fields)) body

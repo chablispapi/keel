@@ -134,7 +134,9 @@ discipline.
 
 A case may instead list some of the constructors, each once, and end with a **default**
 `_ → e₀`, which binds nothing and is typed like the other branches (`Γ₂ ⊢ e₀ : σ`); it covers
-every constructor not listed, and at least one must be left for it. The surface language's
+every constructor not listed, and at least one must be left for it. Since it binds nothing,
+every field of a constructor it covers must be `Free`: otherwise the default would drop a
+linear value. The surface language's
 `_ → e` becomes one, so its body is compiled once rather than copied into each constructor.
 
           Γ ⊢ e : τ                       Γ ⊢ e : Box τ
@@ -157,6 +159,7 @@ linear variables of Γ that `e` uses:
 | two subterms used together (app, op, let, con, scrutinee + branches) | `U₁ ∪ U₂`, requires `U₁ ∩ U₂ = ∅` | `Duplicate` |
 | `if` / `case` branches | all branches must have equal U | `BranchMismatch` |
 | binder `x:τ` with κ(τ) = Lin (λ, let, pattern) | requires `x ∈ U_body`, then `U_body ∖ {x}` | `Dropped` |
+| default `_ → e₀` | every field of every constructor it covers has kind `Free` | `Dropped` |
 | `λ(x:τ). e` (free closure) | requires `U_body ∖ {x} = ∅` | `LinearCapture` |
 | `λ°(x:τ). e` | `U_body ∖ {x}` (captured linear values) | |
 
