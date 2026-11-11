@@ -1746,34 +1746,7 @@ emitRuntime used = do
   ins "ldr x12, [sp, #24]"
   ins "b L_drop_elems"
 
-  -- _keel_free_block: x0 = block with count 0 → push it on its size's free list.
-  fn "_keel_free_block"
-  ins "ldr x10, [x0, #-8]"
-  ins "ubfx x11, x10, #32, #8" -- its words (an array's: capped at 255)
-  ins "tbz w10, #9, L_free_size" -- fieldLayouts = 512: the header holds a field
-  ins "and w10, w10, #0x1ff"
-  address "x11" "_keel_layouts"
-  ins "ldr w11, [x11, x10, lsl #2]"
-  ins "and w11, w11, #0xff"
-  line "L_free_size:"
-  ins ("cmp x11, #" ++ show maxSmall)
-  ins "b.hi L_free_ret" -- ponytail: large blocks are not recycled
-  address "x12" "_keel_freelists"
-  ins "ldr x13, [x12, x11, lsl #3]"
-  ins "cbz x11, L_free_link0"
-  ins "str x13, [x0]" -- the link, in the first word
-  ins "str x0, [x12, x11, lsl #3]"
-  line "L_free_ret:"
-  ins "ret"
-  -- A block of no words: the link in its header's high half, in words from it (0: none).
-  line "L_free_link0:"
-  ins "sub x14, x13, x0"
-  ins "asr x14, x14, #3"
-  ins "cmp x13, #0"
-  ins "csel x14, xzr, x14, eq"
-  ins "str w14, [x0, #-4]"
-  ins "str x0, [x12, x11, lsl #3]"
-  ins "ret"
+  R.freeBlock asmArm (toInteger maxSmall)
 
   -- _keel_drop_reuse: x0 = block, x1 = the fields taken over (a mask of words) → x0 = the
   -- block, if it was unique (its other children dropped, count 0 until reused), or 0 after an

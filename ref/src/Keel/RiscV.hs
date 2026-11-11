@@ -1496,39 +1496,7 @@ emitRuntime = do
   ins "ld t2, 8(sp)"
   ins "j .L_drop_elems"
 
-  -- _keel_free_block: a0 = block with count 0 → its size's free list.
-  fn "_keel_free_block"
-  ins "lbu t0, -4(a0)" -- its words (an array's: capped at 255)
-  ins "lw t1, -8(a0)"
-  ins "andi t1, t1, 0x200" -- fieldLayouts = 512: the header holds a field
-  ins "beqz t1, .L_free_size"
-  ins "lw t0, -8(a0)"
-  ins "andi t0, t0, 0x1ff"
-  ins "la t1, _keel_layouts"
-  ins "slli t0, t0, 2"
-  ins "add t1, t1, t0"
-  ins "lbu t0, 0(t1)"
-  line ".L_free_size:"
-  li "t1" (toInteger maxSmall)
-  ins "bgtu t0, t1, .L_free_ret"
-  ins "la t1, _keel_freelists"
-  ins "slli t0, t0, 3"
-  ins "add t1, t1, t0"
-  ins "ld t2, 0(t1)"
-  ins "beqz t0, .L_free_link0"
-  ins "sd t2, 0(a0)" -- the link, in the first word
-  ins "sd a0, 0(t1)"
-  ins "ret"
-  -- A block of no words: the link in its header's high half, in words from it (0: none).
-  line ".L_free_link0:"
-  ins "beqz t2, .L_free_link"
-  ins "sub t2, t2, a0"
-  ins ("srai t2, t2, " ++ show sh)
-  line ".L_free_link:"
-  ins "sw t2, -4(a0)"
-  ins "sd a0, 0(t1)"
-  line ".L_free_ret:"
-  ins "ret"
+  R.freeBlock (asmRv w) (toInteger maxSmall)
 
   -- Arrays: as in "Keel.AArch64" (payload [length, capacity, elements…]; the layout is
   -- arrayLayout plus the kind: 0 for 4-byte elements, 1 words, 2 pointers).

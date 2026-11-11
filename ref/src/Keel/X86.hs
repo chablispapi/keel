@@ -1320,36 +1320,7 @@ emitRuntime used = do
   ins "call _keel_drop"
   ins "jmp .L_drop_elems"
 
-  -- _keel_free_block: rax = block with count 0 → its size's free list. Clobbers rcx, rdx, rsi.
-  fn "_keel_free_block"
-  ins "movzx ecx, byte ptr [rax - 4]" -- its words (an array's: capped at 255)
-  ins ("test dword ptr [rax - 8], " ++ show fieldLayouts) -- the header holds a field
-  ins "jz .L_free_size"
-  ins "mov edx, dword ptr [rax - 8]"
-  ins "and edx, 0x1ff"
-  address "rsi" "_keel_layouts"
-  ins "movzx ecx, byte ptr [rsi + rdx*4]"
-  line ".L_free_size:"
-  ins ("cmp rcx, " ++ show maxSmall)
-  ins "ja .L_free_ret" -- ponytail: large blocks are not recycled
-  address "rsi" "_keel_freelists"
-  ins "mov rdx, qword ptr [rsi + rcx*8]"
-  ins "test rcx, rcx"
-  ins "jz .L_free_link0"
-  ins "mov qword ptr [rax], rdx" -- the link, in the first word
-  ins "mov qword ptr [rsi + rcx*8], rax"
-  line ".L_free_ret:"
-  ins "ret"
-  -- A block of no words: the link in its header's high half, in words from it (0: none).
-  line ".L_free_link0:"
-  ins "test rdx, rdx"
-  ins "jz .L_free_link"
-  ins "sub rdx, rax"
-  ins "sar rdx, 3"
-  line ".L_free_link:"
-  ins "mov dword ptr [rax - 4], edx"
-  ins "mov qword ptr [rsi], rax"
-  ins "ret"
+  R.freeBlock asmX86 (toInteger maxSmall)
 
   -- _keel_drop_reuse: rax = block, rdi = the fields taken over (a mask of words) → rax = the
   -- block if it was unique (its other children dropped, count 0 until reused), or 0 after an
