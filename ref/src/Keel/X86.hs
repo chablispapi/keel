@@ -30,7 +30,9 @@ import Data.Set qualified as S
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Keel.AArch64 (Loc (..), constData, Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, performedOps, prepare, printerTypes, pruneRuntime, reduction, runtimeBegin, runtimeEnd, template, uses)
+import Keel.Asm qualified as K
 import Keel.Lower
+import Keel.Runtime (arenaOpen)
 import Keel.Syntax
 import Numeric (showOct)
 
@@ -1149,6 +1151,94 @@ emitEntry printers t = do
 
 -- | The runtime, as in "Keel.AArch64" (spec/memory.md). Its routines take rax, rdi, rsi (Keel's
 -- convention) and keep the stack 16-byte aligned at their calls.
+-- | The portable assembler ("Keel.Asm") for the shared runtime: A = rax, rdi, rsi; T = rcx,
+-- rdx, r8, r9 (what the allocator may clobber), then r10, r11.
+asmX86 :: K.Asm G
+asmX86 =
+  K.Asm
+    { K.wordBytes = 8
+    , K.mov = \d o -> case o of
+        K.R s -> ins ("mov " ++ q d ++ ", " ++ q s)
+        K.I n -> li (q d) n
+    , K.op = \o d a b -> do
+        when (d /= a) $ do
+          when (b == K.R d) $ error ("asmX86: " ++ show o ++ " into its second operand")
+          ins ("mov " ++ q d ++ ", " ++ q a)
+        case (o, b) of
+          (_, K.I n) -> ins (opName o ++ " " ++ q d ++ ", " ++ show n)
+          (_, K.R r) | o `notElem` [K.Shl, K.Shr, K.Sar] -> ins (opName o ++ " " ++ q d ++ ", " ++ q r)
+          (_, K.R (K.T 0)) -> ins (opName o ++ " " ++ q d ++ ", cl")
+          _ -> error "asmX86: a shift by a register other than T 0 (rcx)"
+    , K.load = \w d b off -> case w of
+        K.Byte -> ins ("movzx " ++ w32 (q d) ++ ", byte ptr [" ++ q b ++ disp off ++ "]")
+        K.Half32 False -> ins ("mov " ++ w32 (q d) ++ ", " ++ mem32 (q b) off)
+        K.Half32 True -> ins ("movsxd " ++ q d ++ ", " ++ mem32 (q b) off)
+        K.Word -> ins ("mov " ++ q d ++ ", " ++ mem (q b) off)
+    , K.store = \w v b off -> case w of
+        K.Byte -> ins ("mov byte ptr [" ++ q b ++ disp off ++ "], " ++ low8 (q v))
+        K.Half32 _ -> ins ("mov " ++ mem32 (q b) off ++ ", " ++ w32 (q v))
+        K.Word -> ins ("mov " ++ mem (q b) off ++ ", " ++ q v)
+    , K.loadIx = \d b i k -> ins ("mov " ++ q d ++ ", qword ptr [" ++ q b ++ " + " ++ q i ++ "*" ++ show (2 ^ k :: Int) ++ "]")
+    , K.storeIx = \v b i k _ -> ins ("mov qword ptr [" ++ q b ++ " + " ++ q i ++ "*" ++ show (2 ^ k :: Int) ++ "], " ++ q v)
+    , K.addScaled = \d a b k -> ins ("lea " ++ q d ++ ", [" ++ q a ++ " + " ++ q b ++ "*" ++ show (2 ^ k :: Int) ++ "]")
+    , K.branch = \c r o l -> case (c, o) of
+        (_, K.I 0) | c `elem` [K.Eq, K.Ne, K.Lts, K.Ges] -> do
+          ins ("test " ++ q r ++ ", " ++ q r)
+          ins (jcc (if c == K.Lts then "js" else if c == K.Ges then "jns" else cond c) ++ " " ++ l)
+        _ -> do
+          ins ("cmp " ++ q r ++ ", " ++ either id show (opnd o))
+          ins (jcc (cond c) ++ " " ++ l)
+    , K.branchBit = \set n r _ l -> ins ("bt " ++ q r ++ ", " ++ show n) >> ins ((if set then "jc " else "jnc ") ++ l)
+    , K.lowBit = \d s _ -> ins ("bsf " ++ q d ++ ", " ++ q s)
+    , K.jump = \l -> ins ("jmp " ++ l)
+    , K.call = \l -> ins ("call " ++ l)
+    , K.callReg = \r -> ins ("call " ++ q r)
+    , K.ret = ins "ret"
+    , K.addr = address . q
+    , K.stat = \off _ _ -> ins ("inc qword ptr [rip + _keel_stats" ++ disp off ++ "]")
+    , -- On entry rsp is 8 past a 16-byte boundary (the return address): keep calls aligned.
+      K.frame = \n -> ins ("sub rsp, " ++ show (frameSize n))
+    , K.unframe = \n -> ins ("add rsp, " ++ show (frameSize n))
+    , K.slot = (8 *)
+    , K.fn = \l -> line "\t.p2align 4" >> line (l ++ ":")
+    , K.label = \l -> line (l ++ ":")
+    , K.local = (".L_" ++)
+    , K.newLabel = newLabel
+    }
+  where
+    q r = case r of
+      K.A i -> ["rax", "rdi", "rsi"] !! i
+      K.T i -> ["rcx", "rdx", "r8", "r9", "r10", "r11"] !! i
+      K.Sp -> "rsp"
+    low8 r = case r of
+      'r' : n@(d : _) | d `elem` ['0' .. '9'] -> 'r' : n ++ "b"
+      ['r', a, 'x'] -> [a, 'l']
+      ['r', a, b] -> [a, b, 'l']
+      _ -> error ("asmX86: no byte register for " ++ r)
+    opnd o = case o of
+      K.R r -> Left (q r)
+      K.I n -> Right n
+    jcc j = if take 1 j == "j" then j else 'j' : j
+    cond c = case c of
+      K.Eq -> "e"
+      K.Ne -> "ne"
+      K.Ltu -> "b"
+      K.Geu -> "ae"
+      K.Gtu -> "a"
+      K.Leu -> "be"
+      K.Lts -> "l"
+      K.Ges -> "ge"
+    opName o = case o of
+      K.Add -> "add"
+      K.Sub -> "sub"
+      K.And -> "and"
+      K.Or -> "or"
+      K.Xor -> "xor"
+      K.Shl -> "shl"
+      K.Shr -> "shr"
+      K.Sar -> "sar"
+    frameSize n = 8 * (if even n then n + 1 else n)
+
 -- | The runtime; @used@: the built-in operations the program performs (no code for the rest).
 emitRuntime :: S.Set Int -> G ()
 emitRuntime used = do
@@ -1192,32 +1282,7 @@ emitRuntime used = do
   ins "lea rsi, [rdx + rsi*8]"
   ins "jmp .L_alloc_pop"
 
-  -- Arenas: a record [base before, enclosing record, allocations so far] from the bump
-  -- pointer; closing resets the bump pointer to it.
-  fn "_keel_arena_open"
-  address "rcx" "_keel_heap_ptr"
-  ins "mov rdx, qword ptr [rcx]" -- the record
-  ins "lea rsi, [rdx + 24]"
-  ins "cmp rsi, qword ptr [rcx + 8]"
-  ins "ja _keel_panic_oom"
-  ins "mov qword ptr [rcx], rsi"
-  address "rcx" "_keel_arena_base"
-  ins "mov rsi, qword ptr [rcx]"
-  ins "mov qword ptr [rdx], rsi"
-  address "rdi" "_keel_arena_top"
-  ins "mov rax, qword ptr [rdi]"
-  ins "mov qword ptr [rdx + 8], rax"
-  ins "mov qword ptr [rdi], rdx"
-  ins "mov rax, qword ptr [rip + _keel_stats]"
-  ins "mov qword ptr [rdx + 16], rax"
-  ins "cmp rsi, rdx"
-  ins "jb .L_arena_keep"
-  ins "mov qword ptr [rcx], rdx"
-  line ".L_arena_keep:"
-  address "rcx" "_keel_nofree"
-  ins "mov qword ptr [rip + _keel_fl], rcx"
-  ins "xor eax, eax"
-  ins "ret"
+  arenaOpen asmX86
 
   fn "_keel_arena_close"
   address "rdi" "_keel_arena_top"

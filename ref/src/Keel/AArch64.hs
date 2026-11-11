@@ -24,8 +24,10 @@ import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Numeric (showOct)
+import Keel.Asm qualified as K
 import Keel.Check (checkProgram)
 import Keel.Lower
+import Keel.Runtime (arenaOpen)
 import Keel.Range (ranges)
 import Keel.Mono (compileWith)
 import Keel.Syntax
@@ -1575,6 +1577,85 @@ emitEntry printers t = do
 -- | Allocation, reference counting and panics. Header word: bits 0–31 reference count (bit 31
 -- marks an immortal static block, 0 a freed one), 32–47 payload size in words, 48–63 pointer
 -- map. Statistics at @_keel_stats@: fresh allocations, recycled, in place, freed.
+-- | The portable assembler ("Keel.Asm") for the shared runtime: A = x0–x2, T = x13–x16 (what
+-- the allocator may clobber), then x9–x12.
+asmArm :: K.Asm G
+asmArm =
+  K.Asm
+    { K.wordBytes = 8
+    , K.mov = \d o -> case o of
+        K.R s -> ins ("mov " ++ x d ++ ", " ++ x s)
+        K.I n -> movImm (x d) n
+    , K.op = \o d a b -> ins (opName o ++ " " ++ x d ++ ", " ++ x a ++ ", " ++ opnd b)
+    , K.load = \w d b off -> ins (loadName w ++ " " ++ sized w d ++ ", " ++ at b off)
+    , K.store = \w v b off -> ins (storeName w ++ " " ++ (if w == K.Word then x v else 'w' : drop 1 (x v)) ++ ", " ++ at b off)
+    , K.loadIx = \d b i k -> ins ("ldr " ++ x d ++ ", [" ++ x b ++ ", " ++ x i ++ ", lsl #" ++ show k ++ "]")
+    , K.storeIx = \v b i k _ -> ins ("str " ++ x v ++ ", [" ++ x b ++ ", " ++ x i ++ ", lsl #" ++ show k ++ "]")
+    , K.addScaled = \d a b k -> ins ("add " ++ x d ++ ", " ++ x a ++ ", " ++ x b ++ ", lsl #" ++ show k)
+    , K.branch = \c r o l -> case (c, o) of
+        (K.Eq, K.I 0) -> ins ("cbz " ++ x r ++ ", " ++ l)
+        (K.Ne, K.I 0) -> ins ("cbnz " ++ x r ++ ", " ++ l)
+        (K.Lts, K.I 0) -> ins ("tbnz " ++ x r ++ ", #63, " ++ l)
+        (K.Ges, K.I 0) -> ins ("tbz " ++ x r ++ ", #63, " ++ l)
+        _ -> ins ("cmp " ++ x r ++ ", " ++ opnd o) >> ins ("b." ++ cond c ++ " " ++ l)
+    , K.branchBit = \set n r _ l -> ins ((if set then "tbnz " else "tbz ") ++ x r ++ ", #" ++ show n ++ ", " ++ l)
+    , K.lowBit = \d s _ -> ins ("rbit " ++ x d ++ ", " ++ x s) >> ins ("clz " ++ x d ++ ", " ++ x d)
+    , K.jump = \l -> ins ("b " ++ l)
+    , K.call = \l -> ins ("bl " ++ l)
+    , K.callReg = \r -> ins ("blr " ++ x r)
+    , K.ret = ins "ret"
+    , K.addr = address . x
+    , K.stat = \off t1 t2 -> do
+        address (x t1) "_keel_stats"
+        ins ("ldr " ++ x t2 ++ ", [" ++ x t1 ++ ", #" ++ show off ++ "]")
+        ins ("add " ++ x t2 ++ ", " ++ x t2 ++ ", #1")
+        ins ("str " ++ x t2 ++ ", [" ++ x t1 ++ ", #" ++ show off ++ "]")
+    , K.frame = \n -> ins ("stp x29, x30, [sp, #-" ++ show (frameSize n) ++ "]!") >> ins "mov x29, sp"
+    , K.unframe = \n -> ins ("ldp x29, x30, [sp], #" ++ show (frameSize n))
+    , K.slot = \i -> 16 + 8 * i
+    , K.fn = \l -> line "\t.p2align 2" >> line (l ++ ":")
+    , K.label = \l -> line (l ++ ":")
+    , K.local = ("L_" ++)
+    , K.newLabel = newLabel
+    }
+  where
+    x r = case r of
+      K.A i -> "x" ++ show i
+      K.T i -> ["x13", "x14", "x15", "x16", "x9", "x10", "x11", "x12"] !! i
+      K.Sp -> "sp"
+    at b off = "[" ++ x b ++ (if off == 0 then "" else ", #" ++ show off) ++ "]"
+    sized w r = case w of
+      K.Word -> x r
+      K.Half32 True -> x r
+      _ -> 'w' : drop 1 (x r)
+    loadName w = case w of
+      K.Byte -> "ldrb"
+      K.Half32 True -> "ldrsw"
+      _ -> "ldr"
+    storeName w = if w == K.Byte then "strb" else "str"
+    opnd o = case o of
+      K.R r -> x r
+      K.I n -> "#" ++ show n
+    opName o = case o of
+      K.Add -> "add"
+      K.Sub -> "sub"
+      K.And -> "and"
+      K.Or -> "orr"
+      K.Xor -> "eor"
+      K.Shl -> "lsl"
+      K.Shr -> "lsr"
+      K.Sar -> "asr"
+    cond c = case c of
+      K.Eq -> "eq"
+      K.Ne -> "ne"
+      K.Ltu -> "lo"
+      K.Geu -> "hs"
+      K.Gtu -> "hi"
+      K.Leu -> "ls"
+      K.Lts -> "lt"
+      K.Ges -> "ge"
+    frameSize n = 16 * ((16 + 8 * n + 15) `div` 16)
+
 -- | The runtime; @used@: the built-in operations the program performs (no code for the rest).
 emitRuntime :: S.Set Int -> G ()
 emitRuntime used = do
@@ -1619,35 +1700,7 @@ emitRuntime used = do
   ins "csel x15, xzr, x16, eq"
   ins "b L_alloc_pop"
 
-  -- Arenas (spec/memory.md). Opening one takes a record [base before, enclosing record, bump
-  -- allocations so far] from the bump pointer; while any is open, _keel_drop leaves blocks at
-  -- or above _keel_arena_base (the outermost record) alone. Closing resets the bump pointer to
-  -- the record: everything allocated since is freed at once, and counted as freed.
-  fn "_keel_arena_open"
-  address "x13" "_keel_heap_ptr"
-  ins "ldr x14, [x13]"
-  ins "add x15, x14, #24"
-  ins "ldr x16, [x13, #8]"
-  ins "cmp x15, x16"
-  ins "b.hi _keel_panic_oom"
-  ins "str x15, [x13]"
-  address "x10" "_keel_arena_base"
-  ins "ldr x11, [x10]"
-  address "x12" "_keel_arena_top"
-  ins "ldr x9, [x12]"
-  ins "stp x11, x9, [x14]"
-  address "x15" "_keel_stats"
-  ins "ldr x15, [x15]"
-  ins "str x15, [x14, #16]"
-  ins "str x14, [x12]"
-  ins "cmp x11, x14"
-  ins "csel x11, x11, x14, lo"
-  ins "str x11, [x10]"
-  address "x10" "_keel_nofree"
-  address "x11" "_keel_fl"
-  ins "str x10, [x11]"
-  ins "mov x0, #0"
-  ins "ret"
+  arenaOpen asmArm
 
   fn "_keel_arena_close"
   address "x12" "_keel_arena_top"

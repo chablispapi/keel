@@ -31,9 +31,11 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (Loc (..), constData, allocate, bound, dataOf, header, heapSize, keyOf, maxSmall, prepareAt, printerTypes, pruneRuntime, runtimeBegin, runtimeEnd, template)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR)
-import Data.List (elemIndex)
+import Data.List (elemIndex, isPrefixOf)
 import Data.Maybe (fromMaybe)
+import Keel.Asm qualified as K
 import Keel.Lower
+import Keel.Runtime (arenaOpen)
 import Keel.Syntax
 
 -- | What the image runs on: QEMU's virt board as RV64 or RV32 (the register width in bits), or
@@ -1294,6 +1296,115 @@ emitStart printers t = do
 
 -- Runtime ---------------------------------------------------------------------------------
 
+-- | The portable assembler ("Keel.Asm") for the shared runtime, for words of @w@ bytes. A =
+-- a0–a2; T = t4–t6, a6 (what the allocator may clobber), then t0–t3. Instructions are written
+-- for RV64; 'ins' turns them into RV32 ones.
+asmRv :: Int -> K.Asm G
+asmRv w =
+  K.Asm
+    { K.wordBytes = w
+    , K.mov = \d o -> case o of
+        K.R s -> ins ("mv " ++ r d ++ ", " ++ r s)
+        K.I n -> li (r d) n
+    , K.op = \o d a b -> case b of
+        K.R s -> ins (opName o ++ " " ++ r d ++ ", " ++ r a ++ ", " ++ r s)
+        K.I n | o == K.Sub -> ins ("addi " ++ r d ++ ", " ++ r a ++ ", " ++ show (negate n))
+        K.I n -> ins (opName o ++ "i " ++ r d ++ ", " ++ r a ++ ", " ++ show n)
+    , K.load = \wd d b off -> ins (loadName wd ++ " " ++ r d ++ ", " ++ show off ++ "(" ++ r b ++ ")")
+    , K.store = \wd v b off -> ins (storeName wd ++ " " ++ r v ++ ", " ++ show off ++ "(" ++ r b ++ ")")
+    , K.loadIx = \d b i k -> do
+        when (d == b) $ error "asmRv: loadIx into its base"
+        ins ("slli " ++ r d ++ ", " ++ r i ++ ", " ++ show k)
+        ins ("add " ++ r d ++ ", " ++ r b ++ ", " ++ r d)
+        ins ("ld " ++ r d ++ ", 0(" ++ r d ++ ")")
+    , K.storeIx = \v b i k t -> do
+        ins ("slli " ++ r t ++ ", " ++ r i ++ ", " ++ show k)
+        ins ("add " ++ r t ++ ", " ++ r b ++ ", " ++ r t)
+        ins ("sd " ++ r v ++ ", 0(" ++ r t ++ ")")
+    , K.addScaled = \d a b k -> do
+        when (d == a) $ error "asmRv: addScaled into its first operand"
+        ins ("slli " ++ r d ++ ", " ++ r b ++ ", " ++ show k)
+        ins ("add " ++ r d ++ ", " ++ r a ++ ", " ++ r d)
+    , K.branch = \c a o l -> do
+        let b = case o of
+              K.R s -> r s
+              K.I 0 -> "zero"
+              K.I n -> error ("asmRv: compare with " ++ show n ++ ": move it into a register")
+            mnemonic = "b" ++ cond c
+        if ".L" `isPrefixOf` l then ins (mnemonic ++ " " ++ r a ++ ", " ++ b ++ ", " ++ l) else jumpIf mnemonic [r a, b] l
+    , K.branchBit = \set n a t l ->
+        if n < 11
+          then do
+            ins ("andi " ++ r t ++ ", " ++ r a ++ ", " ++ show (2 ^ n :: Integer))
+            ins ((if set then "bnez " else "beqz ") ++ r t ++ ", " ++ l)
+          else do
+            ins ("slli " ++ r t ++ ", " ++ r a ++ ", " ++ show (8 * w - 1 - n))
+            ins ((if set then "bltz " else "bgez ") ++ r t ++ ", " ++ l)
+    , -- No Zbb (rv64imafdc, rv32imac): isolate the lowest bit and count the shifts.
+      K.lowBit = \d s t -> do
+        lLoop <- newLabel
+        lDone <- newLabel
+        ins ("neg " ++ r t ++ ", " ++ r s)
+        ins ("and " ++ r t ++ ", " ++ r s ++ ", " ++ r t)
+        ins ("li " ++ r d ++ ", 0")
+        line (lLoop ++ ":")
+        ins ("srli " ++ r t ++ ", " ++ r t ++ ", 1")
+        ins ("beqz " ++ r t ++ ", " ++ lDone)
+        ins ("addi " ++ r d ++ ", " ++ r d ++ ", 1")
+        ins ("j " ++ lLoop)
+        line (lDone ++ ":")
+    , K.jump = \l -> ins ("j " ++ l)
+    , K.call = \l -> ins ("call " ++ l)
+    , K.callReg = \a -> ins ("jalr " ++ r a)
+    , K.ret = ins "ret"
+    , K.addr = \d sym -> ins ("la " ++ r d ++ ", " ++ sym)
+    , K.stat = \off t1 t2 -> do
+        ins ("la " ++ r t1 ++ ", _keel_stats")
+        ins ("ld " ++ r t2 ++ ", " ++ show off ++ "(" ++ r t1 ++ ")")
+        ins ("addi " ++ r t2 ++ ", " ++ r t2 ++ ", 1")
+        ins ("sd " ++ r t2 ++ ", " ++ show off ++ "(" ++ r t1 ++ ")")
+    , K.frame = \n -> ins ("addi sp, sp, -" ++ show (frameSize n)) >> ins ("sd ra, " ++ show (frameSize n - 8) ++ "(sp)")
+    , K.unframe = \n -> ins ("ld ra, " ++ show (frameSize n - 8) ++ "(sp)") >> ins ("addi sp, sp, " ++ show (frameSize n))
+    , K.slot = (8 *)
+    , K.fn = \l -> line "\t.p2align 2" >> line (l ++ ":")
+    , K.label = \l -> line (l ++ ":")
+    , K.local = (".L_" ++)
+    , K.newLabel = newLabel
+    }
+  where
+    r a = case a of
+      K.A i -> "a" ++ show i
+      K.T i -> ["t4", "t5", "t6", "a6", "t0", "t1", "t2", "t3"] !! i
+      K.Sp -> "sp"
+    loadName wd = case wd of
+      K.Byte -> "lbu"
+      K.Half32 True -> "lw"
+      K.Half32 False -> "lwu"
+      K.Word -> "ld"
+    storeName wd = case wd of
+      K.Byte -> "sb"
+      K.Half32 _ -> "sw"
+      K.Word -> "sd"
+    opName o = case o of
+      K.Add -> "add"
+      K.Sub -> "sub"
+      K.And -> "and"
+      K.Or -> "or"
+      K.Xor -> "xor"
+      K.Shl -> "sll"
+      K.Shr -> "srl"
+      K.Sar -> "sra"
+    cond c = case c of
+      K.Eq -> "eq"
+      K.Ne -> "ne"
+      K.Ltu -> "ltu"
+      K.Geu -> "geu"
+      K.Gtu -> "gtu"
+      K.Leu -> "leu"
+      K.Lts -> "lt"
+      K.Ges -> "ge"
+    frameSize n = 16 * ((8 * n + 8 + 15) `div` 16)
+
 emitRuntime :: G ()
 emitRuntime = do
   w <- wordSize
@@ -1343,32 +1454,7 @@ emitRuntime = do
   ins "add t6, t6, t5"
   ins "j .L_alloc_pop"
 
-  -- Arenas: as in "Keel.AArch64".
-  fn "_keel_arena_open"
-  ins "la t4, _keel_heap_ptr"
-  ins "ld t5, 0(t4)"
-  ins "addi t6, t5, 24"
-  ins "ld a6, 8(t4)"
-  jumpIf "bgtu" ["t6", "a6"] "_keel_panic_oom"
-  ins "sd t6, 0(t4)"
-  ins "la t4, _keel_arena_base"
-  ins "ld t6, 0(t4)"
-  ins "sd t6, 0(t5)"
-  ins "la a6, _keel_arena_top"
-  ins "ld a1, 0(a6)"
-  ins "sd a1, 8(t5)"
-  ins "sd t5, 0(a6)"
-  ins "la a1, _keel_stats"
-  ins "ld a1, 0(a1)"
-  ins "sd a1, 16(t5)"
-  jumpIf "bltu" ["t6", "t5"] ".L_arena_keep"
-  ins "sd t5, 0(t4)"
-  line ".L_arena_keep:"
-  ins "la t4, _keel_nofree"
-  ins "la t5, _keel_fl"
-  ins "sd t4, 0(t5)"
-  ins "li a0, 0"
-  ins "ret"
+  arenaOpen (asmRv w)
 
   fn "_keel_arena_close"
   ins "la a6, _keel_arena_top"
