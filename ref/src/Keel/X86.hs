@@ -32,7 +32,7 @@ import Data.Text.Encoding qualified as TE
 import Keel.AArch64 (Loc (..), constData, Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, performedOps, prepare, printerTypes, pruneRuntime, reduction, runtimeBegin, runtimeEnd, template, uses)
 import Keel.Asm qualified as K
 import Keel.Lower
-import Keel.Runtime (arenaOpen)
+import Keel.Runtime (arenaClose, arenaOpen)
 import Keel.Syntax
 import Numeric (showOct)
 
@@ -1284,29 +1284,7 @@ emitRuntime used = do
 
   arenaOpen asmX86
 
-  fn "_keel_arena_close"
-  address "rdi" "_keel_arena_top"
-  ins "mov rdx, qword ptr [rdi]" -- the record
-  ins "mov rsi, qword ptr [rdx + 8]"
-  ins "mov qword ptr [rdi], rsi"
-  ins "mov rsi, qword ptr [rdx]"
-  ins "mov qword ptr [rip + _keel_arena_base], rsi"
-  ins "cmp rsi, -1" -- the outermost arena closed: the free lists are back
-  ins "jne .L_close_inner"
-  address "rcx" "_keel_freelists"
-  ins "mov qword ptr [rip + _keel_fl], rcx"
-  line ".L_close_inner:"
-  ins "mov rcx, qword ptr [rip + _keel_stats]"
-  ins "sub rcx, qword ptr [rdx + 16]" -- allocated inside: freed now
-  ins "add qword ptr [rip + _keel_stats + 24], rcx"
-  ins "mov rsi, qword ptr [rdx + 8]" -- … and not again when the enclosing arena closes
-  ins "test rsi, rsi"
-  ins "jz .L_close_outermost"
-  ins "add qword ptr [rsi + 16], rcx"
-  line ".L_close_outermost:"
-  ins "mov qword ptr [rip + _keel_heap_ptr], rdx"
-  ins "xor eax, eax"
-  ins "ret"
+  arenaClose asmX86
 
   -- _keel_drop: rax = block. Decrement; at zero, drop the children and free the block. The
   -- last pointer child is handled by looping, so dropping a long list uses constant stack.

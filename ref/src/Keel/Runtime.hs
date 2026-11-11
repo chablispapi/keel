@@ -1,7 +1,7 @@
 -- | The runtime routines the three back ends share, written once against "Keel.Asm"
 -- (spec/backends.md). Each back end's @emitRuntime@ calls these with its own emitters; what
 -- only one target has (host I/O, sockets, RISC-V printing and traps) stays there.
-module Keel.Runtime (arenaOpen) where
+module Keel.Runtime (arenaOpen, arenaClose) where
 
 import Keel.Asm
 
@@ -41,3 +41,43 @@ arenaOpen a = do
   ret a
   where
     keep = local a "arena_keep"
+
+arenaClose :: Monad m => Asm m -> m ()
+arenaClose a = do
+  fn a "_keel_arena_close"
+  addr a (T 0) "_keel_arena_top"
+  load a Word (T 1) (T 0) 0 -- the record
+  load a Word (T 2) (T 1) 8
+  store a Word (T 2) (T 0) 0
+  load a Word (T 2) (T 1) 0 -- the base before it
+  addr a (T 3) "_keel_arena_base"
+  store a Word (T 2) (T 3) 0
+  -- Allocated inside: freed now…
+  addr a (T 3) "_keel_stats"
+  load a Word (T 0) (T 3) 0
+  load a Word (T 4) (T 1) 16
+  op a Sub (T 0) (T 0) (R (T 4))
+  load a Word (T 4) (T 3) 24
+  op a Add (T 4) (T 4) (R (T 0))
+  store a Word (T 4) (T 3) 24
+  -- … and not again when the enclosing arena closes.
+  load a Word (T 4) (T 1) 8
+  branch a Eq (T 4) (I 0) outermost
+  load a Word (T 5) (T 4) 16
+  op a Add (T 5) (T 5) (R (T 0))
+  store a Word (T 5) (T 4) 16
+  label a outermost
+  addr a (T 3) "_keel_heap_ptr"
+  store a Word (T 1) (T 3) 0
+  -- The outermost arena closed (the base before it is all ones): the free lists are back.
+  op a Add (T 4) (T 2) (I 1)
+  branch a Ne (T 4) (I 0) done
+  addr a (T 0) "_keel_freelists"
+  addr a (T 3) "_keel_fl"
+  store a Word (T 0) (T 3) 0
+  label a done
+  mov a (A 0) (I 0)
+  ret a
+  where
+    outermost = local a "close_outermost"
+    done = local a "close_ret"

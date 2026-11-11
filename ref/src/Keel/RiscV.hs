@@ -35,7 +35,7 @@ import Data.List (elemIndex, isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Keel.Asm qualified as K
 import Keel.Lower
-import Keel.Runtime (arenaOpen)
+import Keel.Runtime (arenaClose, arenaOpen)
 import Keel.Syntax
 
 -- | What the image runs on: QEMU's virt board as RV64 or RV32 (the register width in bits), or
@@ -1456,37 +1456,7 @@ emitRuntime = do
 
   arenaOpen (asmRv w)
 
-  fn "_keel_arena_close"
-  ins "la a6, _keel_arena_top"
-  ins "ld t5, 0(a6)"
-  ins "ld t6, 8(t5)"
-  ins "sd t6, 0(a6)"
-  ins "ld t6, 0(t5)"
-  ins "la t4, _keel_arena_base"
-  ins "sd t6, 0(t4)"
-  ins "addi t6, t6, 1" -- the outermost arena closed: the free lists are back
-  jumpIf "bnez" ["t6"] ".L_close_inner"
-  ins "la t4, _keel_freelists"
-  ins "la t6, _keel_fl"
-  ins "sd t4, 0(t6)"
-  line ".L_close_inner:"
-  ins "la t4, _keel_stats"
-  ins "ld t6, 0(t4)"
-  ins "ld a1, 16(t5)"
-  ins "sub t6, t6, a1"
-  ins "ld a1, 24(t4)"
-  ins "add a1, a1, t6"
-  ins "sd a1, 24(t4)"
-  ins "ld a1, 8(t5)" -- … and not again when the enclosing arena closes
-  jumpIf "beqz" ["a1"] ".L_close_outermost"
-  ins "ld a6, 16(a1)"
-  ins "add a6, a6, t6"
-  ins "sd a6, 16(a1)"
-  line ".L_close_outermost:"
-  ins "la t4, _keel_heap_ptr"
-  ins "sd t5, 0(t4)"
-  ins "li a0, 0"
-  ins "ret"
+  arenaClose (asmRv w)
 
   -- _keel_drop: a0 = block; the last pointer child is handled by looping.
   fn "_keel_drop"

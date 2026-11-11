@@ -27,7 +27,7 @@ import Numeric (showOct)
 import Keel.Asm qualified as K
 import Keel.Check (checkProgram)
 import Keel.Lower
-import Keel.Runtime (arenaOpen)
+import Keel.Runtime (arenaClose, arenaOpen)
 import Keel.Range (ranges)
 import Keel.Mono (compileWith)
 import Keel.Syntax
@@ -1702,36 +1702,7 @@ emitRuntime used = do
 
   arenaOpen asmArm
 
-  fn "_keel_arena_close"
-  address "x12" "_keel_arena_top"
-  ins "ldr x14, [x12]"
-  ins "ldp x11, x9, [x14]"
-  address "x10" "_keel_arena_base"
-  ins "str x11, [x10]"
-  ins "str x9, [x12]"
-  address "x13" "_keel_stats"
-  ins "ldr x15, [x13]"
-  ins "ldr x16, [x14, #16]"
-  ins "sub x15, x15, x16"
-  ins "ldr x16, [x13, #24]"
-  ins "add x16, x16, x15"
-  ins "str x16, [x13, #24]"
-  -- … and not again when the enclosing arena closes.
-  ins "cbz x9, L_close_outermost"
-  ins "ldr x16, [x9, #16]"
-  ins "add x16, x16, x15"
-  ins "str x16, [x9, #16]"
-  line "L_close_outermost:"
-  address "x13" "_keel_heap_ptr"
-  ins "str x14, [x13]"
-  ins "cmn x11, #1" -- the outermost arena closed: the free lists are back
-  ins "b.ne L_close_ret"
-  address "x10" "_keel_freelists"
-  address "x11" "_keel_fl"
-  ins "str x10, [x11]"
-  line "L_close_ret:"
-  ins "mov x0, #0"
-  ins "ret"
+  arenaClose asmArm
 
   -- _keel_drop: x0 = block. Decrement; at zero, drop the children and free the block. The last
   -- pointer child is handled by looping, so dropping a long list uses constant stack.
