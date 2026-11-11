@@ -1,11 +1,11 @@
 -- | The runtime routines the three back ends share, written once against "Keel.Asm"
 -- (spec/backends.md). Each back end's @emitRuntime@ calls these with its own emitters; what
 -- only one target has (host I/O, sockets, RISC-V printing and traps) stays there.
-module Keel.Runtime (alloc, freeBlock, arenaOpen, arenaClose) where
+module Keel.Runtime (alloc, dropBlock, freeBlock, arenaOpen, arenaClose) where
 
 import Control.Monad (when)
 import Keel.Asm
-import Keel.Lower (fieldLayouts)
+import Keel.Lower (arrayLayout, fieldLayouts)
 
 -- | _keel_alloc: A 0 = payload words, A 1 = header without its count (on RV32 its low half,
 -- and A 2 the high one) → A 0 = payload. Clobbers T 0–3 only. Blocks of up to @maxSmall@
@@ -28,7 +28,7 @@ alloc a maxSmall = do
   label a bump
   addr a (T 0) "_keel_heap_ptr"
   load a Word (T 1) (T 0) 0
-  addScaled a (T 2) (T 1) (A 0) wordShift
+  addScaled a (T 2) (T 1) (A 0) (wordShift a)
   op a Add (T 2) (T 2) (I 8)
   load a Word (T 3) (T 0) 8
   branch a Gtu (T 2) (R (T 3)) "_keel_panic_oom"
@@ -45,14 +45,142 @@ alloc a maxSmall = do
   label a link0
   load a (Half32 True) (T 2) (T 1) (-4)
   branch a Eq (T 2) (I 0) pop
-  addScaled a (T 2) (T 1) (T 2) wordShift
+  addScaled a (T 2) (T 1) (T 2) (wordShift a)
   jump a pop
   where
-    wordShift = if wordBytes a == 4 then 2 else 3
     bump = local a "alloc_bump"
     pop = local a "alloc_pop"
     header = local a "alloc_header"
     link0 = local a "alloc_link0"
+
+-- | _keel_drop: A 0 = block. Decrement; at zero, drop the children and free the block. The
+-- last pointer child is handled by looping, so dropping a long list uses constant stack.
+-- Slots: the block, the map still to drop, its packed bit. Header (spec/memory.md): bits 0–9
+-- layout, 10–30 count, 31 immortal; 32–39 words, 40–55 pointer map, 56 packed.
+dropBlock :: Monad m => Asm m -> m ()
+dropBlock a = do
+  fn a "_keel_drop"
+  frame a 3
+  label a top
+  load a (Half32 True) (T 0) (A 0) (-8)
+  branch a Lts (T 0) (I 0) done -- immortal
+  op a Shr (T 1) (T 0) (I 10)
+  branch a Eq (T 1) (I 0) "_keel_panic_rc" -- the count was 0: a freed block
+  op a Sub (T 0) (T 0) (I 1024)
+  store a (Half32 False) (T 0) (A 0) (-8)
+  op a Shr (T 1) (T 0) (I 10)
+  branch a Ne (T 1) (I 0) done
+  loadSym a (T 1) "_keel_arena_base"
+  branch a Geu (A 0) (R (T 1)) done -- in an open arena: freed when it closes
+  stat a 24 (T 1) (T 2)
+  store a Word (A 0) Sp (slot a 0)
+  op a And (T 2) (T 0) (I 0x3ff) -- the layout
+  mov a (T 1) (I arrayLayout)
+  branch a Geu (T 2) (R (T 1)) special
+  headerMap a (T 0) (A 0)
+  label a split
+  splitPacked a (T 0) (T 1)
+  label a loop
+  branch a Eq (T 0) (I 0) free
+  op a Sub (T 1) (T 0) (I 1)
+  op a And (T 1) (T 1) (R (T 0)) -- the map without its lowest bit
+  branch a Eq (T 1) (I 0) lastChild
+  lowBit a (T 2) (T 0) (T 3)
+  store a Word (T 1) Sp (slot a 1)
+  load a Word (T 4) Sp (slot a 0)
+  child a (A 0) (T 4) (T 2) (T 3)
+  call a "_keel_drop"
+  load a Word (T 0) Sp (slot a 1)
+  jump a loop
+  -- The last pointer child: free the block, then loop on the child instead of recursing.
+  label a lastChild
+  lowBit a (T 2) (T 0) (T 3)
+  load a Word (T 4) Sp (slot a 0)
+  child a (T 5) (T 4) (T 2) (T 3)
+  store a Word (T 5) Sp (slot a 1)
+  mov a (A 0) (R (T 4))
+  call a "_keel_free_block"
+  load a Word (A 0) Sp (slot a 1)
+  jump a top
+  label a free
+  load a Word (A 0) Sp (slot a 0)
+  call a "_keel_free_block"
+  label a done
+  unframe a 3
+  ret a
+  -- A block with a field in its header: its pointer map is in the table.
+  label a special
+  mov a (T 1) (I fieldLayouts)
+  branch a Ltu (T 2) (R (T 1)) array
+  op a Sub (T 2) (T 2) (I fieldLayouts)
+  addr a (T 1) "_keel_layouts"
+  addScaled a (T 3) (T 1) (T 2) 2
+  load a (Half32 False) (T 0) (T 3) 0
+  op a Shr (T 0) (T 0) (I 8)
+  jump a split
+  -- An array: drop its elements if they are pointers, last first, then free it.
+  label a array
+  mov a (T 1) (I (arrayLayout + 2))
+  branch a Ne (T 2) (R (T 1)) free
+  load a Word (T 0) (A 0) 0
+  label a elems
+  branch a Eq (T 0) (I 0) free
+  op a Sub (T 0) (T 0) (I 1)
+  store a Word (T 0) Sp (slot a 1)
+  load a Word (T 4) Sp (slot a 0)
+  addScaled a (T 1) (T 4) (T 0) (wordShift a)
+  load a Word (A 0) (T 1) (2 * wordBytes a)
+  call a "_keel_drop"
+  load a Word (T 0) Sp (slot a 1)
+  jump a elems
+  where
+    top = local a "drop_top"
+    done = local a "drop_ret"
+    split = local a "drop_split"
+    loop = local a "drop_loop"
+    lastChild = local a "drop_last"
+    free = local a "drop_free"
+    special = local a "drop_special"
+    array = local a "drop_array"
+    elems = local a "drop_elems"
+
+-- | The pointer map and packed bit of the block in @b@ (its header's bits 40–56, the high
+-- half's bits 8–24) into @d@.
+headerMap :: Monad m => Asm m -> Reg -> Reg -> m ()
+headerMap a d b = do
+  load a (Half32 False) d b (-4)
+  op a Shl d d (I (xlen a - 25))
+  op a Shr d d (I (xlen a - 17))
+
+-- | Split a 17-bit map in @r@: its packed bit to slot 2, @r@ the 16-bit map (uses @t@).
+splitPacked :: Monad m => Asm m -> Reg -> Reg -> m ()
+splitPacked a r t = do
+  op a Shr t r (I 16)
+  store a Word t Sp (slot a 2)
+  op a Shl r r (I (xlen a - 16))
+  op a Shr r r (I (xlen a - 16))
+
+-- | Child @i@ (a map bit's index) of the block in @base@ into @d@ (≠ base): word i, or with the
+-- packed bit in slot 2, 4-byte slot i holding (child - block) / 8. Uses @t@.
+child :: Monad m => Asm m -> Reg -> Reg -> Reg -> Reg -> m ()
+child a d base i t = do
+  lPacked <- newLabel a
+  lDone <- newLabel a
+  load a Word t Sp (slot a 2)
+  branch a Ne t (I 0) lPacked
+  loadIx a d base i (wordShift a)
+  jump a lDone
+  label a lPacked
+  addScaled a t base i 2
+  load a (Half32 True) d t 0
+  addScaled a d base d 3
+  label a lDone
+
+xlen :: Asm m -> Integer
+xlen a = 8 * toInteger (wordBytes a)
+
+wordShift :: Asm m -> Int
+wordShift a = if wordBytes a == 4 then 2 else 3
 
 -- | _keel_free_block: A 0 = block with count 0 → pushed on its size's free list. Clobbers T 0–3.
 freeBlock :: Monad m => Asm m -> Integer -> m ()
