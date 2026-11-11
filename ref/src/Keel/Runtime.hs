@@ -1,7 +1,7 @@
 -- | The runtime routines the three back ends share, written once against "Keel.Asm"
 -- (spec/backends.md). Each back end's @emitRuntime@ calls these with its own emitters; what
 -- only one target has (host I/O, sockets, RISC-V printing and traps) stays there.
-module Keel.Runtime (alloc, dropBlock, freeBlock, arenaOpen, arenaClose) where
+module Keel.Runtime (alloc, dropBlock, dropReuse, freeBlock, arenaOpen, arenaClose) where
 
 import Control.Monad (when)
 import Keel.Asm
@@ -144,6 +144,94 @@ dropBlock a = do
     array = local a "drop_array"
     elems = local a "drop_elems"
 
+-- | _keel_drop_reuse: A 0 = block, A 1 = the fields taken over (a mask of words) → A 0 = the
+-- block if it was unique (its other children dropped, count 0 until reused), or 0 after an
+-- ordinary decrement and duplicating the fields taken over. Slots as in 'dropBlock'.
+dropReuse :: Monad m => Asm m -> m ()
+dropReuse a = do
+  fn a "_keel_drop_reuse"
+  frame a 3
+  load a (Half32 True) (T 0) (A 0) (-8)
+  branch a Lts (T 0) (I 0) none -- immortal
+  op a Shr (T 1) (T 0) (I 10)
+  branch a Eq (T 1) (I 0) "_keel_panic_rc"
+  op a Sub (T 1) (T 1) (I 1)
+  branch a Ne (T 1) (I 0) shared
+  stat a 24 (T 1) (T 2)
+  store a Word (A 0) Sp (slot a 0)
+  reuseMap a (T 0) (A 0)
+  op a And (T 1) (T 0) (R (A 1)) -- the fields taken over stay alive: they are the caller's now
+  op a Xor (T 0) (T 0) (R (T 1))
+  label a loop
+  branch a Eq (T 0) (I 0) dropped
+  op a Sub (T 1) (T 0) (I 1)
+  op a And (T 1) (T 1) (R (T 0))
+  lowBit a (T 2) (T 0) (T 3)
+  store a Word (T 1) Sp (slot a 1)
+  load a Word (T 4) Sp (slot a 0)
+  child a (A 0) (T 4) (T 2) (T 3)
+  call a "_keel_drop"
+  load a Word (T 0) Sp (slot a 1)
+  jump a loop
+  label a dropped
+  load a Word (A 0) Sp (slot a 0)
+  load a (Half32 False) (T 0) (A 0) (-8)
+  op a And (T 0) (T 0) (I 0x3ff) -- count 0 until reused
+  store a (Half32 False) (T 0) (A 0) (-8)
+  jump a done
+  label a shared
+  op a Sub (T 0) (T 0) (I 1024)
+  store a (Half32 False) (T 0) (A 0) (-8)
+  -- The block keeps its references: duplicate the fields taken over.
+  label a none
+  branch a Eq (A 1) (I 0) zero
+  reuseMap a (T 0) (A 0) -- only for its packed bit
+  label a dup
+  lowBit a (T 2) (A 1) (T 3)
+  op a Sub (T 1) (A 1) (I 1)
+  op a And (A 1) (A 1) (R (T 1))
+  child a (T 4) (A 0) (T 2) (T 3)
+  load a (Half32 True) (T 5) (T 4) (-8)
+  branch a Lts (T 5) (I 0) next
+  op a Add (T 5) (T 5) (I 1024)
+  store a (Half32 False) (T 5) (T 4) (-8)
+  label a next
+  branch a Ne (A 1) (I 0) dup
+  label a zero
+  mov a (A 0) (I 0)
+  label a done
+  unframe a 3
+  ret a
+  where
+    shared = local a "reuse_shared"
+    none = local a "reuse_none"
+    loop = local a "reuse_loop"
+    dropped = local a "reuse_done"
+    dup = local a "reuse_dup"
+    next = local a "reuse_next"
+    zero = local a "reuse_zero"
+    done = local a "reuse_ret"
+
+-- | The map of the block in @b@ into @d@ (from the layout table when its header holds a
+-- field), its packed bit to slot 2. Uses T 1–3.
+reuseMap :: Monad m => Asm m -> Reg -> Reg -> m ()
+reuseMap a d b = do
+  lMap <- newLabel a
+  headerMap a d b
+  load a (Half32 False) (T 1) b (-8)
+  branchBit a False fieldBit (T 1) (T 2) lMap
+  op a And (T 1) (T 1) (I (fieldLayouts - 1))
+  addr a (T 2) "_keel_layouts"
+  addScaled a (T 3) (T 2) (T 1) 2
+  load a (Half32 False) d (T 3) 0
+  op a Shr d d (I 8)
+  label a lMap
+  splitPacked a d (T 1)
+
+-- | fieldLayouts = 2 ^ fieldBit: the header bit that says it holds a field.
+fieldBit :: Int
+fieldBit = length (takeWhile (< fieldLayouts) (iterate (* 2) 1))
+
 -- | The pointer map and packed bit of the block in @b@ (its header's bits 40–56, the high
 -- half's bits 8–24) into @d@.
 headerMap :: Monad m => Asm m -> Reg -> Reg -> m ()
@@ -213,7 +301,6 @@ freeBlock a maxSmall = do
   store a Word (A 0) (T 1) 0
   ret a
   where
-    fieldBit = length (takeWhile (< fieldLayouts) (iterate (* 2) 1)) -- fieldLayouts = 2 ^ fieldBit
     size = local a "free_size"
     done = local a "free_ret"
     link0 = local a "free_link0"

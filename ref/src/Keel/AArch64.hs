@@ -1667,69 +1667,7 @@ emitRuntime used = do
   R.dropBlock asmArm
   R.freeBlock asmArm (toInteger maxSmall)
 
-  -- _keel_drop_reuse: x0 = block, x1 = the fields taken over (a mask of words) → x0 = the
-  -- block, if it was unique (its other children dropped, count 0 until reused), or 0 after an
-  -- ordinary decrement and duplicating the fields taken over.
-  fn "_keel_drop_reuse"
-  ins "stp x29, x30, [sp, #-32]!"
-  ins "mov x29, sp"
-  ins "ldr w9, [x0, #-8]"
-  ins "tbnz w9, #31, L_reuse_none"
-  ins "tst w9, #0x7ffffc00"
-  ins "b.eq _keel_panic_rc"
-  ins "lsr w10, w9, #10"
-  ins "cmp w10, #1"
-  ins "b.ne L_reuse_shared"
-  stat 24 "x12" "x13"
-  ins "str x0, [sp, #16]"
-  reuseMap
-  ins "bic x11, x11, x1" -- the fields taken over stay alive: they are the caller's now
-  line "L_reuse_loop:"
-  ins "ands x13, x11, #0xffff"
-  ins "b.eq L_reuse_done"
-  ins "rbit x13, x13"
-  ins "clz x13, x13"
-  ins "mov x14, #1"
-  ins "lsl x14, x14, x13"
-  ins "bic x11, x11, x14"
-  ins "str x11, [sp, #24]"
-  ins "ldr x9, [sp, #16]"
-  child "x0" "x9"
-  ins "bl _keel_drop"
-  ins "ldr x11, [sp, #24]"
-  ins "b L_reuse_loop"
-  line "L_reuse_done:"
-  ins "ldr x0, [sp, #16]"
-  ins "ldr w9, [x0, #-8]"
-  ins "and w9, w9, #0x3ff" -- count 0 until reused
-  ins "str w9, [x0, #-8]"
-  ins "b L_reuse_ret"
-  line "L_reuse_shared:"
-  ins "sub w9, w9, #1024"
-  ins "str w9, [x0, #-8]"
-  -- The block keeps its references: duplicate the fields taken over.
-  line "L_reuse_none:"
-  ins "cbz x1, L_reuse_zero"
-  ins "ldr w9, [x0, #-8]"
-  reuseMap -- only for its packed bit
-  line "L_reuse_dup:"
-  ins "rbit x13, x1"
-  ins "clz x13, x13"
-  ins "mov x14, #1"
-  ins "lsl x14, x14, x13"
-  ins "bic x1, x1, x14"
-  child "x15" "x0"
-  ins "ldr w16, [x15, #-8]"
-  ins "tbnz w16, #31, L_reuse_next"
-  ins "add w16, w16, #1024"
-  ins "str w16, [x15, #-8]"
-  line "L_reuse_next:"
-  ins "cbnz x1, L_reuse_dup"
-  line "L_reuse_zero:"
-  ins "mov x0, #0"
-  line "L_reuse_ret:"
-  ins "ldp x29, x30, [sp], #32"
-  ins "ret"
+  R.dropReuse asmArm
 
   -- Arrays: payload [length, capacity, elements…]. The header's tag is 255 (an array) and its
   -- pointer map has bit 1 set if the elements are pointers; its size field is capacity + 2, at
@@ -2473,29 +2411,6 @@ emitRuntime used = do
       ins "ldr x0, [x29, #-8]"
       ins "mov x1, #4"
       ins "bl _fcntl"
-    -- Child x13 of the block in @base@ into @dst@: a word, or for a packed layout (bit 16 of
-    -- x11, the map) a 4-byte slot holding (child - block) / 8.
-    child dst base = do
-      lPacked <- newLabel
-      lDone <- newLabel
-      ins ("tbnz x11, #16, " ++ lPacked)
-      ins ("ldr " ++ dst ++ ", [" ++ base ++ ", x13, lsl #3]")
-      ins ("b " ++ lDone)
-      line (lPacked ++ ":")
-      ins ("ldrsw " ++ dst ++ ", [" ++ base ++ ", x13, lsl #2]")
-      ins ("add " ++ dst ++ ", " ++ base ++ ", " ++ dst ++ ", lsl #3")
-      line (lDone ++ ":")
-    -- The pointer map and packed bit of the block in x0 (header's low half in w9) into x11.
-    reuseMap = do
-      lMap <- newLabel
-      ins "ldr x11, [x0, #-8]"
-      ins "ubfx x11, x11, #40, #17"
-      ins ("tbz w9, #9, " ++ lMap)
-      ins "and w12, w9, #0x1ff" -- a field in the header: the map is in the table
-      address "x11" "_keel_layouts"
-      ins "ldr w11, [x11, x12, lsl #2]"
-      ins "lsr w11, w11, #8"
-      line (lMap ++ ":")
     -- Increment the statistics counter at this byte offset, using two free scratch registers.
     stat :: Int -> String -> String -> G ()
     stat off r1 r2 = do

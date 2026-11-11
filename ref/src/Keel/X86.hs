@@ -1250,67 +1250,7 @@ emitRuntime used = do
   R.dropBlock asmX86
   R.freeBlock asmX86 (toInteger maxSmall)
 
-  -- _keel_drop_reuse: rax = block, rdi = the fields taken over (a mask of words) → rax = the
-  -- block if it was unique (its other children dropped, count 0 until reused), or 0 after an
-  -- ordinary decrement and duplicating the fields taken over.
-  fn "_keel_drop_reuse"
-  ins "push rbx"
-  ins "push r12"
-  ins "sub rsp, 8"
-  ins "mov ecx, dword ptr [rax - 8]"
-  ins "test ecx, ecx"
-  ins "js .L_reuse_none"
-  ins "mov edx, ecx"
-  ins "shr edx, 10"
-  ins "jz _keel_panic_rc"
-  ins "cmp edx, 1"
-  ins "jne .L_reuse_shared"
-  ins "inc qword ptr [rip + _keel_stats + 24]"
-  ins "mov rbx, rax"
-  reuseMap
-  ins "mov rdx, rdi" -- the fields taken over stay alive: they are the caller's now
-  ins "not rdx"
-  ins "and r12, rdx"
-  line ".L_reuse_loop:"
-  ins "mov edx, r12d"
-  ins "and edx, 0xffff"
-  ins "jz .L_reuse_done"
-  ins "bsf rcx, rdx"
-  ins "btr r12, rcx"
-  child "rax" "rbx"
-  ins "call _keel_drop"
-  ins "jmp .L_reuse_loop"
-  line ".L_reuse_done:"
-  ins "mov rax, rbx"
-  ins "and dword ptr [rax - 8], 0x3ff" -- count 0 until reused
-  ins "jmp .L_reuse_ret"
-  line ".L_reuse_shared:"
-  ins "sub ecx, 1024"
-  ins "mov dword ptr [rax - 8], ecx"
-  -- The block keeps its references: duplicate the fields taken over.
-  line ".L_reuse_none:"
-  ins "test rdi, rdi"
-  ins "jz .L_reuse_zero"
-  reuseMap -- only for its packed bit
-  line ".L_reuse_dup:"
-  ins "bsf rcx, rdi"
-  ins "btr rdi, rcx"
-  child "rdx" "rax"
-  ins "mov esi, dword ptr [rdx - 8]"
-  ins "test esi, esi"
-  ins "js .L_reuse_next"
-  ins "add esi, 1024"
-  ins "mov dword ptr [rdx - 8], esi"
-  line ".L_reuse_next:"
-  ins "test rdi, rdi"
-  ins "jnz .L_reuse_dup"
-  line ".L_reuse_zero:"
-  ins "xor eax, eax"
-  line ".L_reuse_ret:"
-  ins "add rsp, 8"
-  ins "pop r12"
-  ins "pop rbx"
-  ins "ret"
+  R.dropReuse asmX86
 
   -- Arrays (spec/memory.md): payload [length, capacity, elements…]; the layout is arrayLayout
   -- plus the kind: 0 for 4-byte elements, 1 words, 2 pointers. An update to an array nothing
@@ -2043,33 +1983,6 @@ emitRuntime used = do
       ins (if on then "mov edx, 0x800" else "xor edx, edx")
       ins "xor eax, eax"
       ins "call fcntl"
-    -- Child rcx of the block in @base@ into @dst@: a word, or for a packed layout (bit 16 of
-    -- r12, the map) a 4-byte slot holding (child - block) / 8.
-    child dst base = do
-      lPacked <- newLabel
-      lDone <- newLabel
-      ins "test r12d, 0x10000"
-      ins ("jnz " ++ lPacked)
-      ins ("mov " ++ dst ++ ", qword ptr [" ++ base ++ " + rcx*8]")
-      ins ("jmp " ++ lDone)
-      line (lPacked ++ ":")
-      ins ("movsxd " ++ dst ++ ", dword ptr [" ++ base ++ " + rcx*4]")
-      ins ("lea " ++ dst ++ ", [" ++ base ++ " + " ++ dst ++ "*8]")
-      line (lDone ++ ":")
-    -- The pointer map and packed bit of the block in rax (header's low half in ecx) into r12.
-    -- Clobbers rcx, rdx.
-    reuseMap = do
-      lMap <- newLabel
-      ins "mov r12, qword ptr [rax - 8]"
-      ins "shl r12, 7"
-      ins "shr r12, 47"
-      ins ("test ecx, " ++ show fieldLayouts)
-      ins ("jz " ++ lMap)
-      ins "and ecx, 0x3ff" -- a field in the header: the map is in the table
-      address "rdx" "_keel_layouts"
-      ins ("mov r12d, dword ptr [rdx + rcx*4 - " ++ show (4 * fieldLayouts) ++ "]")
-      ins "shr r12d, 8"
-      line (lMap ++ ":")
     fn lbl = line "\t.p2align 4" >> line (lbl ++ ":")
     -- An array's payload words for n elements into d: (n << (2 + cl) + 23) >> 3, with cl 1 for
     -- 8-byte elements (2 + the elements, rounded up to words).

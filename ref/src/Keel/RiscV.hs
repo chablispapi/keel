@@ -175,15 +175,6 @@ storeHeader r h = do
       li "t6" (h .&. 0xffffffff) >> ins ("sw t6, -8(" ++ r ++ ")")
       li "t6" (h `shiftR` 32) >> ins ("sw t6, -4(" ++ r ++ ")")
 
--- | The pointer map of the block in @r@ (bits 40–55 of its header, with the packed bit 56) into
--- @d@.
-headerMap :: String -> String -> G ()
-headerMap d r = do
-  w <- wordSize
-  if w == 8
-    then ins ("ld " ++ d ++ ", -8(" ++ r ++ ")") >> ins ("slli " ++ d ++ ", " ++ d ++ ", 7") >> ins ("srli " ++ d ++ ", " ++ d ++ ", 47")
-    else ins ("lw " ++ d ++ ", -4(" ++ r ++ ")") >> ins ("slli " ++ d ++ ", " ++ d ++ ", 7") >> ins ("srli " ++ d ++ ", " ++ d ++ ", 15")
-
 -- | Jump to a possibly distant label when a condition holds. Conditional branches only reach
 -- ±4 KiB, so branch over an unconditional jump instead.
 jumpIf :: String -> [String] -> String -> G ()
@@ -1730,65 +1721,7 @@ emitRuntime = do
   ins "addi sp, sp, 32"
   ins "ret"
 
-  -- _keel_drop_reuse: a0 = block, a1 = the fields taken over (a mask of words) → the block if
-  -- it was unique (its other children dropped), else 0 (the fields taken over duplicated).
-  fn "_keel_drop_reuse"
-  ins "addi sp, sp, -32"
-  ins "sd ra, 24(sp)"
-  ins "lw t0, -8(a0)"
-  ins "bltz t0, .L_reuse_none"
-  ins "srliw t1, t0, 10"
-  jumpIf "beqz" ["t1"] "_keel_panic_rc"
-  ins "li t2, 1"
-  ins "bne t1, t2, .L_reuse_shared"
-  stat 24
-  ins "sd a0, 0(sp)"
-  reuseMap
-  ins "not t4, a1" -- the fields taken over stay alive: they are the caller's now
-  ins "and t2, t2, t4"
-  line ".L_reuse_loop:"
-  ins "beqz t2, .L_reuse_done"
-  ins "neg t3, t2"
-  ins "and t3, t2, t3"
-  ins "xor t2, t2, t3"
-  ins "sd t2, 8(sp)"
-  lowIndex
-  ins "ld t0, 0(sp)"
-  child "a0" "t0"
-  ins "call _keel_drop"
-  ins "ld t2, 8(sp)"
-  ins "j .L_reuse_loop"
-  line ".L_reuse_done:"
-  ins "ld a0, 0(sp)"
-  ins "lw t0, -8(a0)"
-  ins "andi t0, t0, 0x3ff" -- count 0 until reused
-  ins "sw t0, -8(a0)"
-  ins "j .L_reuse_ret"
-  line ".L_reuse_shared:"
-  ins "addiw t0, t0, -1024"
-  ins "sw t0, -8(a0)"
-  -- The block keeps its references: duplicate the fields taken over.
-  line ".L_reuse_none:"
-  ins "beqz a1, .L_reuse_zero"
-  reuseMap -- only for its packed bit
-  line ".L_reuse_dup:"
-  ins "neg t3, a1"
-  ins "and t3, a1, t3" -- lowest set bit
-  ins "xor a1, a1, t3"
-  lowIndex
-  child "t4" "a0"
-  ins "lw t5, -8(t4)"
-  ins "bltz t5, .L_reuse_next"
-  ins "addiw t5, t5, 1024"
-  ins "sw t5, -8(t4)"
-  line ".L_reuse_next:"
-  ins "bnez a1, .L_reuse_dup"
-  line ".L_reuse_zero:"
-  ins "li a0, 0"
-  line ".L_reuse_ret:"
-  ins "ld ra, 24(sp)"
-  ins "addi sp, sp, 32"
-  ins "ret"
+  R.dropReuse (asmRv w)
 
   -- _keel_perform: a0 = operation number, a1 = argument → a0 = result.
   fn "_keel_perform"
@@ -2256,61 +2189,6 @@ emitRuntime = do
       ins ("sll " ++ d ++ ", " ++ n ++ ", " ++ tmp)
       ins ("addi " ++ d ++ ", " ++ d ++ ", 23") -- + 7 to round up, + 16 for length and capacity
       ins ("srli " ++ d ++ ", " ++ d ++ ", 3")
-    -- t3 holds a layout id from fieldLayouts on; put its pointer map in t2 (uses t4).
-    pointerMap = do
-      ins "la t4, _keel_layouts"
-      ins ("addi t2, t3, -" ++ show fieldLayouts)
-      ins "slli t2, t2, 2"
-      ins "add t4, t4, t2"
-      ins "lwu t2, 0(t4)"
-      ins "srli t2, t2, 8"
-    -- The 17-bit map in t2: its packed bit to 16(sp), t2 the map. Clobbers t5.
-    splitPacked = do
-      xlen <- xlenBits
-      ins "srli t5, t2, 16"
-      ins "sd t5, 16(sp)"
-      ins ("slli t2, t2, " ++ show (xlen - 16))
-      ins ("srli t2, t2, " ++ show (xlen - 16))
-    -- The map of the block in a0 (header's low half in t0) into t2, its packed bit to 16(sp).
-    reuseMap = do
-      lMap <- newLabel
-      headerMap "t2" "a0"
-      ins "andi t3, t0, 0x200"
-      ins ("beqz t3, " ++ lMap)
-      ins "andi t3, t0, 0x3ff" -- a field in the header: the map is in the table
-      pointerMap
-      line (lMap ++ ":")
-      splitPacked
-    -- Child t4 / 8 (t4 from lowIndex) of the block in @base@ into @dst@: a word, or with the
-    -- packed bit at 16(sp) a 4-byte slot holding (child - block) / 8. Clobbers t5, t6.
-    child dst base = do
-      lPacked <- newLabel
-      lDone <- newLabel
-      ins "ld t5, 16(sp)"
-      ins ("bnez t5, " ++ lPacked)
-      ins ("add t6, " ++ base ++ ", t4")
-      ins ("ld " ++ dst ++ ", 0(t6)")
-      ins ("j " ++ lDone)
-      line (lPacked ++ ":")
-      ins "srli t6, t4, 1"
-      ins ("add t6, " ++ base ++ ", t6")
-      ins ("lw " ++ dst ++ ", 0(t6)")
-      ins ("slli " ++ dst ++ ", " ++ dst ++ ", 3")
-      ins ("add " ++ dst ++ ", " ++ base ++ ", " ++ dst)
-      line (lDone ++ ":")
-    -- t3 holds a single set bit; put its byte offset (index · word size) in t4.
-    lowIndex = do
-      lLoop <- newLabel
-      lDone <- newLabel
-      w <- wordSize
-      ins "li t4, 0"
-      line (lLoop ++ ":")
-      ins "li t5, 1"
-      ins ("beq t3, t5, " ++ lDone)
-      ins "srli t3, t3, 1"
-      ins ("addi t4, t4, " ++ show w)
-      ins ("j " ++ lLoop)
-      line (lDone ++ ":")
     panic lbl msg = do
       l <- str msg
       fn lbl
