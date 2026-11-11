@@ -1,11 +1,416 @@
 -- | The runtime routines the three back ends share, written once against "Keel.Asm"
 -- (spec/backends.md). Each back end's @emitRuntime@ calls these with its own emitters; what
 -- only one target has (host I/O, sockets, RISC-V printing and traps) stays there.
-module Keel.Runtime (alloc, dropBlock, dropReuse, freeBlock, arenaOpen, arenaClose) where
+module Keel.Runtime (alloc, dropBlock, dropReuse, freeBlock, arenaOpen, arenaClose, arrays) where
 
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Keel.Asm
 import Keel.Lower (arrayLayout, fieldLayouts)
+
+-- | The array routines. Payload [length, capacity, elements…]; the layout is arrayLayout plus
+-- the kind: 0 for 4-byte elements, 1 for 8-byte ones, 2 for pointers. On RV32 a kind-1
+-- element is two words, its high half in the next argument register. The header's size field
+-- is capacity + 2 words, capped at 255 (larger blocks are never recycled anyway). An update
+-- to an array nothing else references happens in place; otherwise the array is copied first.
+arrays :: Monad m => Asm m -> m ()
+arrays a = do
+  arrayAlloc a
+  arrayNew a
+  arrayClone a
+  arraySet a
+  arrayPush a
+  arrayPop a
+
+-- | _keel_array_alloc: A 0 = capacity, A 1 = kind → A 0 = an empty array.
+arrayAlloc :: Monad m => Asm m -> m ()
+arrayAlloc a = do
+  fn a "_keel_array_alloc"
+  frame a 3
+  store a Word (A 0) Sp (slot a 0)
+  store a Word (A 1) Sp (slot a 1)
+  elemWords a (A 0) (A 0) (A 1) (T 0)
+  store a Word (A 0) Sp (slot a 2)
+  mov a (A 1) (I 0)
+  call a "_keel_alloc"
+  load a Word (T 0) Sp (slot a 0)
+  load a Word (T 1) Sp (slot a 1)
+  mov a (T 2) (I (1024 + arrayLayout)) -- count 1, the kind's layout
+  op a Add (T 2) (T 2) (R (T 1))
+  store a (Half32 False) (T 2) (A 0) (-8)
+  load a Word (T 3) Sp (slot a 2) -- its words, capped at 255
+  capWords a (T 3) (T 4)
+  store a (Half32 False) (T 3) (A 0) (-4)
+  mov a (T 4) (I 0)
+  store a Word (T 4) (A 0) 0
+  store a Word (T 0) (A 0) (wordBytes a)
+  unframe a 3
+  ret a
+
+-- | _keel_array_new: A 0 = length, A 1 = the element (owned), A 2 = kind → A 0.
+arrayNew :: Monad m => Asm m -> m ()
+arrayNew a = do
+  fn a "_keel_array_new"
+  frame a 4
+  branch a Lts (A 0) (I 0) "_keel_panic_bounds"
+  store a Word (A 1) Sp (slot a 0)
+  store a Word (A 2) Sp (slot a 1)
+  store a Word (A 0) Sp (slot a 2)
+  when rv32 $ store a Word (A 3) Sp (slot a 3) -- an 8-byte element's high half
+  mov a (A 1) (R (A 2))
+  call a "_keel_array_alloc"
+  load a Word (T 0) Sp (slot a 2)
+  load a Word (T 1) Sp (slot a 0)
+  load a Word (T 2) Sp (slot a 1)
+  store a Word (T 0) (A 0) 0
+  mov a (T 3) (I 0)
+  branch a Eq (T 2) (I 0) fill4
+  when rv32 $ op a Sub (T 4) (T 2) (I 1) >> branch a Eq (T 4) (I 0) fill8
+  label a fill
+  branch a Geu (T 3) (R (T 0)) filled
+  addScaled a (T 4) (A 0) (T 3) (wordShift a)
+  store a Word (T 1) (T 4) elems
+  op a Add (T 3) (T 3) (I 1)
+  jump a fill
+  label a fill4
+  branch a Geu (T 3) (R (T 0)) filled
+  addScaled a (T 4) (A 0) (T 3) 2
+  store a (Half32 False) (T 1) (T 4) elems
+  op a Add (T 3) (T 3) (I 1)
+  jump a fill4
+  when rv32 $ do
+    label a fill8
+    load a Word (T 5) Sp (slot a 3)
+    label a fill8Loop
+    branch a Geu (T 3) (R (T 0)) filled
+    addScaled a (T 4) (A 0) (T 3) 3
+    store a Word (T 1) (T 4) 8
+    store a Word (T 5) (T 4) 12
+    op a Add (T 3) (T 3) (I 1)
+    jump a fill8Loop
+  label a filled
+  mov a (T 4) (I 2)
+  branch a Ne (T 2) (R (T 4)) done
+  -- The element now has n references in the array; the caller gave one.
+  branch a Eq (T 0) (I 0) dropIt
+  load a (Half32 True) (T 4) (T 1) (-8)
+  branch a Lts (T 4) (I 0) done
+  op a Shr (T 5) (T 4) (I 10) -- the count
+  op a Add (T 5) (T 5) (R (T 0))
+  op a Sub (T 5) (T 5) (I 1)
+  op a And (T 4) (T 4) (I 0x3ff)
+  op a Shr (T 3) (T 5) (I 21)
+  branch a Eq (T 3) (I 0) counted
+  mov a (T 5) (I 0x200000) -- overflowed: immortal (bit 31 after the shift)
+  label a counted
+  op a Shl (T 5) (T 5) (I 10)
+  op a Or (T 4) (T 4) (R (T 5))
+  store a (Half32 False) (T 4) (T 1) (-8)
+  jump a done
+  label a dropIt
+  store a Word (A 0) Sp (slot a 2)
+  mov a (A 0) (R (T 1))
+  call a "_keel_drop"
+  load a Word (A 0) Sp (slot a 2)
+  label a done
+  unframe a 4
+  ret a
+  where
+    rv32 = wordBytes a == 4
+    elems = 2 * wordBytes a
+    fill = local a "anew_fill"
+    fill4 = local a "anew_fill4"
+    fill8 = local a "anew_fill8"
+    fill8Loop = local a "anew_fill8_loop"
+    filled = local a "anew_filled"
+    counted = local a "anew_count"
+    dropIt = local a "anew_drop"
+    done = local a "anew_ret"
+
+-- | _keel_array_clone: A 0 = array (owned), A 1 = capacity ≥ its length → A 0 = a fresh array
+-- with the same elements. A unique array's elements move and its block is freed; a shared
+-- one's are duplicated and its count decremented.
+arrayClone :: Monad m => Asm m -> m ()
+arrayClone a = do
+  fn a "_keel_array_clone"
+  frame a 3
+  store a Word (A 0) Sp (slot a 0)
+  kindOf a (T 0) (A 0)
+  store a Word (T 0) Sp (slot a 1)
+  mov a (A 0) (R (A 1))
+  mov a (A 1) (R (T 0))
+  call a "_keel_array_alloc"
+  load a Word (T 0) Sp (slot a 0)
+  load a Word (T 1) (T 0) 0
+  store a Word (T 1) (A 0) 0
+  -- Copy the elements' words.
+  load a Word (T 2) Sp (slot a 1)
+  elemWords a (T 5) (T 1) (T 2) (T 3)
+  op a Sub (T 5) (T 5) (I 2)
+  mov a (T 2) (I 0)
+  label a copy
+  branch a Geu (T 2) (R (T 5)) copied
+  addScaled a (T 3) (T 0) (T 2) (wordShift a)
+  load a Word (T 4) (T 3) elems
+  addScaled a (T 3) (A 0) (T 2) (wordShift a)
+  store a Word (T 4) (T 3) elems
+  op a Add (T 2) (T 2) (I 1)
+  jump a copy
+  label a copied
+  load a (Half32 False) (T 2) (T 0) (-8)
+  op a Shr (T 3) (T 2) (I 10)
+  op a Sub (T 3) (T 3) (I 1)
+  branch a Ne (T 3) (I 0) shared
+  op a And (T 3) (T 2) (I 0x3ff) -- count 0
+  store a (Half32 False) (T 3) (T 0) (-8)
+  loadSym a (T 3) "_keel_arena_base"
+  branch a Geu (T 0) (R (T 3)) done -- in an open arena: freed when it closes
+  stat a 24 (T 3) (T 4)
+  store a Word (A 0) Sp (slot a 1)
+  mov a (A 0) (R (T 0))
+  call a "_keel_free_block"
+  load a Word (A 0) Sp (slot a 1)
+  jump a done
+  label a shared
+  op a And (T 3) (T 2) (I 0x3ff)
+  mov a (T 4) (I (arrayLayout + 2))
+  branch a Ne (T 3) (R (T 4)) dec
+  mov a (T 3) (I 0)
+  label a dup
+  branch a Geu (T 3) (R (T 1)) dec
+  addScaled a (T 4) (T 0) (T 3) (wordShift a)
+  load a Word (T 4) (T 4) elems
+  load a (Half32 True) (T 5) (T 4) (-8)
+  branch a Lts (T 5) (I 0) next
+  op a Add (T 5) (T 5) (I 1024)
+  store a (Half32 False) (T 5) (T 4) (-8)
+  label a next
+  op a Add (T 3) (T 3) (I 1)
+  jump a dup
+  label a dec
+  op a Sub (T 2) (T 2) (I 1024)
+  store a (Half32 False) (T 2) (T 0) (-8)
+  label a done
+  unframe a 3
+  ret a
+  where
+    elems = 2 * wordBytes a
+    copy = local a "aclone_copy"
+    copied = local a "aclone_copied"
+    shared = local a "aclone_shared"
+    dup = local a "aclone_dup"
+    next = local a "aclone_next"
+    dec = local a "aclone_dec"
+    done = local a "aclone_ret"
+
+-- | _keel_array_set: A 0 = array (owned), A 1 = index, A 2 = element (owned) → A 0.
+arraySet :: Monad m => Asm m -> m ()
+arraySet a = do
+  fn a "_keel_array_set"
+  frame a 3
+  load a Word (T 0) (A 0) 0
+  branch a Geu (A 1) (R (T 0)) "_keel_panic_bounds"
+  unique a (T 1) (A 0) put
+  store a Word (A 1) Sp (slot a 0)
+  store a Word (A 2) Sp (slot a 1)
+  when rv32 $ store a Word (A 3) Sp (slot a 2)
+  load a Word (A 1) (A 0) (wordBytes a)
+  call a "_keel_array_clone"
+  load a Word (A 1) Sp (slot a 0)
+  load a Word (A 2) Sp (slot a 1)
+  when rv32 $ load a Word (A 3) Sp (slot a 2)
+  label a put
+  kindOf a (T 2) (A 0)
+  branch a Ne (T 2) (I 0) word
+  addScaled a (T 0) (A 0) (A 1) 2
+  store a (Half32 False) (A 2) (T 0) elems
+  jump a done
+  label a word
+  when rv32 $ do -- 8-byte elements (kind 1) in A 2, A 3
+    op a Sub (T 4) (T 2) (I 1)
+    branch a Ne (T 4) (I 0) word4
+    addScaled a (T 0) (A 0) (A 1) 3
+    store a Word (A 2) (T 0) 8
+    store a Word (A 3) (T 0) 12
+    jump a done
+    label a word4
+  addScaled a (T 0) (A 0) (A 1) (wordShift a)
+  load a Word (T 1) (T 0) elems
+  store a Word (A 2) (T 0) elems
+  op a Sub (T 2) (T 2) (I 2)
+  branch a Ne (T 2) (I 0) done
+  store a Word (A 0) Sp (slot a 0)
+  mov a (A 0) (R (T 1))
+  call a "_keel_drop" -- the element it replaced
+  load a Word (A 0) Sp (slot a 0)
+  label a done
+  unframe a 3
+  ret a
+  where
+    rv32 = wordBytes a == 4
+    elems = 2 * wordBytes a
+    put = local a "aset_store"
+    word = local a "aset_word"
+    word4 = local a "aset_w4"
+    done = local a "aset_ret"
+
+-- | _keel_array_push: A 0 = array (owned), A 1 = element (owned; on RV32 an 8-byte one's high
+-- half in A 2) → A 0. A full array doubles: in place when it is unique and the last block
+-- before the bump pointer (then nothing lies after it, not even an arena's record), otherwise
+-- into a copy.
+arrayPush :: Monad m => Asm m -> m ()
+arrayPush a = do
+  fn a "_keel_array_push"
+  frame a 2
+  store a Word (A 1) Sp (slot a 0)
+  when rv32 $ store a Word (A 2) Sp (slot a 1)
+  load a Word (T 0) (A 0) 0
+  load a Word (T 1) (A 0) (wordBytes a)
+  branch a Geu (T 0) (R (T 1)) grow
+  unique a (T 2) (A 0) put
+  mov a (A 1) (R (T 1))
+  call a "_keel_array_clone"
+  jump a put
+  label a grow
+  op a Shl (A 1) (T 1) (I 1)
+  mov a (T 3) (I 4)
+  branch a Geu (A 1) (R (T 3)) capped
+  mov a (A 1) (R (T 3))
+  label a capped
+  unique a (T 2) (A 0) inPlace
+  jump a copy
+  label a inPlace
+  kindOf a (T 2) (A 0)
+  elemWords a (T 4) (T 1) (T 2) (T 3)
+  addScaled a (T 4) (A 0) (T 4) (wordShift a) -- the block's end
+  addr a (T 5) "_keel_heap_ptr"
+  load a Word (T 3) (T 5) 0
+  branch a Ne (T 4) (R (T 3)) copy
+  elemWords a (T 4) (A 1) (T 2) (T 3)
+  addScaled a (T 3) (A 0) (T 4) (wordShift a)
+  load a Word (T 1) (T 5) 8
+  branch a Gtu (T 3) (R (T 1)) "_keel_panic_oom"
+  store a Word (T 3) (T 5) 0
+  store a Word (A 1) (A 0) (wordBytes a)
+  capWords a (T 4) (T 1) -- the header's words, capped as in _keel_array_alloc
+  store a Byte (T 4) (A 0) (-4)
+  jump a put
+  label a copy
+  call a "_keel_array_clone"
+  label a put
+  load a Word (T 0) (A 0) 0
+  load a Word (A 1) Sp (slot a 0)
+  kindOf a (T 2) (A 0)
+  branch a Ne (T 2) (I 0) word
+  addScaled a (T 1) (A 0) (T 0) 2
+  store a (Half32 False) (A 1) (T 1) elems
+  jump a count
+  label a word
+  when rv32 $ do -- 8-byte elements (kind 1), the high half in slot 1
+    op a Sub (T 4) (T 2) (I 1)
+    branch a Ne (T 4) (I 0) word4
+    addScaled a (T 1) (A 0) (T 0) 3
+    store a Word (A 1) (T 1) 8
+    load a Word (T 3) Sp (slot a 1)
+    store a Word (T 3) (T 1) 12
+    jump a count
+    label a word4
+  addScaled a (T 1) (A 0) (T 0) (wordShift a)
+  store a Word (A 1) (T 1) elems
+  label a count
+  op a Add (T 0) (T 0) (I 1)
+  store a Word (T 0) (A 0) 0
+  unframe a 2
+  ret a
+  where
+    rv32 = wordBytes a == 4
+    elems = 2 * wordBytes a
+    grow = local a "apush_grow"
+    capped = local a "apush_cap"
+    inPlace = local a "apush_in_place"
+    copy = local a "apush_copy"
+    put = local a "apush_store"
+    word = local a "apush_word"
+    word4 = local a "apush_w4"
+    count = local a "apush_count"
+
+-- | _keel_array_pop: A 0 = array (owned) → A 0 without its last element.
+arrayPop :: Monad m => Asm m -> m ()
+arrayPop a = do
+  fn a "_keel_array_pop"
+  frame a 1
+  load a Word (T 0) (A 0) 0
+  branch a Eq (T 0) (I 0) "_keel_panic_bounds"
+  unique a (T 1) (A 0) takeLast
+  load a Word (A 1) (A 0) (wordBytes a)
+  call a "_keel_array_clone"
+  label a takeLast
+  load a Word (T 0) (A 0) 0
+  op a Sub (T 0) (T 0) (I 1)
+  store a Word (T 0) (A 0) 0
+  kindOf a (T 2) (A 0)
+  mov a (T 3) (I 2)
+  branch a Ne (T 2) (R (T 3)) done
+  addScaled a (T 1) (A 0) (T 0) (wordShift a)
+  store a Word (A 0) Sp (slot a 0)
+  load a Word (A 0) (T 1) (2 * wordBytes a)
+  call a "_keel_drop"
+  load a Word (A 0) Sp (slot a 0)
+  label a done
+  unframe a 1
+  ret a
+  where
+    takeLast = local a "apop_take"
+    done = local a "apop_ret"
+
+-- | The kind of the array in @b@ into @d@.
+kindOf :: Monad m => Asm m -> Reg -> Reg -> m ()
+kindOf a d b = do
+  load a (Half32 False) d b (-8)
+  op a And d d (I 0x3ff)
+  op a Sub d d (I arrayLayout)
+
+-- | To @l@ when the block in @b@ has a count of exactly 1 (uses @t@).
+unique :: Monad m => Asm m -> Reg -> Reg -> String -> m ()
+unique a t b l = do
+  load a (Half32 False) t b (-8)
+  op a Shr t t (I 10)
+  op a Sub t t (I 1)
+  branch a Eq t (I 0) l
+
+-- | An array's payload words for @n@ elements of kind @k@ into @d@ (≠ k): 2 + the elements,
+-- rounded up to words. Uses @t@ on RV32.
+elemWords :: Monad m => Asm m -> Reg -> Reg -> Reg -> Reg -> m ()
+elemWords a d n k t = do
+  lOther <- newLabel a
+  lAdd <- newLabel a
+  if wordBytes a == 4
+    then do -- a word per element, two for kind 1
+      op a Sub t k (I 1)
+      branch a Ne t (I 0) lOther
+      op a Shl d n (I 1)
+      jump a lAdd
+      label a lOther
+      unless (d == n) $ mov a d (R n)
+      label a lAdd
+      op a Add d d (I 2)
+    else do -- 4-byte elements for kind 0, 8-byte ones otherwise
+      branch a Eq k (I 0) lOther
+      op a Shl d n (I 3)
+      jump a lAdd
+      label a lOther
+      op a Shl d n (I 2)
+      label a lAdd
+      op a Add d d (I 23) -- + 7 to round up, + 16 for length and capacity
+      op a Shr d d (I 3)
+
+-- | Cap the words in @r@ at 255, the header's size field (uses @t@).
+capWords :: Monad m => Asm m -> Reg -> Reg -> m ()
+capWords a r t = do
+  lOk <- newLabel a
+  mov a t (I 0xFF)
+  branch a Ltu r (R t) lOk
+  mov a r (R t)
+  label a lOk
 
 -- | _keel_alloc: A 0 = payload words, A 1 = header without its count (on RV32 its low half,
 -- and A 2 the high one) → A 0 = payload. Clobbers T 0–3 only. Blocks of up to @maxSmall@
