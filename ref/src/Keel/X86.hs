@@ -9,7 +9,7 @@
 -- Keel's own calling convention: rax = block / result, arguments in rdi, rsi, rdx, rcx, r8, r9,
 -- r10. Variables live in rbx, r12–r15 (callee-saved, as for C) or in stack slots; rbp is the
 -- frame pointer. Scratch: r11 and r10 hold operands, r9 and r8 temporaries (the allocator
--- leaves r8–r11 alone); rdx and rcx for division, shifts and inline reference counting. Calls
+-- leaves r8, r9 and rsi alone); rdx and rcx for division, shifts and inline reference counting. Calls
 -- into the C library follow the System V ABI, with the stack 16-byte aligned at every call.
 --
 -- The heap is 14 GB of address space reserved with mmap (MAP_NORESERVE) at startup, at 1 GB:
@@ -32,7 +32,7 @@ import Data.Text.Encoding qualified as TE
 import Keel.AArch64 (Loc (..), constData, Reduction (..), allocate, bound, dataOf, header, keyOf, maxSmall, performedOps, prepare, printerTypes, pruneRuntime, reduction, runtimeBegin, runtimeEnd, template, uses)
 import Keel.Asm qualified as K
 import Keel.Lower
-import Keel.Runtime (arenaClose, arenaOpen)
+import Keel.Runtime qualified as R
 import Keel.Syntax
 import Numeric (showOct)
 
@@ -570,7 +570,7 @@ vectorLoop slots red = when (length scalars <= 3 && length (rNodes red) <= 3) $ 
       Arith _ Sub -> "psubq"
       _ -> "paddq"
 
--- | Allocate a block into rax (header written). Clobbers rax, rcx, rdx, rsi, rdi only.
+-- | Allocate a block into rax (header written). Clobbers rax, rdi, rcx, rdx, r10, r11 only.
 alloc :: Int -> Integer -> G ()
 alloc fields lid = do
   t <- gets (\st -> template (gsLayouts st) lid)
@@ -898,7 +898,7 @@ arith it@(IntTy sgn n) ov aop
         Optional -> do
           lDone <- newLabel
           (none, some) <- gets (\st -> optionLayouts (gsLayouts st) it)
-          ins "mov r8, rax" -- the allocator leaves r8–r11 alone
+          ins "mov r8, rax" -- the allocator leaves r8 and r9 alone
           if n <= 32
             then alloc 0 some >> ins ("mov " ++ mem32 "rax" (-4) ++ ", r8d")
             else alloc 1 some >> ins ("mov " ++ mem "rax" 0 ++ ", r8")
@@ -1152,7 +1152,7 @@ emitEntry printers t = do
 -- | The runtime, as in "Keel.AArch64" (spec/memory.md). Its routines take rax, rdi, rsi (Keel's
 -- convention) and keep the stack 16-byte aligned at their calls.
 -- | The portable assembler ("Keel.Asm") for the shared runtime: A = rax, rdi, rsi; T = rcx,
--- rdx, r8, r9 (what the allocator may clobber), then r10, r11.
+-- rdx, r10, r11 (what the allocator may clobber), then r8, r9.
 asmX86 :: K.Asm G
 asmX86 =
   K.Asm
@@ -1195,6 +1195,7 @@ asmX86 =
     , K.callReg = \r -> ins ("call " ++ q r)
     , K.ret = ins "ret"
     , K.addr = address . q
+    , K.loadSym = \d sym -> ins ("mov " ++ q d ++ ", qword ptr [rip + " ++ sym ++ "]")
     , K.stat = \off _ _ -> ins ("inc qword ptr [rip + _keel_stats" ++ disp off ++ "]")
     , -- On entry rsp is 8 past a 16-byte boundary (the return address): keep calls aligned.
       K.frame = \n -> ins ("sub rsp, " ++ show (frameSize n))
@@ -1208,7 +1209,7 @@ asmX86 =
   where
     q r = case r of
       K.A i -> ["rax", "rdi", "rsi"] !! i
-      K.T i -> ["rcx", "rdx", "r8", "r9", "r10", "r11"] !! i
+      K.T i -> ["rcx", "rdx", "r10", "r11", "r8", "r9"] !! i
       K.Sp -> "rsp"
     low8 r = case r of
       'r' : n@(d : _) | d `elem` ['0' .. '9'] -> 'r' : n ++ "b"
@@ -1242,49 +1243,9 @@ asmX86 =
 -- | The runtime; @used@: the built-in operations the program performs (no code for the rest).
 emitRuntime :: S.Set Int -> G ()
 emitRuntime used = do
-  -- _keel_alloc: rax = payload words, rdi = header without its count → rax = payload.
-  -- Clobbers rcx, rdx, rsi, rdi only.
-  fn "_keel_alloc"
-  ins ("cmp rax, " ++ show maxSmall)
-  ins "ja .L_alloc_bump"
-  -- The free lists, or an empty table while an arena is open: then everything comes from the
-  -- bump pointer, so all of it lies above the arena's start and goes when it closes.
-  ins "mov rcx, qword ptr [rip + _keel_fl]"
-  ins "mov rdx, qword ptr [rcx + rax*8]"
-  ins "test rdx, rdx"
-  ins "jz .L_alloc_bump"
-  ins "test rax, rax"
-  ins "jz .L_alloc_link0"
-  ins "mov rsi, qword ptr [rdx]" -- the next free block
-  line ".L_alloc_pop:"
-  ins "mov qword ptr [rcx + rax*8], rsi"
-  ins "inc qword ptr [rip + _keel_stats + 8]"
-  ins "jmp .L_alloc_header"
-  line ".L_alloc_bump:"
-  address "rsi" "_keel_heap_ptr"
-  ins "mov rdx, qword ptr [rsi]"
-  ins "lea rcx, [rdx + rax*8 + 8]"
-  ins "cmp rcx, qword ptr [rsi + 8]"
-  ins "ja _keel_panic_oom"
-  ins "mov qword ptr [rsi], rcx"
-  ins "add rdx, 8"
-  ins "inc qword ptr [rip + _keel_stats]"
-  line ".L_alloc_header:"
-  ins "or rdi, 1024" -- count 1
-  ins "mov qword ptr [rdx - 8], rdi"
-  ins "mov rax, rdx"
-  ins "ret"
-  -- A block of no words links to the next in its header's high half, in words from it.
-  line ".L_alloc_link0:"
-  ins "movsxd rsi, dword ptr [rdx - 4]"
-  ins "test rsi, rsi"
-  ins "jz .L_alloc_pop"
-  ins "lea rsi, [rdx + rsi*8]"
-  ins "jmp .L_alloc_pop"
-
-  arenaOpen asmX86
-
-  arenaClose asmX86
+  R.alloc asmX86 (toInteger maxSmall)
+  R.arenaOpen asmX86
+  R.arenaClose asmX86
 
   -- _keel_drop: rax = block. Decrement; at zero, drop the children and free the block. The
   -- last pointer child is handled by looping, so dropping a long list uses constant stack.

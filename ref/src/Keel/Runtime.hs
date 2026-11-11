@@ -1,9 +1,57 @@
 -- | The runtime routines the three back ends share, written once against "Keel.Asm"
 -- (spec/backends.md). Each back end's @emitRuntime@ calls these with its own emitters; what
 -- only one target has (host I/O, sockets, RISC-V printing and traps) stays there.
-module Keel.Runtime (arenaOpen, arenaClose) where
+module Keel.Runtime (alloc, arenaOpen, arenaClose) where
 
+import Control.Monad (when)
 import Keel.Asm
+
+-- | _keel_alloc: A 0 = payload words, A 1 = header without its count (on RV32 its low half,
+-- and A 2 the high one) → A 0 = payload. Clobbers T 0–3 only. Blocks of up to @maxSmall@
+-- words come from their size's free list, unless an arena is open (the table is then empty);
+-- the rest from the bump pointer.
+alloc :: Monad m => Asm m -> Integer -> m ()
+alloc a maxSmall = do
+  fn a "_keel_alloc"
+  mov a (T 0) (I maxSmall)
+  branch a Gtu (A 0) (R (T 0)) bump
+  loadSym a (T 0) "_keel_fl" -- the free lists, or an empty table while an arena is open
+  loadIx a (T 1) (T 0) (A 0) 3
+  branch a Eq (T 1) (I 0) bump
+  branch a Eq (A 0) (I 0) link0
+  load a Word (T 2) (T 1) 0 -- the next free block
+  label a pop
+  storeIx a (T 2) (T 0) (A 0) 3 (T 3)
+  stat a 8 (T 2) (T 3)
+  jump a header
+  label a bump
+  addr a (T 0) "_keel_heap_ptr"
+  load a Word (T 1) (T 0) 0
+  addScaled a (T 2) (T 1) (A 0) wordShift
+  op a Add (T 2) (T 2) (I 8)
+  load a Word (T 3) (T 0) 8
+  branch a Gtu (T 2) (R (T 3)) "_keel_panic_oom"
+  store a Word (T 2) (T 0) 0
+  op a Add (T 1) (T 1) (I 8)
+  stat a 0 (T 2) (T 3)
+  label a header
+  op a Or (T 2) (A 1) (I 1024) -- count 1
+  store a Word (T 2) (T 1) (-8)
+  when (wordBytes a == 4) $ store a Word (A 2) (T 1) (-4)
+  mov a (A 0) (R (T 1))
+  ret a
+  -- A block of no words links to the next in its header's high half, in words from it.
+  label a link0
+  load a (Half32 True) (T 2) (T 1) (-4)
+  branch a Eq (T 2) (I 0) pop
+  addScaled a (T 2) (T 1) (T 2) wordShift
+  jump a pop
+  where
+    wordShift = if wordBytes a == 4 then 2 else 3
+    bump = local a "alloc_bump"
+    pop = local a "alloc_pop"
+    header = local a "alloc_header"
+    link0 = local a "alloc_link0"
 
 -- | Arenas (spec/memory.md). Opening one takes a record [base before, enclosing record, bump
 -- allocations so far] from the bump pointer; while any is open, _keel_drop leaves blocks at

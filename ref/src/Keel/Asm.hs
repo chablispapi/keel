@@ -54,6 +54,8 @@ data Asm m = Asm
   , callReg :: Reg -> m ()
   , ret :: m ()
   , addr :: Reg -> String -> m ()
+  , -- | The word at a symbol (one instruction on x86, adrp + ldr on ARM).
+    loadSym :: Reg -> String -> m ()
   , -- | Increment the statistics counter at this byte offset of @_keel_stats@ (two temps).
     stat :: Int -> Reg -> Reg -> m ()
   , -- | A frame of n 8-byte slots, the return address saved; @slot i@ is slot i's offset from

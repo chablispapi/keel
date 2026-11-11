@@ -71,11 +71,12 @@ The choices that matter:
   | | `A 0..2` | `T 0..` (the first four are what `_keel_alloc` and `_keel_free_block` may clobber) |
   |---|---|---|
   | ARM | x0–x2 | x13–x16, then x9–x12 |
-  | x86-64 | rax, rdi, rsi | rcx, rdx, r8, r9, then r10, r11 |
+  | x86-64 | rax, rdi, rsi | rcx, rdx, r10, r11, then r8, r9 |
   | RISC-V | a0–a2 | t4–t6, a6, then t0–t3 |
 
-  On x86 this moves `_keel_alloc`'s clobbers from rsi/rdi to r8/r9. The code generator keeps
-  values across calls only in rbx and r12–r15, and uses r8–r11 as transient scratch.
+  On x86 this moves `_keel_alloc`'s clobbers from rsi to r10/r11. r10 and r11 hold operands
+  that are always consumed before an allocation; r8 still survives it, which the `Optional`
+  overflow path relies on (it keeps the result there across the allocation of its box).
 - **The header is 8 bytes on every target**, and so is the spacing of the runtime's variables
   and of the free-list table, even on RV32 (which uses each slot's low word). Array elements
   and fields are word-sized. So offsets are given in bytes, `loadIx`/`storeIx` take a scale,

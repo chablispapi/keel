@@ -27,7 +27,7 @@ import Numeric (showOct)
 import Keel.Asm qualified as K
 import Keel.Check (checkProgram)
 import Keel.Lower
-import Keel.Runtime (arenaClose, arenaOpen)
+import Keel.Runtime qualified as R
 import Keel.Range (ranges)
 import Keel.Mono (compileWith)
 import Keel.Syntax
@@ -1605,6 +1605,7 @@ asmArm =
     , K.callReg = \r -> ins ("blr " ++ x r)
     , K.ret = ins "ret"
     , K.addr = address . x
+    , K.loadSym = \d sym -> ins ("adrp " ++ x d ++ ", " ++ sym ++ "@PAGE") >> ins ("ldr " ++ x d ++ ", [" ++ x d ++ ", " ++ sym ++ "@PAGEOFF]")
     , K.stat = \off t1 t2 -> do
         address (x t1) "_keel_stats"
         ins ("ldr " ++ x t2 ++ ", [" ++ x t1 ++ ", #" ++ show off ++ "]")
@@ -1659,50 +1660,9 @@ asmArm =
 -- | The runtime; @used@: the built-in operations the program performs (no code for the rest).
 emitRuntime :: S.Set Int -> G ()
 emitRuntime used = do
-  -- _keel_alloc: x0 = payload words, x1 = header without its count → x0 = payload. Clobbers
-  -- x13–x16 only.
-  fn "_keel_alloc"
-  ins ("cmp x0, #" ++ show maxSmall)
-  ins "b.hi L_alloc_bump"
-  -- The free lists, or an empty table while an arena is open: then everything comes from the
-  -- bump pointer, so all of it lies above the arena's start and goes when it closes.
-  ins "adrp x13, _keel_fl@PAGE"
-  ins "ldr x13, [x13, _keel_fl@PAGEOFF]"
-  ins "ldr x14, [x13, x0, lsl #3]"
-  ins "cbz x14, L_alloc_bump"
-  ins "cbz x0, L_alloc_link0"
-  ins "ldr x15, [x14]" -- the next free block
-  line "L_alloc_pop:"
-  ins "str x15, [x13, x0, lsl #3]"
-  stat 8 "x15" "x16"
-  ins "b L_alloc_header"
-  line "L_alloc_bump:"
-  address "x13" "_keel_heap_ptr"
-  ins "ldr x14, [x13]"
-  ins "add x15, x14, x0, lsl #3"
-  ins "add x15, x15, #8"
-  ins "ldr x16, [x13, #8]"
-  ins "cmp x15, x16"
-  ins "b.hi _keel_panic_oom"
-  ins "str x15, [x13]"
-  ins "add x14, x14, #8"
-  stat 0 "x15" "x16"
-  line "L_alloc_header:"
-  ins "orr x15, x1, #1024" -- count 1
-  ins "str x15, [x14, #-8]"
-  ins "mov x0, x14"
-  ins "ret"
-  -- A block of no words links to the next in its header's high half, in words from it.
-  line "L_alloc_link0:"
-  ins "ldrsw x15, [x14, #-4]"
-  ins "add x16, x14, x15, lsl #3"
-  ins "cmp x15, #0"
-  ins "csel x15, xzr, x16, eq"
-  ins "b L_alloc_pop"
-
-  arenaOpen asmArm
-
-  arenaClose asmArm
+  R.alloc asmArm (toInteger maxSmall)
+  R.arenaOpen asmArm
+  R.arenaClose asmArm
 
   -- _keel_drop: x0 = block. Decrement; at zero, drop the children and free the block. The last
   -- pointer child is handled by looping, so dropping a long list uses constant stack.

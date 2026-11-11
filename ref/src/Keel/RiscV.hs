@@ -35,7 +35,7 @@ import Data.List (elemIndex, isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Keel.Asm qualified as K
 import Keel.Lower
-import Keel.Runtime (arenaClose, arenaOpen)
+import Keel.Runtime qualified as R
 import Keel.Syntax
 
 -- | What the image runs on: QEMU's virt board as RV64 or RV32 (the register width in bits), or
@@ -1358,6 +1358,7 @@ asmRv w =
     , K.callReg = \a -> ins ("jalr " ++ r a)
     , K.ret = ins "ret"
     , K.addr = \d sym -> ins ("la " ++ r d ++ ", " ++ sym)
+    , K.loadSym = \d sym -> ins ("la " ++ r d ++ ", " ++ sym) >> ins ("ld " ++ r d ++ ", 0(" ++ r d ++ ")")
     , K.stat = \off t1 t2 -> do
         ins ("la " ++ r t1 ++ ", _keel_stats")
         ins ("ld " ++ r t2 ++ ", " ++ show off ++ "(" ++ r t1 ++ ")")
@@ -1412,51 +1413,9 @@ emitRuntime = do
   console <- gets ((/= Pico2) . gsBoard)
   let wd k = show (k * w) -- the byte offset of word k
       rv32 = w == 4
-  -- _keel_alloc: a0 = payload words, a1 = header without its count (on RV32 its low half, and
-  -- a2 the high one) → a0 = payload. Clobbers t4–t6, a6.
-  fn "_keel_alloc"
-  li "t4" (toInteger maxSmall)
-  ins "bgtu a0, t4, .L_alloc_bump"
-  ins "la t4, _keel_fl" -- the free lists, or an empty table while an arena is open
-  ins "ld t4, 0(t4)"
-  ins "slli t5, a0, 3"
-  ins "add t4, t4, t5"
-  ins "ld t5, 0(t4)"
-  ins "beqz t5, .L_alloc_bump"
-  ins "beqz a0, .L_alloc_link0"
-  ins "ld t6, 0(t5)" -- the next free block
-  line ".L_alloc_pop:"
-  ins "sd t6, 0(t4)"
-  stat 8
-  ins "j .L_alloc_header"
-  line ".L_alloc_bump:"
-  ins "la t4, _keel_heap_ptr"
-  ins "ld t5, 0(t4)"
-  ins ("slli t6, a0, " ++ show sh)
-  ins "add t6, t6, t5"
-  ins "addi t6, t6, 8"
-  ins "ld a6, 8(t4)"
-  jumpIf "bgtu" ["t6", "a6"] "_keel_panic_oom"
-  ins "sd t6, 0(t4)"
-  ins "addi t5, t5, 8"
-  stat 0
-  line ".L_alloc_header:"
-  ins "ori t6, a1, 1024" -- count 1
-  ins "sd t6, -8(t5)"
-  when rv32 $ ins "sw a2, -4(t5)"
-  ins "mv a0, t5"
-  ins "ret"
-  -- A block of no words links to the next in its header's high half, in words from it.
-  line ".L_alloc_link0:"
-  ins "lw t6, -4(t5)"
-  ins "beqz t6, .L_alloc_pop"
-  ins ("slli t6, t6, " ++ show sh)
-  ins "add t6, t6, t5"
-  ins "j .L_alloc_pop"
-
-  arenaOpen (asmRv w)
-
-  arenaClose (asmRv w)
+  R.alloc (asmRv w) (toInteger maxSmall)
+  R.arenaOpen (asmRv w)
+  R.arenaClose (asmRv w)
 
   -- _keel_drop: a0 = block; the last pointer child is handled by looping.
   fn "_keel_drop"
