@@ -1,0 +1,3 @@
+-- &mut x where a plain value is expected.
+def f : i64 -> i64 = \n. n
+main = var x = 1 in f(&mut x)

@@ -20,8 +20,9 @@
 -- selfhost/reject/ has one rejection per error
 -- kind. selfhost/check.kl loads the modules and resolves their names (Keel.Modules). A
 -- polymorphic definition is instantiated as f[τ̄; ε̄], with the effect arguments after the
--- types as rows of Unit ->ε Unit. Not handled yet: var and references, bitdata, cells and
--- queues, and Mono's noAccidentalHandling.
+-- types as rows of Unit ->ε Unit. var and references: place rules (Elab.checkRefs) and elaboration
+-- (Elab.elaborate) run between the passes, so pass 2 checks the rewritten term. Not handled yet:
+-- bitdata, cells and queues, and Mono's noAccidentalHandling.
 --
 -- Measurements (Apple M-series, keelc at the commit that added this):
 --
@@ -912,8 +913,14 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
          let (x2, es) = binder st env x m1 in let (env1, st) = es in
          let (y2, es) = binder st env1 y m2 in let (env2, st) = es in
          case infer st env2 (unbox b) of { R(b2, tb, eb, st) -> R(ELetPair(x2, y2, box e2, box b2), tb, sUnion ee eb, st) } })
-    | EVarIn(x, e, b) -> R(tm, TUnit, Nil, unsupported st "var")
-    | EAssign(x, e) -> R(tm, TUnit, Nil, unsupported st "var")
+    | EVarIn(x, e, b) ->
+        (case infer st env (unbox e) of { R(e2, te, ee, st) ->
+         let (x2, es) = binder st env x te in let (env2, st) = es in
+         case infer st env2 (unbox b) of { R(b2, tb, eb, st) -> R(EVarIn(x2, box e2, box b2), tb, sUnion ee eb, st) } })
+    | EAssign(x, e) -> (case envLocal env x of
+        { None -> R(tm, TUnit, Nil, failSt st "NotAPlace" (append x " is not a local variable"))
+        | Some(xt) -> let (x2, t) = xt in
+            (case check st env (unbox e) t of { C(e2, ee, st) -> R(EAssign(x2, box e2), TUnit, ee, st) }) })
     | EHandle(l, b, cs) -> (case infer st env (unbox b) of
         { R(b2, tb, eb, st) -> case clauses st env (unbox cs) of
             { CA(cs2, ecs, st) -> R(EHandle(l, box b2, box cs2), tb, sUnion (sDelete l (expand st eb)) ecs, st) } })
@@ -938,8 +945,12 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
                       | None -> R(tm, TUnit, Nil, failSt st "Mismatch" (append "can't tell the type before ." o)) })
                 | None -> R(tm, TUnit, Nil, failSt st "Mismatch" (append "can't tell the type before ." o)) })
             | z -> R(tm, TUnit, Nil, failSt st "Mismatch" (append "can't tell the type before ." o)) } })
-    | EBorrow(x) -> R(tm, TUnit, Nil, unsupported st "references")
-    | EBorrowMut(x) -> R(tm, TUnit, Nil, unsupported st "references")
+    | EBorrow(x) -> (case envLocal env x of
+        { Some(xt) -> let (x2, t) = xt in R(EBorrow(x2), t, Nil, st)
+        | None -> R(tm, TUnit, Nil, failSt st "NotAPlace" (append x " is not a local variable")) })
+    | EBorrowMut(x) -> (case envLocal env x of
+        { Some(xt) -> let (x2, t) = xt in R(EBorrowMut(x2), t, Nil, st)
+        | None -> R(tm, TUnit, Nil, failSt st "NotAPlace" (append x " is not a local variable")) })
     | EBits(c, fs) -> R(tm, TUnit, Nil, unsupported st "bitdata") }
 
 -- A polymorphic definition at these types and fresh effect variables: f[τ̄; ε̄]. The core
@@ -999,9 +1010,17 @@ def applyFn : St -> Env -> Term -> Term ->{Diverge, Panic} R =
         | z -> (TUnit, (Nil, (TUnit, failSt st "Mismatch" (append "applying a non-function of type " (showTy (zonk st z)))))) } in
       let (p, rest) = pler in let (latent, rest) = rest in let (r, st) = rest in
       case a of
-        { EBorrow(x) -> R(f, TUnit, Nil, unsupported st "references")
-        | EBorrowMut(x) -> R(f, TUnit, Nil, unsupported st "references")
+        { EBorrow(x) -> borrowArg st env f2 (sUnion ef latent) r p x false
+        | EBorrowMut(x) -> borrowArg st env f2 (sUnion ef latent) r p x true
         | _ -> case check st env a p of { C(a2, ea, st) -> R(EApp(box f2, box a2), r, sUnion ef (sUnion ea latent), st) } } }
+
+-- A borrow argument f(&x) or f(&mut x): the parameter must be a reference to x's type.
+def borrowArg : St -> Env -> Term -> List (List u8) -> Ty -> Ty -> List u8 -> Bool ->{Diverge, Panic} R =
+  \st env f2 eff r p x isMut. case envLocal env x of
+    { None -> R(f2, TUnit, Nil, failSt st "NotAPlace" (append x " is not a local variable"))
+    | Some(xt) -> let (x2, t) = xt in
+        let st = rel st false p (if isMut then TMut(box t) else TRef(box t)) in
+        R(EApp(box f2, box (if isMut then EBorrowMut(x2) else EBorrow(x2))), r, eff, st) }
 
 -- arena (\u. e) is typed as the call (\u. e) () (Keel.Infer); the core term keeps arena at its
 -- head, and the core check types it the same way.
@@ -1147,6 +1166,8 @@ def zonkTerm : St -> Term ->{Diverge, Panic} (Term, St) =
     | ELet(x, e, b) -> let (e2, st) = zonkTerm st (unbox e) in let (b2, st) = zonkTerm st (unbox b) in (ELet(x, box e2, box b2), st)
     | ELetPair(x, y, e, b) -> let (e2, st) = zonkTerm st (unbox e) in let (b2, st) = zonkTerm st (unbox b) in (ELetPair(x, y, box e2, box b2), st)
     | ESeq(a, b) -> let (a2, st) = zonkTerm st (unbox a) in let (b2, st) = zonkTerm st (unbox b) in (ESeq(box a2, box b2), st)
+    | EVarIn(x, e, b) -> let (e2, st) = zonkTerm st (unbox e) in let (b2, st) = zonkTerm st (unbox b) in (EVarIn(x, box e2, box b2), st)
+    | EAssign(x, e) -> let (e2, st) = zonkTerm st (unbox e) in (EAssign(x, box e2), st)
     | ECon(c, tys, args) -> let (args2, st) = zonkTerms st (unbox args) in (ECon(c, box (map (\t. finalTy st t) (unbox tys)), box args2), st)
     | ECase(e, alts) ->
         let (e2, st) = zonkTerm st (unbox e) in
@@ -1978,6 +1999,301 @@ def tyApps : Term ->{Diverge} List (List u8, List Ty) =
 def atBody : Term -> Option (List u8) ->{Diverge, Panic} Option (List u8) =
   \e er. case e of { EAt(f, l, c, b) -> placeErr f l c er | _ -> er }
 
+-- Places and elaboration (Keel.Elab) --------------------------------------------------------
+
+-- What code may do with a place: a &mut parameter or var is Mutable, a & parameter ReadOnly,
+-- an outer place inside a handled expression Frozen, inside a closure or handler Captured.
+data Acc = AMut | ARead | AFrozen | ACaptured
+
+def isCaptured : Acc -> Bool = \a. case a of { ACaptured -> true | _ -> false }
+
+def refErr : List u8 -> List u8 ->{Diverge} Option (List u8) = \kind msg. Some(errLine kind msg)
+
+-- References may appear only as the parameter type of an arrow.
+def tyOk : Ty ->{Diverge} Option (List u8) =
+  \t. case t of
+    { TRef(a) -> refErr "RefEscape" "reference type outside a parameter"
+    | TMut(a) -> refErr "RefEscape" "reference type outside a parameter"
+    | TFun(a, e, b) -> orErr (paramOk (unbox a)) (tyOk (unbox b))
+    | TLFun(a, e, b) -> orErr (paramOk (unbox a)) (tyOk (unbox b))
+    | TBox(a) -> tyOk (unbox a)
+    | TPair(a, b) -> orErr (tyOk (unbox a)) (tyOk (unbox b))
+    | TData(d, ts) -> firstErr tyOk (unbox ts)
+    | TForall(vs, es, b) -> tyOk (unbox b)
+    | _ -> None }
+
+def paramOk : Ty ->{Diverge} Option (List u8) =
+  \t. case t of
+    { TRef(a) -> tyOk (unbox a)
+    | TMut(a) -> tyOk (unbox a)
+    | _ -> tyOk t }
+
+def isRefTy : Ty -> Bool = \t. case t of { TRef(a) -> true | TMut(a) -> true | _ -> false }
+
+def readable : map.Map (List u8) Acc -> List u8 ->{Diverge} Option (List u8) =
+  \env x. case get x env of
+    { Some(a) -> if isCaptured a then refErr "PlaceCapture" (append x " is a place from outside this closure") else None
+    | None -> None }
+
+def writable : map.Map (List u8) Acc -> List u8 ->{Diverge} Option (List u8) =
+  \env x. case get x env of
+    { None -> refErr "NotAPlace" (append x " is not a &mut parameter or var")
+    | Some(a) -> case a of
+        { ACaptured -> refErr "PlaceCapture" (append x " is a place from outside this closure")
+        | AFrozen -> refErr "PlaceCapture" (append x " can't be changed inside a handled expression")
+        | ARead -> refErr "NotMutable" (append x " is a read-only (&) parameter")
+        | AMut -> None } }
+
+-- &x passes x and gets it back, so x must be a place this code may rebind.
+def rebindable : map.Map (List u8) Acc -> List u8 ->{Diverge} Option (List u8) =
+  \env x. case get x env of
+    { None -> refErr "NotAPlace" (append x " is not a parameter or var")
+    | Some(a) -> case a of
+        { AFrozen -> refErr "PlaceCapture" (append x " can't be borrowed inside a handled expression")
+        | _ -> None } }
+
+def mapAcc : (Acc -> Acc) -> map.Map (List u8) Acc ->{Diverge} map.Map (List u8) Acc =
+  \f m. fromPairs (map (\kv. let (k, v) = kv in (k, f v)) (map.toList m))
+
+def freeze : Acc -> Acc = \a. if isCaptured a then ACaptured else AFrozen
+
+-- A closure sees its outer places as Captured, and its own reference parameter.
+def enter : map.Map (List u8) Acc -> List u8 -> Ty ->{Diverge} map.Map (List u8) Acc =
+  \env x t.
+    let outer = mapAcc (\a. ACaptured) env in
+    case t of
+      { TMut(a) -> put x AMut outer
+      | TRef(a) -> put x ARead outer
+      | _ -> outer }
+
+def places : map.Map (List u8) Acc -> Term ->{Diverge, Panic} Option (List u8) =
+  \env tm. case tm of
+    { EAt(f, l, c, e) -> placeErr f l c (places env (unbox e))
+    | EVar(x) -> readable env x
+    | EAssign(x, e) -> orErr (writable env x) (places env (unbox e))
+    | EApp(f, a) -> (case unbox a of
+        { EBorrow(x) -> orErr (readable env x) (orErr (rebindable env x) (places env (unbox f)))
+        | EBorrowMut(x) -> orErr (writable env x) (places env (unbox f))
+        | _ -> placesAll env (children tm) })
+    | EBorrow(x) -> refErr "RefEscape" (append "&" (append x " is only allowed as a function argument"))
+    | EBorrowMut(x) -> refErr "RefEscape" (append "&mut " (append x " is only allowed as a function argument"))
+    | ELam(x, t, b) -> orErr (paramOk t) (places (enter env x t) (unbox b))
+    | EVarIn(x, e, b) -> orErr (places env (unbox e)) (places (put x AMut env) (unbox b))
+    | EHandle(l, b, cs) ->
+        orErr (places (mapAcc freeze env) (unbox b)) (placesAll (mapAcc (\a. ACaptured) env) (map altBody (unbox cs)))
+    | ECocase(d, tys, bs) -> placesAll (mapAcc (\a. ACaptured) env) (map altBody (unbox bs))
+    | _ -> placesAll env (children tm) }
+
+def placesAll : map.Map (List u8) Acc -> List Term ->{Diverge, Panic} Option (List u8) =
+  \env ts. case ts of
+    { Nil -> None
+    | Cons(t, rest) -> orErr (places env t) (placesAll env (unbox rest)) }
+
+def declRefs : Decl ->{Diverge, Panic} Option (List u8) =
+  \d. case d of
+    { DData(lin, nm, ps, cs) -> firstErr (\c. firstErr tyOk (ctorFields c)) cs
+    | DCodata(nm, ps, os) -> firstErr (\c. firstErr tyOk (ctorFields c)) os
+    | DEffect(l, os) -> firstErr (\c. firstErr tyOk (ctorFields c)) os
+    | DDef(f, t, e) -> orErr (tyOk t) (places map.Tip e)
+    | _ -> None }
+
+-- Keel.Elab.checkRefs: the place rules (§3.2) on the declarations, then main.
+def checkRefs : List Decl -> Term ->{Diverge, Panic} Option (List u8) =
+  \ds prog. orErr (firstErr declRefs ds) (places map.Tip prog)
+
+-- Elaboration (§3.3): &τ →ε σ and &mut τ →ε σ both become τ →ε σ ⊗ τ; a call f(&mut x)
+-- returns its result with the new x, which is rebound; x := e binds a fresh x#n.
+def elabTy : Ty ->{Diverge} Ty =
+  \t. case t of
+    { TFun(a, e, b) -> elabArrow false (unbox a) e (unbox b)
+    | TLFun(a, e, b) -> elabArrow true (unbox a) e (unbox b)
+    | TBox(a) -> TBox(box (elabTy (unbox a)))
+    | TPair(a, b) -> TPair(box (elabTy (unbox a)), box (elabTy (unbox b)))
+    | TData(d, ts) -> TData(d, box (map elabTy (unbox ts)))
+    | TForall(vs, es, b) -> TForall(vs, es, box (elabTy (unbox b)))
+    | TRef(a) -> elabTy (unbox a)
+    | TMut(a) -> elabTy (unbox a)
+    | _ -> t }
+
+def elabArrow : Bool -> Ty -> List (List u8) -> Ty ->{Diverge} Ty =
+  \lin a e b.
+    let a2 = elabTy a in
+    let r = if isRefTy a then tPair (elabTy b) a2 else elabTy b in
+    if lin then TLFun(box a2, e, box r) else TFun(box a2, e, box r)
+
+def hasRef : Ty ->{Diverge} Bool =
+  \t. case t of
+    { TRef(a) -> true
+    | TMut(a) -> true
+    | TFun(a, e, b) -> hasRef (unbox a) || hasRef (unbox b)
+    | TLFun(a, e, b) -> hasRef (unbox a) || hasRef (unbox b)
+    | TBox(a) -> hasRef (unbox a)
+    | TPair(a, b) -> hasRef (unbox a) || hasRef (unbox b)
+    | TData(d, ts) -> any hasRef (unbox ts)
+    | TForall(vs, es, b) -> hasRef (unbox b)
+    | _ -> false }
+
+-- Does the term need elaboration? Terms that don't are core already (up to renaming places).
+def usesRefs : Term ->{Diverge} Bool =
+  \tm. case tm of
+    { EAssign(x, e) -> true
+    | ESeq(a, b) -> true
+    | EVarIn(x, e, b) -> true
+    | EBorrow(x) -> true
+    | EBorrowMut(x) -> true
+    | ELam(x, t, b) -> hasRef t || usesRefs (unbox b)
+    | _ -> any usesRefs (children tm) }
+
+-- Replace reads of places with their current names.
+def renameTm : map.Map (List u8) (List u8) -> Term ->{Diverge} Term =
+  \ps tm. case tm of
+    { EVar(x) -> EVar(case get x ps of { Some(y) -> y | None -> x })
+    | EAt(f, l, c, e) -> EAt(f, l, c, box (renameTm ps (unbox e)))
+    | EConvert(t, e) -> EConvert(t, box (renameTm ps (unbox e)))
+    | EPrim(op, a, b) -> EPrim(op, box (renameTm ps (unbox a)), box (renameTm ps (unbox b)))
+    | EIf(c, a, b) -> EIf(box (renameTm ps (unbox c)), box (renameTm ps (unbox a)), box (renameTm ps (unbox b)))
+    | ELam(x, t, b) -> ELam(x, t, box (renameTm ps (unbox b)))
+    | EApp(f, a) -> EApp(box (renameTm ps (unbox f)), box (renameTm ps (unbox a)))
+    | ELet(x, e, b) -> ELet(x, box (renameTm ps (unbox e)), box (renameTm ps (unbox b)))
+    | ELetPair(x, y, e, b) -> ELetPair(x, y, box (renameTm ps (unbox e)), box (renameTm ps (unbox b)))
+    | ESeq(a, b) -> ESeq(box (renameTm ps (unbox a)), box (renameTm ps (unbox b)))
+    | ECon(c, tys, args) -> ECon(c, tys, box (map (\a. renameTm ps a) (unbox args)))
+    | ECase(e, alts) -> ECase(box (renameTm ps (unbox e)), box (map (\a. renameAlt ps a) (unbox alts)))
+    | EBox(e) -> EBox(box (renameTm ps (unbox e)))
+    | EUnbox(e) -> EUnbox(box (renameTm ps (unbox e)))
+    | EPair(a, b) -> EPair(box (renameTm ps (unbox a)), box (renameTm ps (unbox b)))
+    | EHandle(l, e, cs) -> EHandle(l, box (renameTm ps (unbox e)), box (map (\a. renameAlt ps a) (unbox cs)))
+    | ECocase(d, tys, bs) -> ECocase(d, tys, box (map (\a. renameAlt ps a) (unbox bs)))
+    | EProj(e, o) -> EProj(box (renameTm ps (unbox e)), o)
+    | _ -> tm }
+
+def renameAlt : map.Map (List u8) (List u8) -> Alt ->{Diverge} Alt =
+  \ps a. case a of { Alt(c, xs, b) -> Alt(c, xs, renameTm ps b) }
+
+def freshN : List u8 -> i64 ->{Diverge, Panic} List u8 =
+  \base n. append base (Cons('#', box (string.fromInt n)))
+
+def curName : map.Map (List u8) (List u8) -> List u8 ->{Diverge} List u8 =
+  \ps x. case get x ps of { Some(y) -> y | None -> x }
+
+def idK : map.Map (List u8) (List u8) -> Term -> i64 -> (Term, i64) = \ps v n. (v, n)
+
+-- expr ps tm n k: tm elaborated, its value and the places' new names given to k; n numbers
+-- the fresh names. The continuation is the rest of the computation.
+-- ponytail: like Elab.hs, the continuation is copied into both branches of an if or case, so
+-- nested branches that mutate grow the output exponentially.
+def expr : map.Map (List u8) (List u8) -> Term -> i64 -> (map.Map (List u8) (List u8) -> Term -> i64 ->{Diverge, Panic} (Term, i64)) ->{Diverge, Panic} (Term, i64) =
+  \ps tm n k.
+    if not (usesRefs tm) then k ps (renameTm ps tm) n
+    else case tm of
+      { EAt(f, l, c, e) -> expr ps (unbox e) n k -- positions are kept only where no references are elaborated
+      | EAssign(x, e) -> expr ps (unbox e) n (\ps1 v n1.
+          let x2 = freshN x n1 in
+          let (r, n2) = k (put x x2 ps1) EUnit (n1 +% 1) in
+          (ELet(x2, box v, box r), n2))
+      | ESeq(a, b) -> expr ps (unbox a) n (\ps1 v n1.
+          let u = freshN "seq" n1 in
+          let (r, n2) = expr ps1 (unbox b) (n1 +% 1) k in
+          (ELet(u, box v, box r), n2))
+      | EVarIn(x, e, b) -> expr ps (unbox e) n (\ps1 v n1.
+          let x2 = freshN x n1 in
+          let (r, n2) = expr (put x x2 ps1) (unbox b) (n1 +% 1) (\ps2 v2 n3. k (map.delete string.compare x ps2) v2 n3) in
+          (ELet(x2, box v, box r), n2))
+      | ELet(x, e, b) -> expr ps (unbox e) n (\ps1 v n1.
+          let (r, n2) = expr ps1 (unbox b) n1 k in
+          (ELet(x, box v, box r), n2))
+      | EApp(f, a) -> (case unbox a of
+          { EBorrow(x) -> exprCall ps (unbox f) x n k
+          | EBorrowMut(x) -> exprCall ps (unbox f) x n k
+          | _ -> let (h, args) = spine tm Nil in
+                 -- A builtin (arena, array and float operations) is keelc's ArrayPrim: its head
+                 -- isn't an operand, only its arguments are.
+                 (if builtinHead h
+                  then exprs ps args n (\ps1 vs n1. k ps1 (foldl (\acc v. EApp(box acc, box v)) h vs) n1)
+                  else exprs ps (Cons(unbox f, box (Cons(unbox a, box Nil)))) n (\ps1 vs n1. k ps1 (appOf vs) n1)) })
+      | ELam(x, t, b) ->
+          let (body, n1) =
+            (if isRefTy t
+             then expr (put x x map.Tip) (unbox b) n (\ps1 v n2. (EPair(box v, box (EVar(curName ps1 x))), n2))
+             else expr map.Tip (unbox b) n idK) in
+          k ps (ELam(x, elabTy t, box body)) n1
+      | EPrim(op, a, b) -> exprs ps (Cons(unbox a, box (Cons(unbox b, box Nil)))) n (\ps1 vs n1. k ps1 (primOf op vs) n1)
+      | ECon(c, tys, args) -> exprs ps (unbox args) n (\ps1 vs n1. k ps1 (ECon(c, box (map elabTy (unbox tys)), box vs)) n1)
+      | ECocase(d, tys, bs) ->
+          let (bs2, n1) = exprAlts map.Tip (unbox bs) n idK in
+          k ps (ECocase(d, box (map elabTy (unbox tys)), box bs2)) n1
+      | EProj(e, o) -> expr ps (unbox e) n (\ps1 v n1. k ps1 (EProj(box v, o)) n1)
+      | EPair(a, b) -> exprs ps (Cons(unbox a, box (Cons(unbox b, box Nil)))) n (\ps1 vs n1. k ps1 (pairOf vs) n1)
+      | EBox(e) -> expr ps (unbox e) n (\ps1 v n1. k ps1 (EBox(box v)) n1)
+      | EUnbox(e) -> expr ps (unbox e) n (\ps1 v n1. k ps1 (EUnbox(box v)) n1)
+      | ELetPair(x, y, e, b) -> expr ps (unbox e) n (\ps1 v n1.
+          let (r, n2) = expr ps1 (unbox b) n1 k in
+          (ELetPair(x, y, box v, box r), n2))
+      | EIf(c, a, b) -> expr ps (unbox c) n (\ps1 vc n1.
+          let (ra, n2) = expr ps1 (unbox a) n1 k in
+          let (rb, n3) = expr ps1 (unbox b) n2 k in
+          (EIf(box vc, box ra, box rb), n3))
+      | ECase(e, alts) -> expr ps (unbox e) n (\ps1 ve n1.
+          let (alts2, n2) = exprAlts ps1 (unbox alts) n1 k in
+          (ECase(box ve, box alts2), n2))
+      -- The handled expression only reads outer places, so their names don't change.
+      | EHandle(l, b, cs) ->
+          let (b2, n1) = expr ps (unbox b) n idK in
+          let (cs2, n2) = exprAlts map.Tip (unbox cs) n1 idK in
+          k ps (EHandle(l, box b2, box cs2)) n2
+      | _ -> k ps (renameTm ps tm) n }
+
+def builtinHead : Term ->{Diverge} Bool =
+  \h. case h of
+    { EVar(x) -> if elem x (special ()) then true else false
+    | ETyApp(x, tys) -> if elem x (special ()) then true else false
+    | _ -> false }
+
+def appOf :List Term -> Term = \vs. case vs of { Cons(a, r) -> (case unbox r of { Cons(b, more) -> EApp(box a, box b) | Nil -> a }) | Nil -> EUnit }
+def pairOf : List Term -> Term = \vs. case vs of { Cons(a, r) -> (case unbox r of { Cons(b, more) -> EPair(box a, box b) | Nil -> a }) | Nil -> EUnit }
+def primOf : List u8 -> List Term -> Term = \op vs. case vs of { Cons(a, r) -> (case unbox r of { Cons(b, more) -> EPrim(op, box a, box b) | Nil -> a }) | Nil -> EUnit }
+
+-- f(&x) or f(&mut x): pass x, get (result, new x) back.
+def exprCall : map.Map (List u8) (List u8) -> Term -> List u8 -> i64 -> (map.Map (List u8) (List u8) -> Term -> i64 ->{Diverge, Panic} (Term, i64)) ->{Diverge, Panic} (Term, i64) =
+  \ps f x n k. expr ps f n (\ps1 vf n1.
+    let r = freshN "r" n1 in
+    let x2 = freshN x (n1 +% 1) in
+    let (rest, n2) = k (put x x2 ps1) (EVar(r)) (n1 +% 2) in
+    (ELetPair(r, x2, box (EApp(box vf, box (EVar(curName ps1 x)))), box rest), n2))
+
+def exprAlts : map.Map (List u8) (List u8) -> List Alt -> i64 -> (map.Map (List u8) (List u8) -> Term -> i64 ->{Diverge, Panic} (Term, i64)) ->{Diverge, Panic} (List Alt, i64) =
+  \ps alts n k. case alts of
+    { Nil -> (Nil, n)
+    | Cons(al, rest) -> (case al of
+        { Alt(c, xs, b) ->
+            let (b2, n1) = expr ps b n k in
+            let (more, n2) = exprAlts ps (unbox rest) n1 k in
+            (Cons(Alt(c, xs, b2), box more), n2) }) }
+
+-- Terms elaborated left to right. A value is let-bound when a later term needs elaboration,
+-- so it is evaluated before that term's emitted code (call-by-value order).
+def exprs : map.Map (List u8) (List u8) -> List Term -> i64 -> (map.Map (List u8) (List u8) -> List Term -> i64 ->{Diverge, Panic} (Term, i64)) ->{Diverge, Panic} (Term, i64) =
+  \ps ts n k. case ts of
+    { Nil -> k ps Nil n
+    | Cons(t, rest) -> expr ps t n (\ps1 v n1.
+        if any usesRefs (unbox rest) then
+          (let a = freshN "a" n1 in
+           let (r, n2) = exprs ps1 (unbox rest) (n1 +% 1) (\ps2 vs n3. k ps2 (Cons(EVar(a), box vs)) n3) in
+           (ELet(a, box v, box r), n2))
+        else exprs ps1 (unbox rest) n1 (\ps2 vs n2. k ps2 (Cons(v, box vs)) n2)) }
+
+def elabCtor : Ctor ->{Diverge} Ctor = \c. case c of { Ctor(nm, fs) -> Ctor(nm, map elabTy fs) }
+
+def elabDecl : Decl ->{Diverge, Panic} Decl =
+  \d. case d of
+    { DData(lin, nm, ps, cs) -> DData(lin, nm, ps, map elabCtor cs)
+    | DCodata(nm, ps, os) -> DCodata(nm, ps, map elabCtor os)
+    | DEffect(l, os) -> DEffect(l, map elabCtor os)
+    | DDef(f, t, e) -> let (e2, n) = expr map.Tip e 0 idK in DDef(f, elabTy t, e2)
+    | other -> other }
+
+def elabMain : Term ->{Diverge, Panic} Term = \prog. fst (expr map.Tip prog 0 idK)
+
 -- The verdict on a program: the prelude's declarations, the entry module's, and its prog.
 def verdict : List Decl -> List (Bool, Decl) -> Option Term ->{Diverge, Panic} List u8 =
   \prelude decls entry. case entry of
@@ -1993,4 +2309,6 @@ def verdict : List Decl -> List (Bool, Decl) -> Option Term ->{Diverge, Panic} L
           let (core, rest) = inferAll s user prog in let (main2, err) = rest in
           case err of
             { Some(m) -> m
-            | None -> checkCore lib core main2 } }
+            | None -> case checkRefs core main2 of
+                { Some(m) -> m
+                | None -> checkCore lib (map elabDecl core) (elabMain main2) } } }
