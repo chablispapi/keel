@@ -1,0 +1,3 @@
+-- A handled expression can't change outer places.
+effect Tick { tick : Unit => Unit }
+main = var x = 1 in (handle (x := 2) with Tick { tick u -> () }); x

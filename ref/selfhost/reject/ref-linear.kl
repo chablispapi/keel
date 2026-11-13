@@ -1,0 +1,3 @@
+-- An assigned linear value is dropped.
+linear data Tok = Tok(i64)
+main = var t = Tok(1) in t := Tok(2); 0

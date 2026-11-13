@@ -1,0 +1,2 @@
+-- A closure can't use a place from outside.
+main = var x = 1 in let f = \u. x := 2 in 0
