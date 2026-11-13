@@ -1,0 +1,4 @@
+-- def interrupt has an effect main doesn't: it prints, and main never does.
+def interrupt : usize ->{IO, !Alloc} Unit = \c. out(c as i64)
+
+main = 0

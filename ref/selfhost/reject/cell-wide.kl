@@ -1,0 +1,4 @@
+-- A cell holds an integer of up to 32 bits, or a usize: i64 is too wide.
+cell total : i64
+
+main = 0

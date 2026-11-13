@@ -1,0 +1,4 @@
+-- An array cell needs at least one element.
+cell buf : [u8; 0]
+
+main = 0

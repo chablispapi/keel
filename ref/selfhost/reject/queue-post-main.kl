@@ -1,0 +1,6 @@
+-- Only def interrupt, and what it calls, posts to a queue; main must not.
+data Rx = Byte(u8) | Stop
+
+queue rx : [Rx; 4]
+
+main = post(rx, Byte(1)); 0

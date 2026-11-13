@@ -1,0 +1,10 @@
+-- Only main's side receives from a queue: def interrupt may not.
+data Rx = Byte(u8) | Stop
+
+queue rx : [Rx; 4]
+cell seen : u32
+
+def interrupt : usize ->{Shared, !Alloc} Unit =
+  \c. case receive(rx) of { Byte(b) -> set(seen, b as u32) | Lost(n) -> set(seen, n) | Empty -> () | Stop -> () }
+
+main = 0

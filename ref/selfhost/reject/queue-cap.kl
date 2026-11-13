@@ -1,0 +1,6 @@
+-- A queue's capacity must be a power of two: 3 is not.
+data Rx = Byte(u8) | Stop
+
+queue rx : [Rx; 3]
+
+main = 0
