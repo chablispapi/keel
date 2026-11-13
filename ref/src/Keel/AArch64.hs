@@ -21,7 +21,6 @@ import Data.ByteString qualified as B
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Data.Maybe (fromMaybe, listToMaybe)
-import Data.Tuple (swap)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Numeric (showOct)
@@ -82,7 +81,7 @@ maxSmall = 64
 
 -- | gsLocs: the line-table row (file number, line, column) for variables bound by a
 -- positioned computation; empty unless the program kept positions (debug builds).
-data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int), gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer}
+data GS = GS {gsLabel :: Int, gsLines :: [String], gsStrings :: M.Map String String, gsLocs :: M.Map String (Int, Int, Int), gsNullary :: S.Set Integer, gsLayouts :: M.Map (Integer, Int, Integer) Integer, gsStubs :: M.Map String String}
 
 type G = State GS
 
@@ -121,7 +120,7 @@ emitProgram :: [Decl] -> Ty -> LProg -> String
 emitProgram = emitProgramWithReuse True
 
 emitProgramWithReuse :: Bool -> [Decl] -> Ty -> LProg -> String
-emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts consts _) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts)))))
+emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts consts _) = unlines (pruneRuntime (reverse (gsLines (execState gen (GS 0 [] M.empty rows S.empty layouts M.empty)))))
   where
     printers = printerTypes decls mainTy
     files = nub [f | (f, _, _) <- M.elems locs]
@@ -129,12 +128,12 @@ emitProgramWithReuse reuse decls mainTy (LProg funs statics mainF locs layouts c
     gen = do
       line "\t.section __TEXT,__text,regular,pure_instructions"
       forM_ (zip [1 :: Int ..] files) $ \(n, f) -> ins (".file " ++ show n ++ " " ++ show f)
-      forM_ (M.toList funs) $ \(i, f) -> emitFun reuse ("_kf_" ++ show i) f
-      emitFun reuse "_kf_main" mainF
+      forM_ (M.toList funs) $ \(i, f) -> withStubs (emitFun reuse ("_kf_" ++ show i) f)
+      withStubs (emitFun reuse "_kf_main" mainF)
       -- The runtime has no Keel source: line 0.
       unless (null files) $ ins ".loc 1 0 0"
-      emitEntry printers mainTy
-      forM_ (M.toList printers) $ \(_, (t, lbl)) -> emitPrinter decls printers lbl t
+      withStubs (emitEntry printers mainTy)
+      forM_ (M.toList printers) $ \(_, (t, lbl)) -> withStubs (emitPrinter decls printers lbl t)
       line runtimeBegin
       emitRuntime (performedOps (mainF : M.elems funs))
       line runtimeEnd
@@ -552,22 +551,32 @@ loc x = gets (M.lookup x . gsLocs) >>= mapM_ lineRow
 lineRow :: (Int, Int, Int) -> G ()
 lineRow (f, l, c) = ins (".loc " ++ show f ++ " " ++ show l ++ " " ++ show c)
 
--- | Branch to a possibly distant label (a shared panic routine) when a condition holds.
--- Conditional branches reach ±1 MiB (tbz ±32 KiB), so a program past that size couldn't
--- link: branch over an unconditional b (±128 MiB) instead, as RiscV.jumpIf.
+-- | Branch to a label when a condition holds. A shared panic routine can be past a
+-- conditional branch's reach (±1 MiB; the program's code comes first), so the branch goes to a
+-- stub after the current function, @b _keel_panic_…@ (±128 MiB): the fast path stays one
+-- untaken branch. ponytail: a single function over 1 MiB would still be out of reach.
 jumpIf :: String -> [String] -> String -> G ()
 jumpIf cond regs target = do
-  lSkip <- newLabel
-  ins (inverse ++ " " ++ concatMap (++ ", ") regs ++ lSkip)
-  ins ("b " ++ target)
-  line (lSkip ++ ":")
-  where
-    inverse = case cond of
-      "cbz" -> "cbnz"
-      "cbnz" -> "cbz"
-      'b' : '.' : c -> "b." ++ fromMaybe (error ("jumpIf: " ++ cond)) (lookup c (pairs ++ map swap pairs))
-      _ -> error ("jumpIf: " ++ cond)
-    pairs = [("eq", "ne"), ("vs", "vc"), ("cs", "cc"), ("hs", "lo"), ("hi", "ls"), ("lt", "ge"), ("gt", "le")]
+  l <-
+    if "_keel_panic" `isPrefixOf` target
+      then do
+        stubs <- gets gsStubs
+        case M.lookup target stubs of
+          Just l -> pure l
+          Nothing -> do
+            l <- newLabel
+            modify (\st -> st {gsStubs = M.insert target l stubs})
+            pure l
+      else pure target
+  ins (cond ++ " " ++ concatMap (++ ", ") regs ++ l)
+
+-- | Emit code, then the panic stubs its branches use (see jumpIf).
+withStubs :: G () -> G ()
+withStubs g = do
+  g
+  stubs <- gets gsStubs
+  forM_ (M.toList stubs) $ \(target, l) -> line (l ++ ":") >> ins ("b " ++ target)
+  modify (\st -> st {gsStubs = M.empty})
 
 -- | Increment the reference count of a variable's block (inline; uses x16, x17). Immortal
 -- blocks (bit 31) are skipped; a count of zero means a freed block, which is a bug.
