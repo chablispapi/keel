@@ -17,8 +17,8 @@
 -- keelc's on every .kl file in the repo, and selfhost/reject/ has one rejection per error
 -- kind. selfhost/check.kl loads the modules and resolves their names (Keel.Modules). A
 -- polymorphic definition is instantiated as f[τ̄; ε̄], with the effect arguments after the
--- types as rows of Unit ->ε Unit. Not handled yet: var and references, arena, bitdata, cells
--- and queues, and Mono's noAccidentalHandling.
+-- types as rows of Unit ->ε Unit. Not handled yet: var and references, bitdata, cells and
+-- queues, and Mono's noAccidentalHandling.
 --
 -- Measurements (Apple M-series, keelc at the commit that added this):
 --
@@ -241,26 +241,25 @@ def ty1 : Ty -> List Ty = \t. Cons(t, box Nil)
 def ty2 : Ty -> Ty -> List Ty = \a b. Cons(a, box Cons(b, box Nil))
 def tInt : List u8 -> Ty = \n. TInt(n)
 def tPair : Ty -> Ty -> Ty = \a b. TPair(box a, box b)
-def tUnit : Unit -> Ty = \u. TUnit
 def tBytes : Unit -> Ty = \u. TData("Array", box (ty1 (TInt("u8"))))
 
 -- Keel.Syntax.builtinEffects, in order.
 def builtinEffects : Unit -> List (List u8, List Ctor) = \u.
-  Cons(("IO", Cons(Ctor("out", ty2 (tInt "i64") (tUnit ())), box Cons(Ctor("putc", ty2 (tInt "u8") (tUnit ())), box Nil))), box
-  Cons(("Input", Cons(Ctor("getc", ty2 (tUnit ()) (tInt "i64")), box Nil)), box
+  Cons(("IO", Cons(Ctor("out", ty2 (tInt "i64") (TUnit)), box Cons(Ctor("putc", ty2 (tInt "u8") (TUnit)), box Nil))), box
+  Cons(("Input", Cons(Ctor("getc", ty2 (TUnit) (tInt "i64")), box Nil)), box
   Cons(("MMIO", Cons(Ctor("read8", ty2 (tInt "usize") (tInt "u8")), box Cons(Ctor("read32", ty2 (tInt "usize") (tInt "u32")), box
-                Cons(Ctor("write8", ty2 (tPair (tInt "usize") (tInt "u8")) (tUnit ())), box Cons(Ctor("write32", ty2 (tPair (tInt "usize") (tInt "u32")) (tUnit ())), box Nil))))), box
-  Cons(("Hart", Cons(Ctor("csrRead", ty2 (tInt "usize") (tInt "usize")), box Cons(Ctor("csrSet", ty2 (tPair (tInt "usize") (tInt "usize")) (tUnit ())), box
-                Cons(Ctor("wfi", ty2 (tUnit ()) (tUnit ())), box Nil)))), box
-  Cons(("Shared", Cons(Ctor("%cellLoad", ty2 (tInt "usize") (tInt "usize")), box Cons(Ctor("%cellStore", ty2 (tPair (tInt "usize") (tInt "usize")) (tUnit ())), box Nil))), box
+                Cons(Ctor("write8", ty2 (tPair (tInt "usize") (tInt "u8")) (TUnit)), box Cons(Ctor("write32", ty2 (tPair (tInt "usize") (tInt "u32")) (TUnit)), box Nil))))), box
+  Cons(("Hart", Cons(Ctor("csrRead", ty2 (tInt "usize") (tInt "usize")), box Cons(Ctor("csrSet", ty2 (tPair (tInt "usize") (tInt "usize")) (TUnit)), box
+                Cons(Ctor("wfi", ty2 (TUnit) (TUnit)), box Nil)))), box
+  Cons(("Shared", Cons(Ctor("%cellLoad", ty2 (tInt "usize") (tInt "usize")), box Cons(Ctor("%cellStore", ty2 (tPair (tInt "usize") (tInt "usize")) (TUnit)), box Nil))), box
   Cons(("Files", Cons(Ctor("openFile", ty2 (tBytes ()) (tInt "i64")), box Cons(Ctor("readByte", ty2 (tInt "i64") (tInt "i64")), box
-                 Cons(Ctor("closeFile", ty2 (tInt "i64") (tUnit ())), box Cons(Ctor("createFile", ty2 (tBytes ()) (tInt "i64")), box
+                 Cons(Ctor("closeFile", ty2 (tInt "i64") (TUnit)), box Cons(Ctor("createFile", ty2 (tBytes ()) (tInt "i64")), box
                  Cons(Ctor("appendFile", ty2 (tBytes ()) (tInt "i64")), box Cons(Ctor("writeBytes", ty2 (tPair (tInt "i64") (tBytes ())) (tInt "i64")), box Nil))))))), box
   Cons(("Net", Cons(Ctor("tcpListen", ty2 (tPair (tInt "u32") (tInt "u16")) (tInt "i64")), box Cons(Ctor("sockPort", ty2 (tInt "i64") (tInt "i64")), box
                Cons(Ctor("tcpAccept", ty2 (tInt "i64") (tInt "i64")), box Cons(Ctor("tcpConnect", ty2 (tPair (tInt "u32") (tInt "u16")) (tInt "i64")), box
                Cons(Ctor("sockSend", ty2 (tPair (tInt "i64") (tPair (tBytes ()) (tInt "i64"))) (tInt "i64")), box Cons(Ctor("sockRecv", ty2 (tInt "i64") (tBytes ())), box
-               Cons(Ctor("sockClose", ty2 (tInt "i64") (tUnit ())), box Cons(Ctor("pollWait", ty2 (tPair (TData("Array", box (ty1 (tInt "i32")))) (tInt "i64")) (tInt "i64")), box
-               Cons(Ctor("clockMs", ty2 (tUnit ()) (tInt "i64")), box Nil)))))))))), box Nil)))))))
+               Cons(Ctor("sockClose", ty2 (tInt "i64") (TUnit)), box Cons(Ctor("pollWait", ty2 (tPair (TData("Array", box (ty1 (tInt "i32")))) (tInt "i64")) (tInt "i64")), box
+               Cons(Ctor("clockMs", ty2 (TUnit) (tInt "i64")), box Nil)))))))))), box Nil)))))))
 
 -- Built-in data: Option and Array (Keel.Syntax.optionDecl, arrayDecl).
 def builtinData : Unit -> List Decl = \u.
@@ -343,7 +342,7 @@ def wfTy : Sig -> Ty ->{Diverge, Panic} Option (List u8) =
     | TData(d, ts) ->
         if not (has d (sigData s) || has d (sigCodata s)) then Some(errLine "Unbound" (append "type " d))
         else if length (paramsOf s d) != length (unbox ts) then Some(errLine "Mismatch" (append d ": wrong number of type arguments"))
-        else foldl (\acc a. orErr acc (wfTy s a)) (None) (unbox ts)
+        else foldl (\acc a. orErr acc (wfTy s a)) None (unbox ts)
     | TForall(vs, es, b) -> Some(errLine "HigherRank" (append "∀ is only allowed at the top of a definition's type: " (showTy t)))
     | TRef(a) -> Some(errLine "RefEscape" "reference type in core")
     | TMut(a) -> Some(errLine "RefEscape" "reference type in core")
@@ -486,7 +485,7 @@ def negative : map.Map (List u8) (List (Bool, Bool)) -> List u8 -> Bool -> Ty ->
 
 -- Data types reachable from d through unboxed fields.
 def reachUnboxed : Sig -> List u8 ->{Diverge} List (List u8) =
-  \s d. reachFrom s (Nil) (concatMap (\f. unboxedData s f) (fieldsOf s d))
+  \s d. reachFrom s Nil (concatMap (\f. unboxedData s f) (fieldsOf s d))
 
 def reachFrom : Sig -> List (List u8) -> List (List u8) ->{Diverge} List (List u8) =
   \s seen todo. case todo of
@@ -538,7 +537,7 @@ def zonk : St -> Ty ->{Diverge} Ty =
     | u -> u }
 
 -- The concrete labels an effect stands for so far.
-def expand : St -> List (List u8) ->{Diverge} List (List u8) = \st e. expandSeen st (Nil) e
+def expand : St -> List (List u8) ->{Diverge} List (List u8) = \st e. expandSeen st Nil e
 
 def expandSeen : St -> List (List u8) -> List (List u8) ->{Diverge} List (List u8) =
   \st seen e. case e of
@@ -753,7 +752,7 @@ def cocaseTerm : St -> Env -> List u8 -> List Ty -> List Alt ->{Diverge, Panic} 
           { None -> (done, failSt st "NonExhaustive" (append d (append " has no observation " o)))
           | Some(ot) -> case check st env body (substTy tv map.Tip ot) of
               { C(b2, eb, st) -> (append done (Cons(Alt(o, xs, b2), box Nil)), st) } } } in
-    let (bs2, st) = foldl step ((Nil), st) bs in
+    let (bs2, st) = foldl step (Nil, st) bs in
     C(ECocase(d, box tys, box bs2), Nil, st)
 
 def firstOf : forall (a : Free) (b : Free) 'e. (a ->{'e} Option b) -> List a ->{'e} Option b =
@@ -802,7 +801,7 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
             | None ->
                 if has x (sigOps (envSig env)) then R(tm, TUnit, Nil, failSt st "Mismatch" (append "operation " (append x " must be applied")))
                 else if eq x "arrayEmpty" then (let (m, st) = freshTy st in R(ETyApp(x, box (ty1 m)), TData("Array", box (ty1 m)), Nil, st))
-                else if isSome (floatOpType x) || isSome (arrayOpType x TUnit) then R(tm, TUnit, Nil, failSt st "Mismatch" (append x " must be applied to its arguments"))
+                else if isSome (floatOpType x) || isSome (arrayOpType x TUnit) || eq x "arena" then R(tm, TUnit, Nil, failSt st "Mismatch" (append x " must be applied to its arguments"))
                 else if elem x (special ()) then R(tm, TUnit, Nil, unsupported st x)
                 else R(tm, TUnit, Nil, failSt st "Unbound" x) } })
     | EUnit -> R(tm, TUnit, Nil, st)
@@ -838,7 +837,13 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
         let (x2, es) = binder st env x (content t2) in let (env2, st) = es in
         (case infer st env2 (unbox b) of { R(b2, tb, eb, st) -> R(ELam(x2, t2, box b2), TFun(box t2, sInsert "Alloc" eb, box tb), Nil, st) })
     | EApp(f, a) ->
-        let (h, args) = spine tm (Nil) in
+        if isArena env (unbox f) then
+          (case infer st env (EApp(box (unbox a), box EUnit)) of
+            { R(call, r, eff, st) -> case call of
+                { EApp(f2, u) -> R(EApp(box EVar("arena"), box (unbox f2)), r, eff, st)
+                | _ -> R(tm, TUnit, Nil, failSt st "Mismatch" "arena takes a function of Unit: arena (\\u. e)") } })
+        else
+        let (h, args) = spine tm Nil in
         (case h of
           { EVar(x) ->
               if isLocal env x || isDef env x then inferApp st env tm (unbox f) (unbox a)
@@ -864,7 +869,7 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
         let st = noFields st c fields (unbox args) in
         (case checkArgs st env (unbox args) (instFields (envSig env) d tys2 fields) of
           { C3(args2, eff, st) -> R(ECon(c, box tys2, box args2), TData(d, box tys2), eff, st) })
-    | ECase(e, alts) -> caseOf st env (unbox e) (unbox alts) (None)
+    | ECase(e, alts) -> caseOf st env (unbox e) (unbox alts) None
     | EBox(e) -> (case infer st env (unbox e) of { R(e2, t, eff, st) -> R(EBox(box e2), TBox(box t), eff, st) })
     | EUnbox(e) ->
         (case infer st env (unbox e) of { R(e2, t, eff, st) ->
@@ -970,6 +975,11 @@ def applyFn : St -> Env -> Term -> Term ->{Diverge, Panic} R =
         | EBorrowMut(x) -> R(f, TUnit, Nil, unsupported st "references")
         | _ -> case check st env a p of { C(a2, ea, st) -> R(EApp(box f2, box a2), r, sUnion ef (sUnion ea latent), st) } } }
 
+-- arena (\u. e) is typed as the call (\u. e) () (Keel.Infer); the core term keeps arena at its
+-- head, and the core check types it the same way.
+def isArena : Env -> Term ->{Diverge} Bool =
+  \env f. case f of { EVar(x) -> eq x "arena" && not (isLocal env x) && not (isDef env x) | _ -> false }
+
 -- Float and array builtins (Keel.Syntax.floatOpType, arrayOpType), applied to all their
 -- arguments at once. An array operation's head becomes arrayOp[elem], for the core check.
 def floatOpType : List u8 -> Option (List Ty, Ty) =
@@ -1023,7 +1033,7 @@ def caseOf : St -> Env -> Term -> List Alt -> Option Ty ->{Diverge, Panic} R =
         { Nil -> R(ECase(box e2, box Nil), TUnit, ee, failSt st "NonExhaustive" "empty case")
         | Cons(alt0, more) ->
             let c0 = case alt0 of { Alt(c, xs, b) -> c } in
-            let (d, rest) = conInfo st env c0 (Nil) in let (f0, rest) = rest in let (tys, st) = rest in
+            let (d, rest) = conInfo st env c0 Nil in let (f0, rest) = rest in let (tys, st) = rest in
             let st = rel st false te (TData(d, box tys)) in
             let (resTy, st) = case mex of { Some(t) -> (t, st) | None -> freshTy st } in
             let s = envSig env in
@@ -1048,7 +1058,7 @@ def checkAlts : St -> Env -> List u8 -> List Ty -> Ty -> List Alt ->{Diverge, Pa
         { Alt(c, xs, b) ->
             let one = if eq c "_" then (case check st env b resTy of { C(b2, eb, st) -> CA(ty1Alt (Alt("_", Nil, b2)), eb, st) })
               else
-                (let (d2, rest) = conInfo st env c (Nil) in let (fields, rest) = rest in let (tys0, st) = rest in
+                (let (d2, rest) = conInfo st env c Nil in let (fields, rest) = rest in let (tys0, st) = rest in
                  if length xs != length fields then CA(Nil, Nil, failSt st "Mismatch" (append c ": wrong number of pattern variables"))
                  else
                    (let (xs2, es) = binders st env (zipL xs (instFields (envSig env) d tys fields)) in let (env2, st) = es in
@@ -1193,7 +1203,7 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
         if fits n neg mag then Q(TInt(n), Nil, Nil, None)
         else qErr "Mismatch" (append (string.fromInt (mag as i64)) (append " does not fit " n))
     | EFloat(neg, m, e) -> Q(TInt("f64"), Nil, Nil, None)
-    | ETyApp(x, tys) -> if has x (sigDefs s) then ctyapp s rec x (unbox tys) else carray s rec ctx x (unbox tys) (Nil)
+    | ETyApp(x, tys) -> if has x (sigDefs s) then ctyapp s rec x (unbox tys) else carray s rec ctx x (unbox tys) Nil
     | EConvert(to, e) -> (case cinfer s rec ctx (unbox e) of
         { Q(te, ee, ue, er) -> case er of
             { Some(m) -> Q(TUnit, Nil, Nil, er)
@@ -1219,7 +1229,7 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
                                   else if eq suffix "?" then Q(TData("Option", box (ty1 ta)), sUnion ea eb, u, None)
                                   else Q(ta, sUnion ea eb, u, None)
                               | None -> if eq op "==" || eq op "<" then Q(TBool, sUnion ea eb, u, None) else Q(ta, sUnion ea eb, u, None) } } } }) } })
-    | EIf(c, a, b) -> (case expect s rec ctx (TBool) (unbox c) of
+    | EIf(c, a, b) -> (case expect s rec ctx TBool (unbox c) of
         { Q(t0, ec, uc, er) -> case er of
             { Some(m) -> Q(TUnit, Nil, Nil, er)
             | None -> case cinfer s rec ctx (unbox a) of
@@ -1304,7 +1314,7 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
                             { Q(te, ee0, ue, er) -> case er of
                                 { Some(m) -> Some(m)
                                 | None ->
-                                    let want = substTy tv (map.Tip) (case firstOf (\c. case c of { Ctor(n, ts) -> if eq n o then Some(nth 0 ts) else None }) obs of { Some(t) -> t | None -> TUnit }) in
+                                    let want = substTy tv map.Tip (case firstOf (\c. case c of { Ctor(n, ts) -> if eq n o then Some(nth 0 ts) else None }) obs of { Some(t) -> t | None -> TUnit }) in
                                     let ee = sDelete "Alloc" ee0 in
                                     if not (isNil ue) then Some(errLine "LinearCapture" (append "cocase branch " (append o " captures linear values")))
                                     else if not (isNil ee) then Some(errLine "EffectMismatch" (append "cocase branch " (append o (append " has effects " (showSet ee)))))
@@ -1373,7 +1383,10 @@ def spine : Term -> List Term ->{Diverge} (Term, List Term) =
 
 def capp : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term -> Term -> Term ->{Diverge, Panic} Q =
   \s rec ctx tm f a.
-    let (h, args) = spine tm (Nil) in
+    if (case f of { EVar(x) -> eq x "arena" && not (has x ctx) && not (has x (sigDefs s)) | _ -> false })
+    then cinfer s rec ctx (EApp(box a, box EUnit))
+    else
+    let (h, args) = spine tm Nil in
     let known = case h of
       { EVar(g) -> if has g ctx then None else get g (sigArity s)
       | ETyApp(g, tys) -> get g (sigArity s)
@@ -1441,7 +1454,7 @@ def cappKnown : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term -> Term ->
           (case cinfer s rec ctx h of
             { Q(th, eh, uh, er) -> case er of
                 { Some(m) -> Q(TUnit, Nil, Nil, er)
-                | None -> case steps s rec ctx n th (sDelete "Alloc" eh) (Nil) 1 args of
+                | None -> case steps s rec ctx n th (sDelete "Alloc" eh) Nil 1 args of
                     { Q(r, effs, u, er) -> case er of
                         { Some(m) -> Q(TUnit, Nil, Nil, er)
                         | None -> Q(r, sUnion effs (allocOf s r), u, None) } } } })
@@ -1531,7 +1544,7 @@ def expectAll : Sig -> List (List u8) -> map.Map (List u8) Ty -> List Ty -> List
     | _ -> Q(TUnit, Nil, Nil, None) }
 
 -- Names sorted, repeats kept (to compare as multisets).
-def sortL : List (List u8) -> List (List u8) = \xs. foldl (\acc x. insertDup x acc) (Nil) xs
+def sortL : List (List u8) -> List (List u8) = \xs. foldl (\acc x. insertDup x acc) Nil xs
 
 def insertDup : List u8 -> List (List u8) -> List (List u8) =
   \x xs. case xs of
@@ -1645,7 +1658,7 @@ def freeVars : Term ->{Diverge} List (List u8) =
     | EBorrowMut(x) -> one x
     | _ -> unions (map freeVars (children tm)) }
 
-def unions : List (List (List u8)) ->{Diverge} List (List u8) = \xs. foldl sUnion (Nil) xs
+def unions : List (List (List u8)) ->{Diverge} List (List u8) = \xs. foldl sUnion Nil xs
 
 -- The definitions a definition refers to, then those reachable in one or more steps.
 def recursiveGroups : List (List u8, Term) ->{Diverge, Panic} map.Map (List u8) (List (List u8)) =
@@ -1687,7 +1700,7 @@ data TEnv = TEnv(map.Map (List u8) V, map.Map (List u8) (List u8), List (List u8
 -- The recursive groups, with every group that provably terminates made empty.
 def terminatingGroups : List (List u8, Term) -> map.Map (List u8) (List (List u8)) ->{Diverge, Panic} map.Map (List u8) (List (List u8)) =
   \defs groups.
-    let gs = foldl (\acc fg. let (f, g) = fg in if isNil g || any (\h. namesEq h g) acc then acc else Cons(g, box acc)) (Nil) (map.toList groups) in
+    let gs = foldl (\acc fg. let (f, g) = fg in if isNil g || any (\h. namesEq h g) acc then acc else Cons(g, box acc)) Nil (map.toList groups) in
     let bodies = fromPairs defs in
     let total = filterL (\g. terminates bodies g) gs in
     fromPairs (map (\fg. let (f, g) = fg in (f, if any (\t. namesEq t g) total then Nil else g)) (map.toList groups))
@@ -1724,7 +1737,7 @@ def decreases : map.Map (List u8) Term -> List (List u8) -> map.Map (List u8) i6
 def walk : List (List u8) -> map.Map (List u8) i64 -> i64 -> TEnv -> Term ->{Diverge, Panic} Bool =
   \g idx self env tm. case tm of
     { EApp(f, a) ->
-        let (h, args) = spine tm (Nil) in
+        let (h, args) = spine tm Nil in
         (case memberOf g env h of
           { Some(callee) -> all (\x. walk g idx self env x) args && (case dropL (idxOf idx callee) args of
               { Cons(x, more) -> partOf env self x | Nil -> false })
@@ -1819,7 +1832,7 @@ def mentions : Decl ->{Diverge} List (List u8) =
 def withPrelude : List Decl -> List Decl ->{Diverge} List Decl =
   \lib user.
     let userNames = unions (map declared user) in
-    let out = dropFix lib userNames (Nil) in
+    let out = dropFix lib userNames Nil in
     filterL (\d. isNil (sInter (declared d) out) || isNil (declared d)) lib
 
 -- The names of left-out prelude declarations, to a fixpoint.
@@ -1865,7 +1878,7 @@ def inferAll : Sig -> List Decl -> Term ->{Diverge, Panic} (List Decl, (Term, Op
           (case check st env e body of { C(e2, eff, st) ->
              let (e3, st) = finish st e2 in (append ds (Cons(DDef(f, t, e3), box Nil)), st) })
       | other -> (append ds (Cons(other, box Nil)), st) } in
-    let (ds, st) = foldl step ((Nil), St(0, map.Tip, map.Tip, map.Tip, Nil, None)) user in
+    let (ds, st) = foldl step (Nil, St(0, map.Tip, map.Tip, map.Tip, Nil, None)) user in
     let st = fresh st in
     case infer st (Env(s, map.Tip, Nil)) prog of
       { R(m2, t, eff, st) -> let (m3, st) = finish st m2 in (ds, (m3, stErr st)) }
@@ -1895,7 +1908,7 @@ def checkCore : List Decl -> List Decl -> Term ->{Diverge, Panic} List u8 =
             | _ -> None }) user in
           case defErr of
             { Some(m) -> m
-            | None -> case cinfer s (Nil) map.Tip prog of
+            | None -> case cinfer s Nil map.Tip prog of
                 { Q(t, eff, u, er) -> case er of
                     { Some(m) -> m
                     | None ->

@@ -222,6 +222,6 @@ def judge : List u8 -> List (List u8, Module) ->{Files, Diverge, Panic} List u8 
 
 main =
   let path = firstLine (readAll ()) in
-  case visit (dirOf path) (Nil) (baseName path) path Nil of
+  case visit (dirOf path) Nil (baseName path) path Nil of
     { Err(e) -> println e; -1
     | Ok(ms) -> println (judge (baseName path) ms); 0 }
