@@ -1,0 +1,6 @@
+-- A cocase branch has no effects of its own.
+codata Num { get : i64 }
+
+def n : Num = cocase Num { get -> 9223372036854775807 + 1 }
+
+main = n.get

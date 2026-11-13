@@ -1,0 +1,7 @@
+-- Recursion must keep the same type variables.
+data Nest a = Flat(a) | Deeper(Box (Nest (a, a)))
+
+def depth : forall (a : Free). Nest a ->{Panic} i64 =
+  \n. case n of { Flat(x) -> 0 | Deeper(m) -> 1 + depth (unbox m) }
+
+main = depth (Deeper(box Flat((1, 2))))

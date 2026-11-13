@@ -1,0 +1,4 @@
+-- A type to the left of an arrow in its own definition.
+data Bad = Bad(Bad -> i64)
+
+main = 0

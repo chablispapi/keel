@@ -1,0 +1,4 @@
+-- ∀ only at the top of a definition's type.
+def apply : (forall a. a -> a) -> i64 = \f. 1
+
+main = 0

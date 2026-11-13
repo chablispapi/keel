@@ -1,0 +1,8 @@
+-- A linear type given for a Free type variable.
+linear data Tok = Tok
+
+def dup2 : forall (a : Free). a -> (a, a) = \x. (x, x)
+
+def spend : Tok -> i64 = \t. case t of { Tok -> 1 }
+
+main = let p = dup2 Tok in let (a, b) = p in spend a + spend b

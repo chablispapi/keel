@@ -1,0 +1,6 @@
+-- A cocase defines every observation.
+codata Pair2 { first : i64 ; second : i64 }
+
+def p : Pair2 = cocase Pair2 { first -> 1 }
+
+main = p.first
