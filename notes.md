@@ -896,6 +896,7 @@ results back (step 4) waits for headers and a serial adapter or Debug Probe.
 - [ ] Design the unsafe C-level dialect and a stage-1 C → dialect translator (section 11).
 - [ ] Design the real-time effects (`Block`, `Diverge`) and the termination checker (section 13). `Alloc` is done: implicit in every arrow, `!Alloc` to forbid it.
 - [ ] Design refinement types and constant-time `Secret a` typing; choose translation validation or a verified compiler (section 14).
+- [ ] High-assurance steps (range types, `Recurse` and stack bounds, ceiling-locked tasks, Thumb-2): `spec/assurance.md`.
 - [x] First RISC-V milestone: "hello world" over the QEMU `virt` UART (section 15). Done in M3: `keelc qemu ref/examples/firmware/hello.kl`.
 - [ ] Run Keel on the Pico 2 (section 18): RV32 back end, RP2350 boot image and startup, blink GP25; later UART output through a Debug Probe or USB-serial adapter.
 - [x] Write the core calculus formally: linear types + second-class refs + effects + codata (section 16). Done: `spec/core.md` (Keel Core, stages 1–4) with the Haskell reference checker/evaluator in `ref/` (`cd ref && cabal test`).
