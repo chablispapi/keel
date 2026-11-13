@@ -30,6 +30,9 @@
 --   M3        | 1900  | 5.1 s       | 9.1 s       | 1.4 MB  | 3.9 s, live=0      | 89 (27 rejections) / 16
 --     (polymorphism, codata, NonPositive, PolyRecursion; the checker agrees with keelc on its
 --     own source, checked in 1.9 s)
+--   + speed   | 1940  | 5.4 s       | 9.3 s       | 1.4 MB  | 2.0 s, live=0      | 91 (28 rejections) / 16
+--     (its own source in 0.40 s, keelc's Haskell front end 0.36 s: sets merge in one pass, and
+--     recursive groups use maps; the 1.9 s was O(n³) in recursiveGroups)
 
 import std.string
 import std.map
@@ -49,10 +52,36 @@ def sInsert : List u8 -> List (List u8) -> List (List u8) =
     | Cons(y, rest) -> case string.compare x y of
         { Less -> Cons(x, box Cons(y, rest)) | Equal -> Cons(y, rest) | Greater -> Cons(y, box (sInsert x (unbox rest))) } }
 
-def sUnion : List (List u8) -> List (List u8) -> List (List u8) =
-  \a b. case a of { Nil -> b | Cons(x, rest) -> sUnion (unbox rest) (sInsert x b) }
+-- b is a set; a may be any list of names (sorted first when it isn't).
+def sUnion : List (List u8) -> List (List u8) ->{Diverge} List (List u8) =
+  \a b. merge (if sorted a then a else sFrom a) b
 
-def sFrom : List (List u8) -> List (List u8) = \xs. sUnion xs Nil
+-- Two sets, merged in one pass.
+def merge : List (List u8) -> List (List u8) ->{Diverge} List (List u8) =
+  \a b. case a of
+    { Nil -> b
+    | Cons(x, xr) -> case b of
+        { Nil -> Cons(x, xr)
+        | Cons(y, yr) -> case string.compare x y of
+            { Less -> Cons(x, box (merge (unbox xr) (Cons(y, yr))))
+            | Equal -> Cons(x, box (merge (unbox xr) (unbox yr)))
+            | Greater -> Cons(y, box (merge (Cons(x, xr)) (unbox yr))) } } }
+
+def sorted : List (List u8) ->{Diverge} Bool =
+  \xs. case xs of
+    { Nil -> true
+    | Cons(x, rest) -> case unbox rest of
+        { Nil -> true
+        | Cons(y, more) -> (case string.compare x y of { Less -> true | _ -> false }) && sorted (Cons(y, more)) } }
+
+-- A set from any list of names: merge sort, repeats dropped.
+def sFrom : List (List u8) ->{Diverge} List (List u8) =
+  \xs. case xs of
+    { Nil -> Nil
+    | Cons(x, rest) -> if isNil (unbox rest) then Cons(x, box Nil) else (let (l, r) = halves xs in merge (sFrom l) (sFrom r)) }
+
+def halves : List (List u8) -> (List (List u8), List (List u8)) =
+  \xs. case xs of { Nil -> (Nil, Nil) | Cons(x, rest) -> let (l, r) = halves (unbox rest) in (Cons(x, box r), l) }
 
 def sDelete : List u8 -> List (List u8) -> List (List u8) =
   \x xs. case xs of { Nil -> Nil | Cons(y, rest) -> if eq x y then unbox rest else Cons(y, box (sDelete x (unbox rest))) }
@@ -120,7 +149,7 @@ def substTy : map.Map (List u8) Ty -> map.Map (List u8) (List (List u8)) -> Ty -
     | TMut(a) -> TMut(box (substTy tv ev (unbox a)))
     | other -> other }
 
-def substEff : map.Map (List u8) (List (List u8)) -> List (List u8) -> List (List u8) =
+def substEff : map.Map (List u8) (List (List u8)) -> List (List u8) ->{Diverge} List (List u8) =
   \ev e. case e of
     { Nil -> Nil
     | Cons(l, rest) -> sUnion (case get l ev of { Some(ls) -> ls | None -> Cons(l, box Nil) }) (substEff ev (unbox rest)) }
@@ -1616,13 +1645,14 @@ def freeVars : Term ->{Diverge} List (List u8) =
     | EBorrowMut(x) -> one x
     | _ -> unions (map freeVars (children tm)) }
 
-def unions : List (List (List u8)) -> List (List u8) = \xs. foldl sUnion (Nil) xs
+def unions : List (List (List u8)) ->{Diverge} List (List u8) = \xs. foldl sUnion (Nil) xs
 
 -- The definitions a definition refers to, then those reachable in one or more steps.
 def recursiveGroups : List (List u8, Term) ->{Diverge, Panic} map.Map (List u8) (List (List u8)) =
   \defs.
     let names = map fst defs in
-    let refs = fromPairs (map (\fe. let (f, e) = fe in (f, sInter (freeVars e) (sFrom names))) defs) in
+    let nameSet = sFrom names in
+    let refs = fromPairs (map (\fe. let (f, e) = fe in (f, sInter (freeVars e) nameSet)) defs) in
     let reach = fromPairs (map (\f. (f, reachable refs f)) names) in
     fromPairs (map (\f. (f, filterL (\g. elem f (lookupNames g reach)) (lookupNames f reach))) names)
 
@@ -1630,13 +1660,19 @@ def lookupNames : List u8 -> map.Map (List u8) (List (List u8)) ->{Diverge} List
   \k m. case get k m of { Some(v) -> v | None -> Nil }
 
 def reachable : map.Map (List u8) (List (List u8)) -> List u8 ->{Diverge} List (List u8) =
-  \refs f. reachGo refs (Nil) (lookupNames f refs)
+  \refs f. map (\kv. let (k, v) = kv in k) (map.toList (reachGo refs map.Tip (lookupNames f refs)))
 
-def reachGo : map.Map (List u8) (List (List u8)) -> List (List u8) -> List (List u8) ->{Diverge} List (List u8) =
+def reachGo : map.Map (List u8) (List (List u8)) -> map.Map (List u8) Bool -> List (List u8) ->{Diverge} map.Map (List u8) Bool =
   \refs seen todo. case todo of
     { Nil -> seen
-    | Cons(f, rest) -> if elem f seen then reachGo refs seen (unbox rest)
-        else reachGo refs (sInsert f seen) (append (lookupNames f refs) (unbox rest)) }
+    | Cons(f, rest) -> if has f seen then reachGo refs seen (unbox rest)
+        else reachGo refs (put f true seen) (append (lookupNames f refs) (unbox rest)) }
+
+-- Membership in a set, stopping at the first larger name.
+def setHas : List u8 -> List (List u8) ->{Diverge} Bool =
+  \x xs. case xs of
+    { Nil -> false
+    | Cons(y, rest) -> case string.compare x y of { Less -> false | Equal -> true | Greater -> setHas x (unbox rest) } }
 
 -- A definition's parameters (its leading λs) and body.
 def params : Term -> (List (List u8), Term) =
@@ -1651,14 +1687,15 @@ data TEnv = TEnv(map.Map (List u8) V, map.Map (List u8) (List u8), List (List u8
 -- The recursive groups, with every group that provably terminates made empty.
 def terminatingGroups : List (List u8, Term) -> map.Map (List u8) (List (List u8)) ->{Diverge, Panic} map.Map (List u8) (List (List u8)) =
   \defs groups.
-    let gs = map (\fg. let (f, g) = fg in g) (map.toList groups) in
-    let total = filterL (\g. not (isNil g) && terminates defs g) gs in
+    let gs = foldl (\acc fg. let (f, g) = fg in if isNil g || any (\h. namesEq h g) acc then acc else Cons(g, box acc)) (Nil) (map.toList groups) in
+    let bodies = fromPairs defs in
+    let total = filterL (\g. terminates bodies g) gs in
     fromPairs (map (\fg. let (f, g) = fg in (f, if any (\t. namesEq t g) total then Nil else g)) (map.toList groups))
 
-def defBody : List (List u8, Term) -> List u8 ->{Diverge} Term =
-  \defs f. case filterL (\fe. let (g, e) = fe in eq g f) defs of { Cons(fe, more) -> let (g, e) = fe in e | Nil -> EUnit }
+def defBody : map.Map (List u8) Term -> List u8 ->{Diverge} Term =
+  \defs f. case get f defs of { Some(e) -> e | None -> EUnit }
 
-def terminates : List (List u8, Term) -> List (List u8) ->{Diverge, Panic} Bool =
+def terminates : map.Map (List u8) Term -> List (List u8) ->{Diverge, Panic} Bool =
   \defs g.
     let arityOf = \f. let (ps, b) = params (defBody defs f) in length ps in
     -- ponytail: tries every choice of positions; a group with more than 4096 stays diverging.
@@ -1678,7 +1715,7 @@ def choices : List (List u8, List i64) ->{Diverge} List (map.Map (List u8) i64) 
 
 def idxOf : map.Map (List u8) i64 -> List u8 ->{Diverge} i64 = \m f. case get f m of { Some(i) -> i | None -> 0 }
 
-def decreases : List (List u8, Term) -> List (List u8) -> map.Map (List u8) i64 -> List u8 ->{Diverge, Panic} Bool =
+def decreases : map.Map (List u8) Term -> List (List u8) -> map.Map (List u8) i64 -> List u8 ->{Diverge, Panic} Bool =
   \defs g idx f.
     let (ps, body) = params (defBody defs f) in
     let vals = fromPairs (zipL ps (map (\k. VPart(false, k)) (range (length ps)))) in
@@ -1806,7 +1843,7 @@ def defsOf : List Decl ->{Diverge} List (List u8, Term) =
   \ds. concatMap (\d. case d of { DDef(f, t, e) -> Cons((f, e), box Nil) | _ -> Nil }) ds
 
 -- Effects main may leave unhandled (Keel.Check.topLevelEffects).
-def topLevelEffects : Unit -> List (List u8) = \u. sFrom (string.split ' ' "IO Input MMIO Hart Shared Files Net Panic Diverge Alloc")
+def topLevelEffects : Unit ->{Diverge} List (List u8) = \u. sFrom (string.split ' ' "IO Input MMIO Hart Shared Files Net Panic Diverge Alloc")
 
 -- A definition's type variables (↦ linear?) and effect variables, and the type under its ∀.
 def unForall : Ty ->{Diverge} (map.Map (List u8) Bool, (List (List u8), Ty)) =
