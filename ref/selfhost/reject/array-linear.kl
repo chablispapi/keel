@@ -1,0 +1,4 @@
+-- Array elements must be Free.
+linear data Tok = Tok
+
+main = let a = arrayPush arrayEmpty Tok in arrayLength a

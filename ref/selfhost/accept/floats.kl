@@ -1,0 +1,7 @@
+-- Floats and the array builtins, checked: the effects agree with keelc.
+def mean : f64 -> f64 -> f64 = \a b. (a + b) / 2.0
+
+main =
+  let xs = arrayPush (arrayPush arrayEmpty 3) 4 in
+  let m = mean (arrayGet xs 0 as f64) (floatSqrt 16.0) in
+  if m >= 3.5 then m as i64 else arrayLength xs

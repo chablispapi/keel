@@ -1,0 +1,4 @@
+-- f64 has only + - * / and comparisons.
+def half : f64 -> f64 = \x. x % 2.0
+
+main = half 3.0 as i64

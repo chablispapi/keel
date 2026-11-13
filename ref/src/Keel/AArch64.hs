@@ -21,6 +21,7 @@ import Data.ByteString qualified as B
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Tuple (swap)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Numeric (showOct)
@@ -551,6 +552,23 @@ loc x = gets (M.lookup x . gsLocs) >>= mapM_ lineRow
 lineRow :: (Int, Int, Int) -> G ()
 lineRow (f, l, c) = ins (".loc " ++ show f ++ " " ++ show l ++ " " ++ show c)
 
+-- | Branch to a possibly distant label (a shared panic routine) when a condition holds.
+-- Conditional branches reach ±1 MiB (tbz ±32 KiB), so a program past that size couldn't
+-- link: branch over an unconditional b (±128 MiB) instead, as RiscV.jumpIf.
+jumpIf :: String -> [String] -> String -> G ()
+jumpIf cond regs target = do
+  lSkip <- newLabel
+  ins (inverse ++ " " ++ concatMap (++ ", ") regs ++ lSkip)
+  ins ("b " ++ target)
+  line (lSkip ++ ":")
+  where
+    inverse = case cond of
+      "cbz" -> "cbnz"
+      "cbnz" -> "cbz"
+      'b' : '.' : c -> "b." ++ fromMaybe (error ("jumpIf: " ++ cond)) (lookup c (pairs ++ map swap pairs))
+      _ -> error ("jumpIf: " ++ cond)
+    pairs = [("eq", "ne"), ("vs", "vc"), ("cs", "cc"), ("hs", "lo"), ("hi", "ls"), ("lt", "ge"), ("gt", "le")]
+
 -- | Increment the reference count of a variable's block (inline; uses x16, x17). Immortal
 -- blocks (bit 31) are skipped; a count of zero means a freed block, which is a bug.
 dup :: Slots -> String -> G ()
@@ -560,7 +578,7 @@ dup slots v = do
   ins "ldr w17, [x16, #-8]"
   ins ("tbnz w17, #31, " ++ lSkip)
   ins "tst w17, #0x7ffffc00"
-  ins "b.eq _keel_panic_rc"
+  jumpIf "b.eq" [] "_keel_panic_rc"
   ins "add w17, w17, #1024"
   ins "str w17, [x16, #-8]"
   line (lSkip ++ ":")
@@ -813,7 +831,7 @@ vectorLoop slots red = when (length scalars <= 4 && u * length (rNodes red) <= 8
   forM_ [sum' h ++ ".d[" ++ show lane ++ "]" | h <- halves, lane <- [0, 1 :: Int]] $ \l -> do
     ins ("mov x16, " ++ l)
     if rChecked red
-      then ins "adds x15, x15, x16" >> ins "b.vs _keel_panic_overflow"
+      then ins "adds x15, x15, x16" >> jumpIf "b.vs" [] "_keel_panic_overflow"
       else ins "add x15, x15, x16"
   ins "add x10, x10, x12"
   store slots "x10" (rI red)
@@ -951,7 +969,7 @@ rhsInto slots d rhs = case rhs of
         let op = (if aop == Add then "add" else "sub") ++ (if ov == Checked then "s" else "")
         ins (op ++ " " ++ d ++ ", " ++ ra ++ ", " ++ rb)
         when (ov == Checked) $
-          ins ("b." ++ (if sgn then "vs" else if aop == Add then "cs" else "lo") ++ " _keel_panic_overflow")
+          jumpIf ("b." ++ (if sgn then "vs" else if aop == Add then "cs" else "lo")) [] "_keel_panic_overflow"
         pure True
     | ov `elem` [Wrap, Checked], aop == Mul -> do
         ra <- operand slots "x9" a
@@ -961,8 +979,8 @@ rhsInto slots d rhs = case rhs of
         ins ("mul " ++ d ++ ", " ++ ra ++ ", " ++ rb)
         when (ov == Checked) $
           if sgn
-            then ins ("cmp x11, " ++ d ++ ", asr #63") >> ins "b.ne _keel_panic_overflow"
-            else ins "cbnz x11, _keel_panic_overflow"
+            then ins ("cmp x11, " ++ d ++ ", asr #63") >> jumpIf "b.ne" [] "_keel_panic_overflow"
+            else jumpIf "cbnz" ["x11"] "_keel_panic_overflow"
         pure True
   -- Canonical (sign- or zero-extended) operands give a canonical result: any width.
   RPrim (Bits bop) _ a b | bop `elem` [And, Or, Xor] -> do
@@ -1017,7 +1035,7 @@ rhsInto slots d rhs = case rhs of
     ri <- operand slots "x10" i
     ins ("ldr x11, [" ++ ra ++ "]")
     ins ("cmp " ++ ri ++ ", x11")
-    ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
+    jumpIf "b.hs" [] "_keel_panic_bounds" -- unsigned: a negative index is out of bounds too
     element e d ra ri
     pure True
   RIndex a i e -> do
@@ -1197,7 +1215,7 @@ rhsCode slots rhs = case rhs of
     atom slots "x10" i
     ins "ldr x11, [x9]"
     ins "cmp x10, x11"
-    ins "b.hs _keel_panic_bounds" -- unsigned: a negative index is out of bounds too
+    jumpIf "b.hs" [] "_keel_panic_bounds" -- unsigned: a negative index is out of bounds too
     element e "x0" "x9" "x10"
   RIndex a i e -> atom slots "x9" a >> atom slots "x10" i >> element e "x0" "x9" "x10"
   RArray op e as -> do
@@ -1295,29 +1313,29 @@ arith it@(IntTy sgn n) ov aop
           plain -- exact: narrow operands can't overflow 64 bits
           movImm "x11" lo
           ins "cmp x0, x11"
-          ins ("b.lt " ++ lOvf)
+          jumpIf "b.lt" [] lOvf
           movImm "x11" hi
           ins "cmp x0, x11"
-          ins ("b.gt " ++ lOvf)
+          jumpIf "b.gt" [] lOvf
       | narrow = do
           plain -- unsigned: a negative result is also above hi when compared unsigned
           movImm "x11" hi
           ins "cmp x0, x11"
-          ins ("b.hi " ++ lOvf)
+          jumpIf "b.hi" [] lOvf
       | otherwise = case (aop, sgn) of
-          (Add, True) -> ins "adds x0, x9, x10" >> ins ("b.vs " ++ lOvf)
-          (Sub, True) -> ins "subs x0, x9, x10" >> ins ("b.vs " ++ lOvf)
+          (Add, True) -> ins "adds x0, x9, x10" >> jumpIf "b.vs" [] lOvf
+          (Sub, True) -> ins "subs x0, x9, x10" >> jumpIf "b.vs" [] lOvf
           (_, True) -> do -- Mul (division never reaches here: see divide)
             ins "mul x0, x9, x10"
             ins "smulh x11, x9, x10"
             ins "cmp x11, x0, asr #63"
-            ins ("b.ne " ++ lOvf)
-          (Add, False) -> ins "adds x0, x9, x10" >> ins ("b.cs " ++ lOvf)
-          (Sub, False) -> ins "subs x0, x9, x10" >> ins ("b.lo " ++ lOvf)
+            jumpIf "b.ne" [] lOvf
+          (Add, False) -> ins "adds x0, x9, x10" >> jumpIf "b.cs" [] lOvf
+          (Sub, False) -> ins "subs x0, x9, x10" >> jumpIf "b.lo" [] lOvf
           (_, False) -> do -- Mul
             ins "mul x0, x9, x10"
             ins "umulh x11, x9, x10"
-            ins ("cbnz x11, " ++ lOvf)
+            jumpIf "cbnz" ["x11"] lOvf
     -- The bound in the direction of the overflow.
     saturate
       | narrow && sgn = do
@@ -1338,14 +1356,14 @@ arith it@(IntTy sgn n) ov aop
 -- and explicitly for i64 (the hardware returns min without trapping).
 divide :: IntTy -> ArithOp -> G ()
 divide it@(IntTy sgn n) aop = do
-  ins "cbz x10, _keel_panic_div"
+  jumpIf "cbz" ["x10"] "_keel_panic_div"
   when (sgn && n == 64 && aop == Div) $ do
     lOk <- newLabel
     ins "cmn x10, #1"
     ins ("b.ne " ++ lOk)
     movImm "x11" (fst (intRange it))
     ins "cmp x9, x11"
-    ins "b.eq _keel_panic_overflow"
+    jumpIf "b.eq" [] "_keel_panic_overflow"
     line (lOk ++ ":")
   let d = if sgn then "sdiv" else "udiv"
   case aop of
@@ -1354,7 +1372,7 @@ divide it@(IntTy sgn n) aop = do
   when (sgn && n < 64 && aop == Div) $ do
     movImm "x11" (snd (intRange it))
     ins "cmp x0, x11"
-    ins "b.gt _keel_panic_overflow"
+    jumpIf "b.gt" [] "_keel_panic_overflow"
 
 -- | Re-extend x0 to the canonical form of an integer type (no-op for 64-bit types).
 canonical :: IntTy -> G ()

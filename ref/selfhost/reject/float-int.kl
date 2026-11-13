@@ -1,0 +1,4 @@
+-- An integer literal is never a float.
+def next : f64 -> f64 = \x. x + 1
+
+main = next 1.5 as i64

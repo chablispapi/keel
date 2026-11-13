@@ -1,0 +1,4 @@
+-- A clause returns its operation's result type.
+effect Ask { ask : Unit => i64 }
+
+main = handle ask(()) with Ask { ask u -> true }

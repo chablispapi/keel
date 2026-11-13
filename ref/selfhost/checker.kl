@@ -1,5 +1,5 @@
 -- Keel's type checker, in Keel: the verdict `keelc check` reaches, from the self-hosted
--- parser's syntax tree. Two passes, ts keelc does them:
+-- parser's syntax tree. Two passes, as keelc does them:
 --
 --   1. inference (ref/src/Keel/Infer.hs): fills in λ parameter types, literal widths and
 --      constructor type arguments by unification, and renames binders apart;
@@ -7,20 +7,24 @@
 --
 -- Both passes work on the parser's Ty and Term. A unification variable is TVar("?n"), an
 -- effect variable "?n", and a λ is linear (λ°) when it uses a linear variable from outside,
--- which is how keelc's linearize decides it.
+-- which is how keelc's linearize decides it. f64 is TInt("f64"), and an array builtin's
+-- element type, which inference finds, is written arrayOp[elem] for the core check.
 --
 -- Errors are sticky: the first one is kept and checking goes on with placeholder types, so
 -- no function has to stop early. Constructs not handled yet give `unsupported: …` the same way.
 --
 -- The test suite (selfhostCheckChecks in ref/test/Native.hs) compares its verdicts with
 -- keelc's on every .kl file in the repo, and selfhost/reject/ has one rejection per error
--- kind. Not handled yet: imports, polymorphism, handlers, codata, var and references, arrays,
--- floats, bitdata, cells and queues.
+-- kind. selfhost/check.kl loads the modules and resolves their names (Keel.Modules). Not
+-- handled yet: polymorphism, codata, var and references, arena, bitdata, cells and queues.
 --
 -- Measurements (Apple M-series, keelc at the commit that added this):
 --
---   milestone | lines | keelc check | keelc build | binary  | corpus (103 files) | agree / unsupported
+--   milestone | lines | keelc check | keelc build | binary  | corpus (files) | agree / unsupported
 --   M1 (λK₁)  | 1550  | 3.3 s       | 6.2 s       | 1.1 MB  | 0.9 s, live=0      | 25 + 16 rejections / 49
+--   M2        | 1690  | 4.1 s       | 7.5 s       | 1.3 MB  | 2.5 s, live=0      | 53 (21 rejections) / 45
+--     (handlers, imports, floats, array builtins; past 1 MB of code, AArch64's conditional
+--     branches to the panic routines no longer reached: AArch64.jumpIf)
 
 import std.string
 import std.map
@@ -675,6 +679,8 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
                 | _ -> R(tm, t, diverge env x, st) })
             | None ->
                 if has x (sigOps (envSig env)) then R(tm, TUnit, Nil, failSt st "Mismatch" (append "operation " (append x " must be applied")))
+                else if eq x "arrayEmpty" then (let (m, st) = freshTy st in R(ETyApp(x, box (ty1 m)), TData("Array", box (ty1 m)), Nil, st))
+                else if isSome (floatOpType x) || isSome (arrayOpType x TUnit) then R(tm, TUnit, Nil, failSt st "Mismatch" (append x " must be applied to its arguments"))
                 else if elem x (special ()) then R(tm, TUnit, Nil, unsupported st x)
                 else R(tm, TUnit, Nil, failSt st "Unbound" x) } })
     | EUnit -> R(tm, TUnit, Nil, st)
@@ -686,22 +692,21 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
            R(ENum(neg, mag, v), TVar(v), Nil, st))
         else if eq suffix "f64" then R(tm, TUnit, Nil, unsupported st "floats")
         else R(tm, TInt(suffix), Nil, st)
-    | EFloat(neg, m, e) -> R(tm, TUnit, Nil, unsupported st "floats")
+    | EFloat(neg, m, e) -> R(tm, TInt("f64"), Nil, st)
     | EConvert(to, e) ->
-        if eq to "f64" then R(tm, TUnit, Nil, unsupported st "floats")
-        else (case infer st env (unbox e) of { R(e2, te, ee, st) ->
+        (case infer st env (unbox e) of { R(e2, te, ee, st) ->
           case zonk st te of
-            { TInt(n) -> if eq n "f64" then R(tm, TUnit, Nil, unsupported st "floats") else R(EConvert(to, box e2), TInt(to), ee, st)
+            { TInt(n) ->
+                if eq n "f64" && eq to "f64" then R(tm, TUnit, Nil, failSt st "Mismatch" "e as f64: e is already f64")
+                else R(EConvert(to, box e2), TInt(to), ee, st)
             | TVar(v) -> if isMeta v then R(EConvert(to, box e2), TInt(to), ee, st) else R(tm, TUnit, Nil, failSt st "Mismatch" "conversion of non-integer")
             | z -> R(tm, TUnit, Nil, failSt st "Mismatch" (append "conversion of non-integer " (showTy z))) } })
     | EPrim(op, a, b) ->
         (case infer st env (unbox a) of { R(a2, ta, ea, st) ->
          case check st env (unbox b) ta of { C(b2, eb, st) ->
-           let za = zonk st ta in
-           if tyEq za (TInt("f64")) then R(tm, TUnit, Nil, unsupported st "floats")
-           else
-             let te = primType op ta in let (t, extra) = te in
-             R(EPrim(op, box a2, box b2), t, sUnion ea (sUnion eb extra), st) } })
+           let te = primType op ta in let (t, extra) = te in
+           let extra = if tyEq (zonk st ta) (TInt("f64")) then Nil else extra in
+           R(EPrim(op, box a2, box b2), t, sUnion ea (sUnion eb extra), st) } })
     | EIf(c, a, b) ->
         (case check st env (unbox c) TBool of { C(c2, ec, st) ->
          case infer st env (unbox a) of { R(a2, ta, ea, st) ->
@@ -710,7 +715,21 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
         let (t2, st) = fill st (allocTy t) in
         let (x2, es) = binder st env x (content t2) in let (env2, st) = es in
         (case infer st env2 (unbox b) of { R(b2, tb, eb, st) -> R(ELam(x2, t2, box b2), TFun(box t2, sInsert "Alloc" eb, box tb), Nil, st) })
-    | EApp(f, a) -> inferApp st env tm (unbox f) (unbox a)
+    | EApp(f, a) ->
+        let (h, args) = spine tm (Nil) in
+        (case h of
+          { EVar(x) ->
+              if isLocal env x || isDef env x then inferApp st env tm (unbox f) (unbox a)
+              else (case floatOpType x of
+                { Some(fo) -> let (tys, r) = fo in builtinApp st env x h args tys r Nil
+                | None -> case arrayOpType x TUnit of
+                    { Some(ao) ->
+                        let (m, st) = freshTy st in
+                        (case arrayOpType x m of
+                          { Some(ao) -> let (tys, rest) = ao in let (r, eff) = rest in builtinApp st env x (ETyApp(x, box (ty1 m))) args tys r eff
+                          | None -> R(tm, TUnit, Nil, st) })
+                    | None -> inferApp st env tm (unbox f) (unbox a) } })
+          | _ -> inferApp st env tm (unbox f) (unbox a) })
     | ELet(x, e, b) ->
         (case infer st env (unbox e) of { R(e2, te, ee, st) ->
          let (x2, es) = binder st env x te in let (env2, st) = es in
@@ -739,7 +758,9 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
          case infer st env2 (unbox b) of { R(b2, tb, eb, st) -> R(ELetPair(x2, y2, box e2, box b2), tb, sUnion ee eb, st) } })
     | EVarIn(x, e, b) -> R(tm, TUnit, Nil, unsupported st "var")
     | EAssign(x, e) -> R(tm, TUnit, Nil, unsupported st "var")
-    | EHandle(l, b, cs) -> R(tm, TUnit, Nil, unsupported st "handle")
+    | EHandle(l, b, cs) -> (case infer st env (unbox b) of
+        { R(b2, tb, eb, st) -> case clauses st env (unbox cs) of
+            { CA(cs2, ecs, st) -> R(EHandle(l, box b2, box cs2), tb, sUnion (sDelete l (expand st eb)) ecs, st) } })
     | ECocase(d, tys, bs) -> R(tm, TUnit, Nil, unsupported st "codata")
     | ETyApp(f, tys) -> R(tm, TUnit, Nil, unsupported st "polymorphism")
     | EProj(e, o) -> R(tm, TUnit, Nil, unsupported st "projection")
@@ -790,6 +811,49 @@ def applyFn : St -> Env -> Term -> Term ->{Diverge, Panic} R =
         { EBorrow(x) -> R(f, TUnit, Nil, unsupported st "references")
         | EBorrowMut(x) -> R(f, TUnit, Nil, unsupported st "references")
         | _ -> case check st env a p of { C(a2, ea, st) -> R(EApp(box f2, box a2), r, sUnion ef (sUnion ea latent), st) } } }
+
+-- Float and array builtins (Keel.Syntax.floatOpType, arrayOpType), applied to all their
+-- arguments at once. An array operation's head becomes arrayOp[elem], for the core check.
+def floatOpType : List u8 -> Option (List Ty, Ty) =
+  \x. let f = TInt("f64") in
+    if eq x "floatSqrt" || eq x "floatExp" || eq x "floatLog" || eq x "floatSin" || eq x "floatCos" || eq x "floatFloor" then Some((ty1 f, f))
+    else if eq x "floatPow" then Some((Cons(f, box (ty1 f)), f))
+    else if eq x "floatToBits" then Some((ty1 f, TInt("u64")))
+    else if eq x "floatFromBits" then Some((ty1 (TInt("u64")), f))
+    else None
+
+def arrayOpType : List u8 -> Ty -> Option (List Ty, (Ty, List (List u8))) =
+  \x a. let arr = TData("Array", box (ty1 a)) in let i = TInt("i64") in
+    if eq x "arrayEmpty" then Some((Nil, (arr, Nil)))
+    else if eq x "arrayNew" then Some((Cons(i, box (ty1 a)), (arr, one "Panic")))
+    else if eq x "arrayLength" then Some((ty1 arr, (i, Nil)))
+    else if eq x "arrayGet" then Some((Cons(arr, box (ty1 i)), (a, one "Panic")))
+    else if eq x "arraySet" then Some((Cons(arr, box (Cons(i, box (ty1 a)))), (arr, one "Panic")))
+    else if eq x "arrayPush" then Some((Cons(arr, box (ty1 a)), (arr, Nil)))
+    else if eq x "arrayPop" then Some((ty1 arr, (arr, one "Panic")))
+    else None
+
+def isSome : forall (a : Free). Option a -> Bool = \o. case o of { Some(x) -> true | None -> false }
+
+def builtinApp : St -> Env -> List u8 -> Term -> List Term -> List Ty -> Ty -> List (List u8) ->{Diverge, Panic} R =
+  \st env x h args tys r eff.
+    if length args != length tys then
+      R(h, TUnit, Nil, failSt st "Mismatch" (append x (append " takes " (append (string.fromInt (length tys)) " arguments"))))
+    else case checkArgs st env args tys of
+      { C3(args2, ea, st) -> R(foldl (\f a. EApp(box f, box a)) h args2, r, sUnion eff ea, st) }
+
+-- Handler clauses: each binds its operation's argument and returns its result (Infer's Handle).
+def clauses : St -> Env -> List Alt ->{Diverge, Panic} CA =
+  \st env cs. case cs of
+    { Nil -> CA(Nil, Nil, st)
+    | Cons(c, more) -> case c of
+        { Alt(op, xs, b) -> case get op (sigOps (envSig env)) of
+            { None -> CA(Nil, Nil, failSt st "Unbound" (append "operation " op))
+            | Some(info) -> let (l, ar) = info in let (ta, tr) = ar in
+                let (xs2, es) = binders st env (zipL xs (Cons(ta, box Nil))) in let (env2, st) = es in
+                case check st env2 b tr of
+                  { C(b2, eb, st) -> case clauses st env (unbox more) of
+                      { CA(rest, er, st) -> CA(Cons(Alt(op, xs2, b2), box rest), sUnion eb er, st) } } } } }
 
 -- A case; with an expected type, its branches are checked against it (Keel.Infer.caseOf).
 def caseOf : St -> Env -> Term -> List Alt -> Option Ty ->{Diverge, Panic} R =
@@ -892,6 +956,11 @@ def zonkTerm : St -> Term ->{Diverge, Panic} (Term, St) =
         let (e2, st) = zonkTerm st (unbox e) in
         let (alts2, st) = zonkAlts st (unbox alts) in
         (ECase(box e2, box alts2), st)
+    | EHandle(l, e, cs) ->
+        let (e2, st) = zonkTerm st (unbox e) in
+        let (cs2, st) = zonkAlts st (unbox cs) in
+        (EHandle(l, box e2, box cs2), st)
+    | ETyApp(f, tys) -> (ETyApp(f, box (map (\t. finalTy st t) (unbox tys))), st)
     | EBox(e) -> let (e2, st) = zonkTerm st (unbox e) in (EBox(box e2), st)
     | EUnbox(e) -> let (e2, st) = zonkTerm st (unbox e) in (EUnbox(box e2), st)
     | EPair(a, b) -> let (a2, st) = zonkTerm st (unbox a) in let (b2, st) = zonkTerm st (unbox b) in (EPair(box a2, box b2), st)
@@ -963,15 +1032,21 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
     | ENum(neg, mag, n) ->
         if fits n neg mag then Q(TInt(n), Nil, Nil, None)
         else qErr "Mismatch" (append (string.fromInt (mag as i64)) (append " does not fit " n))
+    | EFloat(neg, m, e) -> Q(TInt("f64"), Nil, Nil, None)
+    | ETyApp(x, tys) -> carray s rec ctx x (unbox tys) (Nil)
     | EConvert(to, e) -> (case cinfer s rec ctx (unbox e) of
         { Q(te, ee, ue, er) -> case er of
             { Some(m) -> Q(TUnit, Nil, Nil, er)
-            | None -> if isIntTy te then Q(TInt(to), ee, ue, None) else qErr "Mismatch" (append "conversion of non-integer " (showTy te)) } })
+            | None ->
+                if isIntTy te || (tyEq te (TInt("f64")) && not (eq to "f64")) then Q(TInt(to), ee, ue, None)
+                else qErr "Mismatch" (append "conversion of non-integer " (showTy te)) } })
     | EPrim(op, a, b) -> (case cinfer s rec ctx (unbox a) of
         { Q(ta, ea, ua, er) -> case er of
             { Some(m) -> Q(TUnit, Nil, Nil, er)
             | None ->
-                if not (isIntTy ta) then qErr "Mismatch" (append "arithmetic on " (showTy ta))
+                if not (isIntTy ta || tyEq ta (TInt("f64"))) then qErr "Mismatch" (append "arithmetic on " (showTy ta))
+                else if tyEq ta (TInt("f64")) && not (eq op "+" || eq op "-" || eq op "*" || eq op "/" || eq op "==" || eq op "<") then
+                  qErr "Mismatch" "f64 has only + - * / and comparisons (no %, +% +| +? or bit operations)"
                 else (case expect s rec ctx ta (unbox b) of
                   { Q(t0, eb, ub, er) -> case er of
                       { Some(m) -> Q(TUnit, Nil, Nil, er)
@@ -980,7 +1055,7 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
                           | None -> case arith op of
                               { Some(bs) -> let (base, suffix) = bs in
                                   if (base == '/' || base == '%') && not (isNil suffix) then qErr "Mismatch" "division has only the checked forms / and %"
-                                  else if isNil suffix then Q(ta, sUnion ea (sInsert "Panic" eb), u, None)
+                                  else if isNil suffix then Q(ta, sUnion ea (if tyEq ta (TInt("f64")) then eb else sInsert "Panic" eb), u, None)
                                   else if eq suffix "?" then Q(TData("Option", box (ty1 ta)), sUnion ea eb, u, None)
                                   else Q(ta, sUnion ea eb, u, None)
                               | None -> if eq op "==" || eq op "<" then Q(TBool, sUnion ea eb, u, None) else Q(ta, sUnion ea eb, u, None) } } } }) } })
@@ -1042,7 +1117,35 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
                         { Some(m) -> Q(TUnit, Nil, Nil, er)
                         | None -> let (u, er) = join2 ue ub in Q(tr, sUnion ee eb, u, er) } })
                 | _ -> qErr "Mismatch" (append "let-pair of non-pair type " (showTy te)) } } })
+    | EHandle(l, b, cs) -> (case get l (sigEffs s) of
+        { None -> qErr "Unbound" (append "effect " (append l " cannot be handled"))
+        | Some(ops) ->
+            let names = map (\o. case o of { Ctor(op, ts) -> op }) ops in
+            if not (namesEq (sortL (map (\c. case c of { Alt(op, xs, e) -> op }) (unbox cs))) (sortL names)) then
+              qErr "NonExhaustive" (append "handler for " (append l " must handle each operation exactly once"))
+            else case cinfer s rec ctx (unbox b) of
+              { Q(tb, eb, ub, er) -> case er of
+                  { Some(m) -> Q(TUnit, Nil, Nil, er)
+                  | None -> case handled s rec ctx (unbox cs) of
+                      { Q(t0, ecs, u0, er) -> Q(tb, sUnion (sInsert "Alloc" (sDelete l eb)) ecs, ub, er) } } } })
     | _ -> Q(TUnit, Nil, Nil, Some("unsupported: core construct")) }
+
+-- Handler clauses: none captures a linear value, each returns its operation's result type.
+def handled : Sig -> List (List u8) -> map.Map (List u8) Ty -> List Alt ->{Diverge, Panic} Q =
+  \s rec ctx cs. case cs of
+    { Nil -> Q(TUnit, Nil, Nil, None)
+    | Cons(c, more) -> case c of
+        { Alt(op, xs, e) -> case get op (sigOps s) of
+            { None -> qErr "Unbound" (append "operation " op)
+            | Some(info) -> let (l, ar) = info in let (targ, tres) = ar in
+                case bindIn s rec ctx (zipL xs (Cons(targ, box Nil))) e of
+                  { Q(tc, ec, uc, er) -> case er of
+                      { Some(m) -> Q(TUnit, Nil, Nil, er)
+                      | None ->
+                          if not (isNil uc) then qErr "LinearCapture" (append "handler clause " (append op " captures linear values"))
+                          else if not (sub tc tres) then Q(TUnit, Nil, Nil, Some(mismatch tres tc))
+                          else case handled s rec ctx (unbox more) of
+                            { Q(t0, er2, u0, er) -> Q(TUnit, sUnion ec er2, Nil, er) } } } } } }
 
 def branches : List (List u8) -> List (List u8) ->{Diverge} List u8 =
   \a b. append "branches use [" (append (string.join ", " a) (append "] and [" (append (string.join ", " b) "]")))
@@ -1079,11 +1182,38 @@ def capp : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term -> Term -> Term
     let known = case h of
       { EVar(g) -> if has g ctx then None else get g (sigArity s)
       | _ -> None } in
-    case f of
-      { EVar(op) ->
-          if not (has op ctx) && not (has op (sigDefs s)) && has op (sigOps s) then cperform s rec ctx op a
-          else cappKnown s rec ctx tm f a h args known
-      | _ -> cappKnown s rec ctx tm f a h args known }
+    case h of
+      { ETyApp(x, tys) -> carray s rec ctx x (unbox tys) args
+      | EVar(x) -> (case floatOpType x of
+          { Some(fo) -> if has x ctx || has x (sigDefs s) then cappOp s rec ctx tm f a h args known
+              else (let (tys, r) = fo in case expectAll s rec ctx tys args of
+                { Q(t0, ea, ua, er) -> case er of { Some(m) -> Q(TUnit, Nil, Nil, er) | None -> Q(r, ea, ua, None) } })
+          | None -> cappOp s rec ctx tm f a h args known })
+      | _ -> cappOp s rec ctx tm f a h args known }
+
+def cappOp : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term -> Term -> Term -> Term -> List Term -> Option i64 ->{Diverge, Panic} Q =
+  \s rec ctx tm f a h args known. case f of
+    { EVar(op) ->
+        if not (has op ctx) && not (has op (sigDefs s)) && has op (sigOps s) then cperform s rec ctx op a
+        else cappKnown s rec ctx tm f a h args known
+    | _ -> cappKnown s rec ctx tm f a h args known }
+
+-- An array operation arrayOp[a] applied to its arguments (Keel.Check's ArrayPrim).
+def carray : Sig -> List (List u8) -> map.Map (List u8) Ty -> List u8 -> List Ty -> List Term ->{Diverge, Panic} Q =
+  \s rec ctx x tys args. case tys of
+    { Cons(a, more) -> (case wfTy s a of
+        { Some(m) -> Q(TUnit, Nil, Nil, Some(m))
+        | None ->
+            if isLin s a then qErr "KindMismatch" (append "array elements must be Free, got linear " (showTy a))
+            else case arrayOpType x a of
+              { None -> Q(TUnit, Nil, Nil, Some("unsupported: polymorphism"))
+              | Some(ao) -> let (ptys, rest) = ao in let (r, eff) = rest in
+                  if length ptys != length args then qErr "Mismatch" "array operation: wrong number of arguments"
+                  else case expectAll s rec ctx ptys args of
+                    { Q(t0, ea, ua, er) -> case er of
+                        { Some(m) -> Q(TUnit, Nil, Nil, er)
+                        | None -> Q(r, sInsert "Alloc" (sUnion eff ea), ua, None) } } } })
+    | Nil -> Q(TUnit, Nil, Nil, Some("unsupported: polymorphism")) }
 
 def cappKnown : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term -> Term -> Term -> Term -> List Term -> Option i64 ->{Diverge, Panic} Q =
   \s rec ctx tm f a h args known. case known of

@@ -1,0 +1,8 @@
+-- A handler clause can't capture a linear value.
+linear data Tok = Tok
+
+effect Ask { ask : Unit => i64 }
+
+def spend : Tok -> i64 = \t. case t of { Tok -> 1 }
+
+main = let t = Tok in handle ask(()) with Ask { ask u -> spend t }

@@ -1,0 +1,2 @@
+-- An array builtin takes all its arguments at once.
+main = let push = arrayPush arrayEmpty in arrayLength (push 1)

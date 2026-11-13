@@ -1,0 +1,6 @@
+-- A handler must cover every operation of its effect.
+effect Dev { get : i64 => i64 ; put : i64 => Unit }
+
+def use : i64 ->{Dev} i64 = \i. put(i); get(i)
+
+main = handle use 1 with Dev { get i -> i }
