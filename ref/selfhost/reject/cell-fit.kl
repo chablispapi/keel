@@ -1,0 +1,4 @@
+-- A cell's initial value must fit its type: 300 is past the range of u8.
+cell small : u8 = 300
+
+main = 0

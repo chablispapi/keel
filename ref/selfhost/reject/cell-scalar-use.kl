@@ -1,0 +1,4 @@
+-- A scalar cell is a place, not a value: n + 1 must be get(n) + 1.
+cell n : u32 = 0
+
+main = n + 1

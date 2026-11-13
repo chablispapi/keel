@@ -1,0 +1,6 @@
+-- Lost is an alternative of every receive, so a message can't be called Lost.
+data Rx = Lost(u8) | Stop
+
+queue rx : [Rx; 4]
+
+main = 0
