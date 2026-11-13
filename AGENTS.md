@@ -24,7 +24,7 @@ messages, and examples that the test suite runs.
   `ref/src/Keel/Parser.hs` for every test file, so a syntax change goes into both.
 - **Specs:** a language change also updates `spec/surface.md` (syntax) or `spec/core.md`
   (semantics). Add new mistakes agents make to the skill's table.
-- **The hook reinstalls keelc:** with `git config core.hooksPath .githooks`, a commit that
+- **The hook reinstalls keelc:** with `git config core.hooksPath .githooks`, a commit or merge (pull, fast-forward) that
   changes `ref/src`, `ref/app`, `ref/std` or the `.cabal` file reinstalls `keelc` in the
   background (`.git/keelc-install.log`). Don't run `cabal install` while
   `.git/keelc-install.lock` exists: the two would share `ref/dist-newstyle`.

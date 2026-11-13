@@ -1,0 +1,4 @@
+#!/usr/bin/env fish
+# Merges and pulls (fast-forwards included) don't run post-commit; reuse it on the merged range.
+set hooks (dirname (status filename))
+exec $hooks/post-commit ORIG_HEAD

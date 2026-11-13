@@ -9,8 +9,14 @@
 set root (git rev-parse --show-toplevel)
 set gitdir (git rev-parse --absolute-git-dir)
 
+# post-merge passes the pre-merge commit, so a fast-forward of many commits is diffed whole.
 # The first commit has no parent to diff against: --root lists everything.
-if not git diff-tree --root --no-commit-id --name-only -r HEAD | string match -qr '^ref/(src|app|std)/|^ref/[^/]*\.cabal$'
+if set -q argv[1]
+    set changed (git diff --name-only $argv[1] HEAD)
+else
+    set changed (git diff-tree --root --no-commit-id --name-only -r HEAD)
+end
+if not string match -qr '^ref/(src|app|std)/|^ref/[^/]*\.cabal$' -- $changed
     exit 0
 end
 
