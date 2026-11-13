@@ -1,0 +1,3 @@
+-- A def whose body panics, with no Panic in its type.
+def inc : i64 -> i64 = \n. n + 1
+main = inc 2

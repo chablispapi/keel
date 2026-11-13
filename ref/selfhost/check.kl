@@ -1,0 +1,78 @@
+-- Type-check a Keel program and print keelc check's verdict line: `ok: main : T ! {E…}`,
+-- `error [Kind]`, or `unsupported: <feature>` for what the checker doesn't handle yet.
+-- stdin holds the entry file's path (stdin has no name, and imports resolve against it):
+--
+--   echo examples/fact.kl | keelc run selfhost/check.kl
+--
+-- The result is 0 for a verdict, -1 when a file is missing or doesn't parse.
+
+import std.string
+import std.file
+import lexer
+import parser
+import checker
+
+data Result a e = Ok(a) | Err(e)
+
+def any : forall (a : Free) 'e. (a ->{'e} Bool) -> List a ->{'e} Bool =
+  \f xs. case xs of { Nil -> false | Cons(x, rest) -> if f x then true else any f (unbox rest) }
+
+-- The path before the first newline.
+def firstLine : List u8 -> List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == '\n' then Nil else Cons(c, box (firstLine (unbox rest))) }
+
+-- Everything up to and including the last '/', or "" (the directory imports resolve against).
+def dirOf : List u8 -> List u8 =
+  \p. reverse (dropToSlash (reverse p))
+
+def dropToSlash : List u8 -> List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == '/' then Cons(c, rest) else dropToSlash (unbox rest) }
+
+-- The file of an import, as Keel.Modules.importPath: `a.b` is ROOT/a/b.kl, `std.m` is
+-- std/m.kl (relative to ref/, where keelc's std lives).
+def importPath : List u8 -> List u8 ->{Diverge} List u8 =
+  \root imp. case imp of
+    { Cons(s, Cons(t, Cons(d, Cons(dot, m)))) ->
+        if s == 's' && t == 't' && d == 'd' && dot == '.' then append "std/" (file (unbox m)) else append root (file imp)
+    | _ -> append root (file imp) }
+
+def file : List u8 ->{Diverge} List u8 =
+  \m. append (map (\c. if c == '.' then '/' else c) m) ".kl"
+
+-- Parse a file: its module, or an error line.
+def load : List u8 ->{Files, Diverge, Panic} Result Module (List u8) =
+  \path. case file.read path of
+    { None -> Err(append "missing " path)
+    | Some(text) ->
+        let (m, ts) = parser.parse (lexer.lex text 1 1) in
+        case parser.tok ts of { Error(msg) -> Err(append path (append ": " msg)) | _ -> Ok(m) } }
+
+-- The entry module and every module it imports, transitively, each loaded once: (path, module).
+def loadAll : List u8 -> List (List u8) -> List (List u8, Module) ->{Files, Diverge, Panic} Result (List (List u8, Module)) (List u8) =
+  \root todo done. case todo of
+    { Nil -> Ok(done)
+    | Cons(p, rest) ->
+        if any (\d. let (q, m) = d in string.equal p q) done then loadAll root (unbox rest) done
+        else case load p of
+          { Err(e) -> Err(e)
+          | Ok(m) -> case m of
+              { Module(imps, ds, entry) ->
+                  let more = map (\i. let (path, q) = i in importPath root path) imps in
+                  loadAll root (append more (unbox rest)) (Cons((p, Module(imps, ds, entry)), box done)) } } }
+
+-- The entry module's verdict (imports aren't handled yet).
+def judge : List u8 -> List (List u8, Module) ->{Files, Diverge, Panic} List u8 =
+  \path ms. case ms of
+    { Cons(pm, more) -> if not (case unbox more of { Nil -> true | _ -> false }) then "unsupported: imports"
+        else (let (p, m) = pm in case m of
+          { Module(imps, ds, entry) -> case load "selfhost/prelude.kl" of
+              { Err(e) -> e
+              | Ok(pre) -> case pre of
+                  { Module(pimps, pds, pentry) -> checker.verdict (map (\pd. let (priv, d) = pd in d) pds) ds entry } } })
+    | Nil -> "unsupported: nothing loaded" }
+
+main =
+  let path = firstLine (readAll ()) in
+  case loadAll (dirOf path) (Cons(path, box Nil)) Nil of
+    { Err(e) -> println e; -1
+    | Ok(ms) -> println (judge path ms); 0 }

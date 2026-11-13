@@ -1,0 +1,3 @@
+-- Recursion on an integer diverges; the type doesn't say so.
+def down : i64 ->{Panic} i64 = \n. if n == 0 then 0 else down (n - 1)
+main = down 3

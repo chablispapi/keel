@@ -1,0 +1,3 @@
+-- A pattern with the wrong number of variables.
+data P = P(i64, i64)
+main = case P(1, 2) of { P(a) -> a }

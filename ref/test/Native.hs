@@ -20,6 +20,7 @@ import Data.List (isInfixOf, isPrefixOf, isSuffixOf, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, emitProgram)
+import Keel.Check (TypeError (..), checkProgram)
 import Keel.Elab (elaborate)
 import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn, runProgramAt)
 import Keel.Infer (inferProgram)
@@ -27,6 +28,7 @@ import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
 import Keel.Lower qualified as L
 import Keel.Parser (parseModule)
+import Keel.Prelude (preludeSource)
 import Keel.RiscV (Board (..), compileRiscVAt, compileRiscVFor)
 import Keel.X86 (compileX86)
 import Keel.Toolchain (RiscVTools, buildNative, buildRiscV, findRiscVTools, runQemu)
@@ -354,6 +356,50 @@ selfhostChecks dir = do
         isDir <- doesDirectoryExist e
         if isDir then klFiles e else pure [e | ".kl" `isSuffixOf` e]
 
+-- | The self-hosted checker (selfhost/check.kl), built natively, must reach keelc's verdict
+-- on every .kl file keelc can load: the same `ok: main : …` line, or the same `error [Kind]`
+-- (no position yet). Its copy of the prelude must be keelc's. `unsupported: …` is a skip, counted so coverage shows.
+selfhostCheckChecks :: FilePath -> IO [String]
+selfhostCheckChecks dir = do
+  loaded <- loadModules "selfhost/check.kl"
+  case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileNative of
+    Left e -> pure ["FAIL selfhost/check.kl: " ++ e]
+    Right asm -> do
+      let exe = dir </> "selfhost-check"
+      writeFile (exe ++ ".s") asm
+      _ <- buildNative False (exe ++ ".s") exe
+      files <- concat <$> mapM klFiles ["examples", "std", "test", "selfhost"]
+      results <- fmap concat $ forM files $ \f ->
+        keelcVerdict f >>= \case
+          Nothing -> pure []
+          Just want -> do
+            (_, printed, _) <- readCreateProcessWithExitCode (shell ("echo " ++ f ++ " | " ++ exe)) ""
+            let got = takeWhile (/= '\n') printed
+            pure [if "unsupported:" `isPrefixOf` got then Nothing else Just (f, want, got)]
+      let compared = [r | Just r <- results]
+          bad = [(f, w, g) | (f, w, g) <- compared, w /= g]
+      prelude <- readFile "selfhost/prelude.kl"
+      putStrLn ("selfhost checker: " ++ show (length compared - length bad) ++ " agree, " ++ show (length results - length compared) ++ " unsupported")
+      pure $
+        ["FAIL selfhost/prelude.kl is not keelc's prelude (Keel.Prelude.preludeSource)" | prelude /= preludeSource]
+          ++ ["FAIL selfhost/check.kl disagrees with keelc on " ++ f ++ ": keelc says " ++ w ++ ", the checker " ++ g | (f, w, g) <- bad]
+  where
+    -- The type system's verdict, without position or message; Nothing when the file doesn't
+    -- load. Errors come from the whole pipeline; main's type and effect from the elaborated
+    -- core, before optimization (inlining can drop an effect, as square's Alloc in
+    -- examples/hello.kl).
+    keelcVerdict f =
+      loadModules f >>= \case
+        Left _ -> pure Nothing
+        Right (surface, _) -> pure . Just $ case inferProgram surface >>= \core -> compile core >> checkProgram (elaborate core) of
+          Left e -> "error [" ++ show (errKind e) ++ "]"
+          Right (t, eff) -> "ok: main : " ++ prettyTy t ++ (if null (prettyEff eff) then "" else " ! " ++ prettyEff eff)
+    klFiles d = do
+      entries <- map (d </>) <$> listDirectory d
+      fmap concat $ forM entries $ \e -> do
+        isDir <- doesDirectoryExist e
+        if isDir then klFiles e else pure [e | ".kl" `isSuffixOf` e]
+
 -- | Programs that type-check but that keelc must refuse to compile, with this message.
 compileErrors :: [(FilePath, String)]
 compileErrors =
@@ -397,7 +443,7 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
-  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir, reuseChecks dir]
+  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir, selfhostCheckChecks dir, reuseChecks dir]
   let programs = cases ++ specCases ++ concatMap snd loaded
   failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir False))
   -- The examples have source positions: build them again with debug info.
@@ -410,7 +456,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ debugFailures ++ refused
-      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 3
+      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 4
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-

@@ -1,0 +1,4 @@
+-- A free data type with a linear field.
+linear data R = R(i64)
+data Holder = Holder(R)
+main = 0

@@ -1,0 +1,6 @@
+-- A default alternative that drops a linear field.
+linear data R = R(i64)
+linear data T = Full(R) | Empty
+def drop : R -> Unit = \r. case r of { R(x) -> () }
+def f : T -> i64 = \t. case t of { Empty -> 0 | _ -> 1 }
+main = f (Empty)

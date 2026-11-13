@@ -1,0 +1,2 @@
+-- A λ applied to itself.
+main = let f = \x. x x in 0

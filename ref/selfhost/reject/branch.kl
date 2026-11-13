@@ -1,0 +1,4 @@
+-- Branches that use different linear values.
+linear data R = R(i64)
+def free : R -> i64 = \r. case r of { R(x) -> x }
+main = let r = R(1) in let s = R(2) in if true then free r +% free s else free r

@@ -1,0 +1,3 @@
+-- A linear value bound and never used.
+linear data R = R(i64)
+main = let r = R(1) in 3

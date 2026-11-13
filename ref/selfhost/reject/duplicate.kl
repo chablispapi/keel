@@ -1,0 +1,4 @@
+-- A linear value used twice.
+linear data R = R(i64)
+def both : R -> R -o i64 = \a b. case a of { R(x) -> case b of { R(y) -> x +% y } }
+main = let r = R(1) in both r r

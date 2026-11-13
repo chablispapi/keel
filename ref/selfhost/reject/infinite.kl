@@ -1,0 +1,3 @@
+-- A data type that contains itself without Box.
+data T = Leaf | Node(T, T)
+main = 0

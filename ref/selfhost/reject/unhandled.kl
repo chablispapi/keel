@@ -1,0 +1,3 @@
+-- main performs an effect nothing handles.
+effect Log { log : i64 => Unit }
+main = log(3); 0

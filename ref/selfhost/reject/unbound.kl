@@ -1,0 +1,2 @@
+-- A name nothing declares.
+main = nope 3

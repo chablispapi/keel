@@ -1,0 +1,4 @@
+-- Two constructors with one name.
+data A = X | Y
+data B = X
+main = 0

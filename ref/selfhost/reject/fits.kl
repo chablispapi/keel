@@ -1,0 +1,3 @@
+-- A literal too big for its type.
+def small : u8 -> u8 = \x. x
+main = small 300
