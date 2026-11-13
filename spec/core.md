@@ -345,6 +345,10 @@ compound terms take the union of their parts. The algorithmic form is
  (Op)  ───────────────────────────────────────────    π = {Panic} for checked + - *, {} otherwise
          Γ₁ ⋈ Γ₂ ⊢ e₁ ⊕ e₂ : ι ! ε₁ ∪ ε₂ ∪ π         (result Bool for == <)
 
+         Γ₁ ⊢ e₁ : Bool ! ε₁    Γ₂ ⊢ e₂ : Bool ! ε₂
+ (BoolEq) ─────────────────────────────────────────    Bool has == (so != too), no other ⊕
+          Γ₁ ⋈ Γ₂ ⊢ e₁ == e₂ : Bool ! ε₁ ∪ ε₂
+
          (op : τ ⇒ σ) ∈ l      Γ ⊢ e : τ ! ε
  (Perform) ──────────────────────────────────
              Γ ⊢ op(e) : σ ! ε ∪ {l}

@@ -239,6 +239,7 @@ exampleFiles =
   , ("test/syntax/known-con.kl", (Just "12057", "1234"))
   , ("test/syntax/known-con-panic.kl", (Nothing, "78"))
   , ("test/syntax/tuples.kl", (Just "14", ""))
+  , ("test/syntax/bool-eq.kl", (Just "(true, (false, (true, (false, true))))", ""))
   , ("test/cells/cells.kl", (Just "301", "12\n-3\n1\n"))
   , ("test/cells/bounds.kl", (Nothing, "9\n"))
   , ("test/cells/queue.kl", (Just "0", "314\n-1\n10\n100\n"))

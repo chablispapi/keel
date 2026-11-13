@@ -1044,7 +1044,7 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
         { Q(ta, ea, ua, er) -> case er of
             { Some(m) -> Q(TUnit, Nil, Nil, er)
             | None ->
-                if not (isIntTy ta || tyEq ta (TInt("f64"))) then qErr "Mismatch" (append "arithmetic on " (showTy ta))
+                if not (isIntTy ta || tyEq ta (TInt("f64")) || (tyEq ta TBool && eq op "==")) then qErr "Mismatch" (append "arithmetic on " (showTy ta))
                 else if tyEq ta (TInt("f64")) && not (eq op "+" || eq op "-" || eq op "*" || eq op "/" || eq op "==" || eq op "<") then
                   qErr "Mismatch" "f64 has only + - * / and comparisons (no %, +% +| +? or bit operations)"
                 else (case expect s rec ctx ta (unbox b) of

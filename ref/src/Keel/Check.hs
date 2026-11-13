@@ -508,6 +508,7 @@ infer s rec ctx tm = case tm of
     case ta of
       TInt _ -> pure ()
       TFloat -> pure ()
+      TBool | op == Eq -> pure () -- Bool has == (and so !=), nothing else
       _ -> err Mismatch ("arithmetic on " ++ prettyTy ta)
     -- f64 has + - * / (IEEE: inf and NaN, never a panic), == and <.
     when (ta == TFloat) $ case op of

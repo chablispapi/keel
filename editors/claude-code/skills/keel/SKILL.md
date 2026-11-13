@@ -106,7 +106,6 @@ Each of these has tripped up someone who had the spec open:
 | a variable named `as`, `main`, `linear`, `in`, `of`, `with`, `mut`, `land` or another keyword | `parse error … unexpected reserved word "as"` | another name: `ts`, `prog`, `isLin` |
 | `def n : i64 = twice 3`, or any top-level value that isn't a λ (a list, a call) | `keelc check` accepts it, but `keelc run` can end in `<<loop>>` and `keelc build` says `not supported yet: top-level definition n that is neither a λ nor a cocase` | a function of Unit, `def n : Unit -> i64 = \u. twice 3`, called as `n ()` |
 | `g None (Some(4))` | parses as `g (None(Some(4)))`: a constructor takes the parenthesized argument after it, even across a space | `g (None) (Some(4))` |
-| `a == b` with `a, b : Bool` | `Mismatch: arithmetic on Bool`: `==` is only for numbers | `if a then b else not b` |
 | `(a, b, c)` | parse error at the second `,`: there are only pairs | `(a, (b, c))` |
 | `Cons('+', rest)` in a pattern | parse error: literals only work as the top-level alternatives | `Cons(c, rest) -> if c == '+' then … else …` |
 | `map.insert k v m` | type error: no type classes | pass the comparison: `map.insert compareInt k v m`, `string.compare` for strings |

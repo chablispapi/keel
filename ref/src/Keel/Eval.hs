@@ -407,6 +407,7 @@ prim op (VFloat a) (VFloat b) = pure $ case op of
   Arith _ Mul -> VFloat (a * b)
   Arith _ Div -> VFloat (a / b)
   _ -> stuck "float primitive"
+prim Eq (VBool a) (VBool b) = pure (VBool (a == b))
 prim _ _ _ = stuck "primitive on non-integers"
 
 -- | How a float shows as a result: its IEEE bits in hex, exact on every target (std.string's

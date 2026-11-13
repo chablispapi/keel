@@ -114,7 +114,7 @@ prints it, and means the same as leaving it out.
 | `n as f64`, `x as i32` | integer to `f64` (rounded to nearest); `f64` to integer (toward zero, saturating, NaN gives 0) |
 | `s.thr_empty`, `s.raw`, `LineStatus(x)`, `LineStatus { thr_empty = 1 }` | bitdata field, raw value, from raw, from fields |
 | `+ - *`, `+% -% *%`, `+\| -\| *\|`, `+? -? *?` | checked, wrapping, saturating, Option arithmetic |
-| `==`, `<`, `!=`, `>`, `<=`, `>=` | comparisons (the last four are written with `==`, `<` and `if`; operands still evaluate left to right) |
+| `==`, `<`, `!=`, `>`, `<=`, `>=` | comparisons (the last four are written with `==`, `<` and `if`; operands still evaluate left to right). On `Bool`, only `==` and `!=` |
 | `a && b`, `a \|\| b`, `not a` | `if a then b else false`, `if a then true else b`, and a prelude function |
 | `f[i64]`, `Nil[i64]` | explicit type arguments (usually inferred) |
 

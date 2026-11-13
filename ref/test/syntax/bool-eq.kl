@@ -1,0 +1,5 @@
+def same : Bool -> Bool -> Bool = \a b. a == b
+
+def differ : Bool -> Bool -> Bool = \a b. a != b
+
+main = (same true true, (same true false, (differ false true, (differ false false, true == (1 < 2)))))

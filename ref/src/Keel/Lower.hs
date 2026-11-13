@@ -418,6 +418,8 @@ expr info env tm k = case tm of
         Arith Optional _ -> mapM_ (\(tag, fts) -> dataLayout info tag fts) [(0, []), (1, [TInt it])]
         _ -> pure ()
       sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op it va vb)
+    -- Bool is 0 or 1: == compares it as a u8, one word on every target.
+    TBool -> sub a $ \va -> sub b $ \vb -> bindRhs (RPrim op (IntTy False 8) va vb)
     t -> lift (Left ("arithmetic on " ++ prettyTy t))
   -- A u32 widened on a 32-bit target: the back end extends a narrow word by its sign, so the
   -- high half is given (the other narrow types are sign-extended in their word, or positive).
