@@ -37,6 +37,10 @@
 --   + speed   | 1940  | 5.4 s       | 9.3 s       | 1.4 MB  | 2.0 s, live=0      | 91 (28 rejections) / 16
 --     (its own source in 0.40 s, keelc's Haskell front end 0.36 s: sets merge in one pass, and
 --     recursive groups use maps; the 1.9 s was O(n³) in recursiveGroups)
+--   M4        | 2720  | 14.8 s      | 23.0 s      | 1.9 MB  | 3.4 s, live=0      | 127 (61 rejections) / 0
+--     (error positions, var and references, bitdata, cells and queues; its own source in 1.0 s,
+--     keelc's front end 0.84 s. keelc check's 14.8 s is 0.84 s of front end and 14 s of
+--     monomorphization, optimization and re-checking, which grew 2.7× for 1.4× the code)
 
 import std.string
 import std.map
