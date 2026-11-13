@@ -1,0 +1,8 @@
+-- post takes a message written out as a constructor, not a variable.
+data Rx = Byte(u8) | Stop
+
+queue rx : [Rx; 4]
+
+def interrupt : usize ->{Shared, !Alloc} Unit = \c. post(rx, c)
+
+main = 0

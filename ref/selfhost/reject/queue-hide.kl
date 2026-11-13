@@ -1,0 +1,6 @@
+-- receive(q) must list every message: _ would hide Stop.
+data Rx = Byte(u8) | Stop
+
+queue rx : [Rx; 4]
+
+main = case receive(rx) of { Byte(b) -> out(b as i64); 0 | _ -> 0 }

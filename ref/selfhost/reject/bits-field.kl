@@ -1,0 +1,4 @@
+-- A bitdata value has only its declared fields: thr_empty is there, nope isn't.
+bitdata LineStatus : u8 { thr_empty @ 5 }
+
+main = LineStatus(0).nope
