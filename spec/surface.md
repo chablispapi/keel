@@ -104,6 +104,7 @@ prints it, and means the same as leaving it out.
 | `read8(4)`, `out(x)`, `putc(c)` | performing an operation (`out` prints a number and a newline, `putc` one byte) |
 | `getc ()` | read one byte of input (effect `Input`): `0`–`255`, or `-1` at the end |
 | `Cons(1, box Nil)`, `box e`, `unbox e`, `(a, b)` | constructors, boxes, pairs; `(a, b, c)` is `(a, (b, c))`, in types and `case` patterns too |
+| `g None (Some(4))`, `Nil[i64]` | a constructor's fields `(…)` and type arguments `[…]` follow its name (or the `]`) with no space. With a space, a parenthesis is the next argument, as after any name: `g None (Some(4))` passes `g` two arguments, and `Some (4)` is an error. In a pattern, `Some (x)` is a parse error |
 | `42`, `250u8`, `0x1000_0000`, `-5`, `true`, `()` | literals (width inferred unless suffixed; `_` separates digits) |
 | `1.5`, `2.0`, `1e-30`, `-6.5e3` | `f64` literals: a point or an exponent (an integer literal is never an `f64`) |
 | `"Hi!\n"` | a `List u8` of the string's UTF-8 bytes (Haskell-style escapes) |

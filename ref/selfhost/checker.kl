@@ -691,7 +691,8 @@ def check : St -> Env -> Term -> Ty ->{Diverge, Panic} C =
     | ECon(c, tys, args) -> (case shallow st ex of
         { TData(d, dtys) ->
             if isNil (unbox tys) && (case get c (sigCons (envSig env)) of { Some(info) -> let (fs, d2) = info in eq d d2 | None -> false })
-            then (case checkArgs st env (unbox args) (instFields (envSig env) d (unbox dtys) (conFields env c)) of
+            then (let st = noFields st c (conFields env c) (unbox args) in
+                  case checkArgs st env (unbox args) (instFields (envSig env) d (unbox dtys) (conFields env c)) of
                     { C3(args2, eff, st) -> C(ECon(c, box (unbox dtys), box args2), eff, st) })
             else checkBy st env tm ex
         | _ -> checkBy st env tm ex })
@@ -728,6 +729,12 @@ def cocaseTerm : St -> Env -> List u8 -> List Ty -> List Alt ->{Diverge, Panic} 
 
 def firstOf : forall (a : Free) (b : Free) 'e. (a ->{'e} Option b) -> List a ->{'e} Option b =
   \f xs. case xs of { Nil -> None | Cons(x, rest) -> case f x of { None -> firstOf f (unbox rest) | Some(y) -> Some(y) } }
+
+-- A constructor with fields written without them: usually C (x) for C(x) (Keel.Infer.noFields).
+def noFields : St -> List u8 -> List Ty -> List Term ->{Diverge} St =
+  \st c fields args.
+    if isNil args && not (isNil fields) then failSt st "Mismatch" (append c " has fields: write it with them, with no space before the parenthesis")
+    else st
 
 def conFields : Env -> List u8 ->{Diverge} List Ty =
   \env c. case get c (sigCons (envSig env)) of { Some(info) -> let (fs, d) = info in fs | None -> Nil }
@@ -825,6 +832,7 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
          case infer st env (unbox b) of { R(b2, tb, eb, st) -> R(ESeq(box a2, box b2), tb, sUnion ea eb, st) } })
     | ECon(c, tys, args) ->
         let (d, rest) = conInfo st env c (unbox tys) in let (fields, rest) = rest in let (tys2, st) = rest in
+        let st = noFields st c fields (unbox args) in
         (case checkArgs st env (unbox args) (instFields (envSig env) d tys2 fields) of
           { C3(args2, eff, st) -> R(ECon(c, box tys2, box args2), TData(d, box tys2), eff, st) })
     | ECase(e, alts) -> caseOf st env (unbox e) (unbox alts) (None)

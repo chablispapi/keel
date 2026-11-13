@@ -1,0 +1,9 @@
+-- A constructor's fields and type arguments follow its name with no space; with a space, a
+-- parenthesis starts the next argument, as after any other name.
+def pick : Option i64 -> Option i64 -> i64 =
+  \a b. case a of { Some(x) -> x | None -> case b of { Some(y) -> y | None -> 0 } }
+
+def size : List i64 -> i64 =
+  \xs. case xs of { Nil -> 0 | Cons(x, rest) -> 1 +% size (unbox rest) }
+
+main = pick None (Some(4)) + pick (Some(1)) None + size Nil[i64] + size (Cons(5, box Nil))

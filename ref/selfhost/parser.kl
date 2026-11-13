@@ -557,17 +557,44 @@ private def strTerm : List u8 ->{Diverge} Term =
     | Cons(c, rest) ->
         ECon("Cons", box Nil, box Cons(ENum(false, c as u64, "u8"), box Cons(EBox(box (strTerm (unbox rest))), box Nil))) }
 
--- C, C(e, …), C[t](e, …), or a bitdata value Status { field = e, … }.
+-- C, C(e, …), C[t](e, …), or a bitdata value Status { field = e, … }. The brackets and
+-- parentheses follow with no space: C (x) applies C to x, as f (x) applies f.
 private def constructor : List Token ->{Diverge, Panic} (Term, List Token) =
   \ts.
+    let at = endOf (nameToken ts) in
     let (c, ts) = qualUpper ts in
     if symIs "{" ts then
       (let (fs, ts) = inside (\ts. let (f, ts) = lower ts in let (e, ts) = expr (expect "=" ts) in (Alt(f, Nil, e), ts)) "," "}" (next ts) in
        (EBits(c, box fs), ts))
     else
-      (let (tys, ts) = if symIs "[" ts then inside ty "," "]" (next ts) else (Nil, ts) in
-       let (xs, ts) = if symIs "(" ts then inside expr "," ")" (next ts) else (Nil, ts) in
+      (let tight = startsAt at ts in
+       let (tys, rest) = if tight && symIs "[" ts then
+           (let (tys, ts) = if symIs "]" (next ts) then (Nil, next ts) else sepBy1 ty "," (next ts) in
+            (tys, (startsAt (endOf ts) (next ts), expect "]" ts)))
+         else (Nil, (tight, ts)) in
+       let (tight, ts) = rest in
+       let (xs, ts) = if tight && symIs "(" ts then inside expr "," ")" (next ts) else (Nil, ts) in
        (ECon(c, box tys, box xs), ts))
+
+-- The capitalized token of a name: Status, or the Status of uart.Status.
+private def nameToken : List Token ->{Diverge} List Token =
+  \ts. case tok ts of { Ident(q) -> next (next ts) | _ -> ts }
+
+-- Where the current token ends: line, and the column after it (names and symbols).
+private def endOf : List Token ->{Panic} (i64, i64) =
+  \ts. case ts of
+    { Nil -> (0, 0)
+    | Cons(t, rest) -> case t of
+        { At(l, c, k) -> case k of
+            { Upper(x) -> (l, c + length x)
+            | Sym(x) -> (l, c + length x)
+            | _ -> (0, 0) } } }
+
+-- Does the current token start right there?
+private def startsAt : (i64, i64) -> List Token -> Bool =
+  \lc ts. let (l, c) = lc in case ts of
+    { Nil -> false
+    | Cons(t, rest) -> case t of { At(l2, c2, k) -> l == l2 && c == c2 } }
 
 -- Alternatives as written: constructors with patterns for their fields, pairs, literals,
 -- and variables (or _).
@@ -597,8 +624,13 @@ private def altP : List Token ->{Diverge, Panic} ((Pattern, Term), List Token) =
 private def patternP : List Token ->{Diverge, Panic} (Pattern, List Token) =
   \ts.
     if startsQualUpper ts then
-      (let (c, ts) = qualUpper ts in
-       let (ps, ts) = if symIs "(" ts then inside patternP "," ")" (next ts) else (Nil, ts) in
+      (let at = endOf (nameToken ts) in
+       let (c, ts) = qualUpper ts in
+       let (ps, ts) =
+         if symIs "(" ts then
+           (if startsAt at ts then inside patternP "," ")" (next ts)
+            else (Nil, fail (append "write " (append c "(…) with no space: a constructor's fields follow its name")) ts))
+         else (Nil, ts) in
        (PCon(c, box ps), ts))
     else if symIs "(" ts then
       (let (p, ts) = patternP (next ts) in

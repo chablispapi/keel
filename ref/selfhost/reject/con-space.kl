@@ -1,0 +1,2 @@
+-- Some (4) applies Some, written without its field, to 4.
+main = case Some (4) of { Some(x) -> x | None -> 0 }

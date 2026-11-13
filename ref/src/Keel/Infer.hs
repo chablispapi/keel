@@ -440,6 +440,7 @@ check env tm expected = do
       pure (mk x' t' b', S.empty)
     conTerm c tys args = do
       (_, fields, tys') <- conInfo env c tys
+      noFields c fields args
       rs <- zipWithM (check env) args (map (inst env c tys') fields)
       pure (Con c tys' (map fst rs), S.unions (map snd rs))
     cocaseTerm d tys bs = do
@@ -471,6 +472,12 @@ inst env c tys =
   let d = maybe "" fst (M.lookup c (sCons (eSig env)))
       ps = maybe [] (\(_, p, _) -> p) (M.lookup d (sData (eSig env)))
    in substTy (M.fromList (zip ps tys)) M.empty
+
+-- | A constructor with fields written without them: usually C (x) for C(x), which applies C
+-- to x (the fields follow the name with no space).
+noFields :: String -> [Ty] -> [Term] -> I ()
+noFields c fields args = when (null args && not (null fields)) $
+  failWith Mismatch (c ++ " has " ++ show (length fields) ++ " field" ++ (if length fields == 1 then "" else "s") ++ ": write " ++ c ++ "(…), with no space before the parenthesis")
 
 codataInfo :: Env -> String -> I ([String], [(String, Ty)])
 codataInfo env d = maybe (failWith Unbound ("codata " ++ d)) pure (M.lookup d (sCodata (eSig env)))
@@ -756,6 +763,7 @@ infer env tm = case tm of
       pure (foldl (Prim (Bits Or)) (IntLit it 0) (map fst parts), TData b [], S.unions (map snd parts))
   Con c tys args -> do
     (d, fields, tys') <- conInfo env c tys
+    noFields c fields args
     rs <- zipWithM (check env) args (map (inst env c tys') fields)
     pure (Con c tys' (map fst rs), TData d tys', S.unions (map snd rs))
   Case e alts | Just q <- receiveOf env e -> receiveTerm env q alts >>= infer env

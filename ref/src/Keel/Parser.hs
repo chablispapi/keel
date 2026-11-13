@@ -247,7 +247,15 @@ data Pat = PVar String | PCon String [Pat] | PPair Pat Pat
 
 pattern :: Parser Pat
 pattern =
-  (PCon <$> qualUpper <*> option [] (parens (sepBy pattern comma)))
+  ( do
+      (c, tight) <- conName
+      if tight
+        then PCon c <$> option [] (parens (sepBy pattern comma))
+        else do
+          spaced <- option False (True <$ lookAhead (char '('))
+          when spaced $ fail ("write " ++ c ++ "(…) with no space: a constructor's fields follow its name")
+          pure (PCon c [])
+  )
     <|> (PVar <$> lower)
     <|> parens (PPair <$> pattern <* comma <*> rest)
   where
@@ -300,6 +308,20 @@ match (u : us) rows d = go (runs rows)
 
 qualUpper :: Parser String
 qualUpper = try (do q <- lower; op "."; (\n -> q ++ "." ++ n) <$> upper) <|> upper
+
+-- | A constructor's name, and whether the next token follows it with no space: only then do
+-- a ( or [ belong to it. C(x) has fields; C (x) applies C to x, as f (x) applies f.
+conName :: Parser (String, Bool)
+conName = do
+  p0 <- getPosition
+  c <- qualUpper
+  (c,) <$> tightAfter p0 (length c)
+
+-- | Whether the parser now stands right after a token of width w that started at p0.
+tightAfter :: SourcePos -> Int -> Parser Bool
+tightAfter p0 w = do
+  p1 <- getPosition
+  pure (sourceLine p1 == sourceLine p0 && sourceColumn p1 == sourceColumn p0 + w)
 
 -- Types -----------------------------------------------------------------------------------
 
@@ -533,11 +555,19 @@ atom =
   where
     -- (a, b, c) is (a, (b, c))
     tuple = do e <- expr; option e (comma >> Pair e <$> tuple)
+    -- C, C(e, …), C[t, …](e, …): the brackets and parentheses follow with no space.
     constructor = do
-      c <- qualUpper
+      (c, tight) <- conName
       bitsLit c <|> do
-        ts <- option [] (brackets (sepBy ty comma))
-        Con c ts <$> option [] (parens (sepBy expr comma))
+        (ts, tight') <-
+          if tight
+            then option ([], True) $ do
+              ts <- Tok.symbol lexer "[" *> sepBy ty comma
+              p0 <- getPosition
+              _ <- Tok.symbol lexer "]"
+              (ts,) <$> tightAfter p0 1
+            else pure ([], False)
+        Con c ts <$> (if tight' then option [] (parens (sepBy expr comma)) else pure [])
     -- Status { field = e, … }
     bitsLit c = BitsLit c <$> braces (sepBy ((,) <$> lower <* op "=" <*> expr) comma)
     caseE = do
