@@ -28,6 +28,7 @@ data Term =
   | EHandle(List u8, Box Term, Box (List Alt)) | ECocase(List u8, Box (List Ty), Box (List Alt))
   | ETyApp(List u8, Box (List Ty)) | EProj(Box Term, List u8)
   | EBorrow(List u8) | EBorrowMut(List u8) | EBits(List u8, Box (List Alt))
+  | EAt(List u8, i64, i64, Box Term)
 
 -- A case alternative (constructor, variables, body). Handler clauses (operation, [x], body),
 -- cocase branches (observation, [], body) and bitdata fields (field, [], value) reuse it.
@@ -338,7 +339,17 @@ def expr : List Token ->{Diverge, Panic} (Term, List Token) =
     let (a, ts) = opExpr ts in
     if symIs ";" ts then (let (b, ts) = expr (next ts) in (ESeq(box a, box b), ts)) else (a, ts)
 
-private def opExpr : List Token ->{Diverge, Panic} (Term, List Token) =
+-- Where a term starts (file, line, column), for error messages, as keelc's located: whole
+-- expressions and applications, never a call's head or an argument atom. The file is filled
+-- in by whoever knows it (selfhost/check.kl).
+private def located : (List Token ->{Diverge, Panic} (Term, List Token)) -> List Token ->{Diverge, Panic} (Term, List Token) =
+  \p ts. case ts of
+    { Cons(t, rest) -> (case t of { At(l, c, k) -> let (e, ts2) = p ts in (EAt(Nil, l, c, box e), ts2) })
+    | Nil -> p ts }
+
+private def opExpr : List Token ->{Diverge, Panic} (Term, List Token) = \ts. located opExpr1 ts
+
+private def opExpr1 : List Token ->{Diverge, Panic} (Term, List Token) =
   \ts.
     if symIs "\\" ts then
       (let (ps, ts) = manyOf startsParam param (next ts) in
@@ -443,7 +454,7 @@ private def swapped : Term -> Term -> Term =
     if plain a && plain b then EPrim("<", box b, box a)
     else ELet("l%", box a, box ELet("r%", box b, box EPrim("<", box EVar("r%"), box EVar("l%"))))
 
-private def plain : Term -> Bool = \e. case e of { EVar(x) -> true | ENum(n, v, w) -> true | EFloat(n, v, x) -> true | _ -> false }
+private def plain : Term -> Bool = \e. case e of { EVar(x) -> true | ENum(n, v, w) -> true | EFloat(n, v, x) -> true | EAt(f, l, c, b) -> plain (unbox b) | _ -> false }
 
 private def addE : List Token ->{Diverge, Panic} (Term, List Token) =
   \ts. let (a, ts) = mulE ts in addRest a ts
@@ -480,7 +491,9 @@ private def convRest : Term -> List Token ->{Diverge, Panic} (Term, List Token) 
         | _ -> (e, fail "expected an integer type" (next ts)) })
     else (e, ts)
 
-private def appE : List Token ->{Diverge, Panic} (Term, List Token) =
+private def appE : List Token ->{Diverge, Panic} (Term, List Token) = \ts. located appE1 ts
+
+private def appE1 : List Token ->{Diverge, Panic} (Term, List Token) =
   \ts.
     let (h, ts) =
       if kwIs "box" ts then (let (e, ts) = postfix (next ts) in (EBox(box e), ts))

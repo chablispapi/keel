@@ -88,6 +88,7 @@ def pTerm : Term ->{IO, Diverge, Panic} Unit =
     | EVarIn(x, a, b) -> print "(var "; print x; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
     | EAssign(x, a) -> print "(:= "; print x; terms (Cons(unbox a, box Nil))
     | ESeq(a, b) -> print "(seq"; terms (Cons(unbox a, box Cons(unbox b, box Nil)))
+    | EAt(f, l, c, b) -> pTerm (unbox b)
     | ECon(c, ts, xs) -> print "(con "; print c; putc(' '); plist pTy (unbox ts); terms (unbox xs)
     | ECase(a, alts) ->
         print "(case "; pTerm (unbox a);

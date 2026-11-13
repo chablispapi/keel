@@ -1,5 +1,6 @@
 -- Type-check a Keel program and print keelc check's verdict line: `ok: main : T ! {E…}`,
--- `error [Kind]`, or `unsupported: <feature>` for what the checker doesn't handle yet.
+-- `file:line:col: error [Kind]: message` (no position when keelc gives none), or
+-- `unsupported: <feature>` for what the checker doesn't handle yet.
 -- stdin holds the entry file's path (stdin has no name, and imports resolve against it):
 --
 --   echo examples/fact.kl | keelc run selfhost/check.kl
@@ -49,18 +50,18 @@ def load : List u8 ->{Files, Diverge, Panic} Result Module (List u8) =
 
 -- Every module the entry imports, transitively, then the entry, each loaded once and after
 -- the modules it imports (Keel.Modules.visit): (module name, module).
-def visit : List u8 -> List (List u8) -> List u8 -> List u8 -> List (List u8, Module) ->{Files, Diverge, Panic} Result (List (List u8, Module)) (List u8) =
+def visit : List u8 -> List (List u8) -> List u8 -> List u8 -> List (List u8, (List u8, Module)) ->{Files, Diverge, Panic} Result (List (List u8, (List u8, Module))) (List u8) =
   \root stack name path done.
     if checker.elem name stack then Err(append "import cycle at " name)
-    else if any (\d. let (n, m) = d in string.equal n name) done then Ok(done)
+    else if any (\d. let (n, pm) = d in string.equal n name) done then Ok(done)
     else case load path of
       { Err(e) -> Err(e)
       | Ok(m) -> case m of
           { Module(imps, ds, entry) -> case visitAll root (Cons(name, box stack)) imps done of
               { Err(e) -> Err(e)
-              | Ok(done) -> Ok(append done (Cons((name, Module(imps, ds, entry)), box Nil))) } } }
+              | Ok(done) -> Ok(append done (Cons((name, (path, Module(imps, ds, entry))), box Nil))) } } }
 
-def visitAll : List u8 -> List (List u8) -> List (List u8, List u8) -> List (List u8, Module) ->{Files, Diverge, Panic} Result (List (List u8, Module)) (List u8) =
+def visitAll : List u8 -> List (List u8) -> List (List u8, List u8) -> List (List u8, (List u8, Module)) ->{Files, Diverge, Panic} Result (List (List u8, (List u8, Module))) (List u8) =
   \root stack imps done. case imps of
     { Nil -> Ok(done)
     | Cons(iq, rest) -> let (imp, q) = iq in
@@ -77,8 +78,9 @@ def visitAll : List u8 -> List (List u8) -> List (List u8, List u8) -> List (Lis
 -- Scope(public names by module, private names by module, the prelude's names, entry module).
 data Scope = Scope(List (List u8, List (List u8)), List (List u8, List (List u8)), List (List u8), List u8)
 
--- A module's resolver: Res(scope, module, its own names → internal, qualifier → module, imports).
-data Res = Res(Scope, List u8, List (List u8, List u8), List (List u8, List u8), List (List u8))
+-- A module's resolver: Res(scope, module, its own names → internal, qualifier → module, imports,
+-- its file, for the positions in its terms).
+data Res = Res(Scope, List u8, List (List u8, List u8), List (List u8, List u8), List (List u8), List u8)
 
 def lookupS : List u8 -> List (List u8, List u8) ->{Diverge} Option (List u8) =
   \k kvs. case kvs of
@@ -99,7 +101,7 @@ def internal : Scope -> List u8 -> Bool -> List u8 ->{Diverge} List u8 =
 
 def plain : Res -> List u8 ->{Diverge} List u8 =
   \r n. case r of
-    { Res(sc, self, own, quals, imported) -> case lookupS n own of
+    { Res(sc, self, own, quals, imported, file) -> case lookupS n own of
         { Some(i) -> i
         | None -> case sc of
             { Scope(pubs, privs, pre, entry) ->
@@ -110,7 +112,7 @@ def plain : Res -> List u8 ->{Diverge} List u8 =
 -- A name as written, maybe qualified: q.f, q.Type, q.Con, prelude.f.
 def name : Res -> List u8 ->{Diverge} List u8 =
   \r n. case r of
-    { Res(sc, self, own, quals, imported) ->
+    { Res(sc, self, own, quals, imported, file) ->
         let q = takeTo '.' n in let f = dropTo '.' n in
         if checker.isNil f then plain r n
         else case lookupS q quals of
@@ -147,10 +149,11 @@ def term : Res -> List (List u8) -> Term ->{Diverge} Term =
     { EVar(x) -> if checker.elem x bound then EVar(x) else EVar(plain r x)
     | EProj(e, o) -> (case unbox e of
         { EVar(q) -> (case r of
-            { Res(sc, self, own, quals, imported) ->
+            { Res(sc, self, own, quals, imported, file) ->
                 if not (checker.elem q bound) && (has q quals || string.equal q "prelude") then EVar(name r (append q (Cons('.', box o))))
                 else EProj(box (EVar(q)), o) })
         | e2 -> EProj(box (term r bound e2), o) })
+    | EAt(f, l, c, b) -> (case r of { Res(sc, self, own, quals, imported, file) -> EAt(file, l, c, box (term r bound (unbox b))) })
     | ELam(x, t, b) -> ELam(x, ty r t, box (term r (Cons(x, box bound)) (unbox b)))
     | EApp(f, a) -> EApp(box (term r bound (unbox f)), box (term r bound (unbox a)))
     | ELet(x, e, b) -> ELet(x, box (term r bound (unbox e)), box (term r (Cons(x, box bound)) (unbox b)))
@@ -189,15 +192,15 @@ def decl : Res -> Decl ->{Diverge} Decl =
     | DQueue(n, dn, len) -> DQueue(plain r n, name r dn, len) }
 
 -- A module's declarations and main, under program-wide names.
-def resolve : Scope -> (List u8, Module) ->{Diverge} (List Decl, Option Term) =
-  \sc nm. let (self, m) = nm in case m of
+def resolve : Scope -> (List u8, (List u8, Module)) ->{Diverge} (List Decl, Option Term) =
+  \sc nm. let (self, pm) = nm in let (path, m) = pm in case m of
     { Module(imps, ds, entry) ->
         let own = checker.concatMap (\pd. let (p, d) = pd in map (\n. (n, internal sc self p n)) (checker.declared d)) ds in
-        let r = Res(sc, self, own, map (\iq. let (i, q) = iq in (q, i)) imps, map (\iq. let (i, q) = iq in i) imps) in
+        let r = Res(sc, self, own, map (\iq. let (i, q) = iq in (q, i)) imps, map (\iq. let (i, q) = iq in i) imps, path) in
         (map (\pd. let (p, d) = pd in decl r d) ds, case entry of { Some(e) -> Some(term r Nil e) | None -> None }) }
 
-def namesBy : Bool -> List (List u8, Module) ->{Diverge} List (List u8, List (List u8)) =
-  \priv ms. map (\nm. let (n, m) = nm in case m of
+def namesBy : Bool -> List (List u8, (List u8, Module)) ->{Diverge} List (List u8, List (List u8)) =
+  \priv ms. map (\nm. let (n, pm) = nm in let (path, m) = pm in case m of
     { Module(imps, ds, entry) -> (n, checker.sFrom (checker.concatMap (\pd. let (p, d) = pd in if p == priv then checker.declared d else Nil) ds)) }) ms
 
 -- The file name without directory and .kl: the entry module's name.
@@ -208,7 +211,7 @@ def dropN : forall (a : Free). i64 -> List a ->{Diverge} List a =
   \n xs. if n <= 0 then xs else (case xs of { Nil -> Nil | Cons(x, rest) -> dropN (n -% 1) (unbox rest) })
 
 -- The program's verdict: every module's declarations under program-wide names, the entry's main.
-def judge : List u8 -> List (List u8, Module) ->{Files, Diverge, Panic} List u8 =
+def judge : List u8 -> List (List u8, (List u8, Module)) ->{Files, Diverge, Panic} List u8 =
   \entry ms. case load "selfhost/prelude.kl" of
     { Err(e) -> e
     | Ok(pre) -> case pre of

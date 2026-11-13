@@ -12,9 +12,12 @@
 --
 -- Errors are sticky: the first one is kept and checking goes on with placeholder types, so
 -- no function has to stop early. Constructs not handled yet give `unsupported: …` the same way.
+-- An error takes the position of the innermost EAt around where it was raised (the parser puts
+-- one on every expression and application, as keelc's does), unless one was raised before it.
 --
 -- The test suite (selfhostCheckChecks in ref/test/Native.hs) compares its verdicts with
--- keelc's on every .kl file in the repo, and selfhost/reject/ has one rejection per error
+-- keelc's on every .kl file in the repo, positions included (messages are its own), and
+-- selfhost/reject/ has one rejection per error
 -- kind. selfhost/check.kl loads the modules and resolves their names (Keel.Modules). A
 -- polymorphic definition is instantiated as f[τ̄; ε̄], with the effect arguments after the
 -- types as rows of Unit ->ε Unit. Not handled yet: var and references, bitdata, cells and
@@ -201,7 +204,28 @@ def showRow : List (List u8) ->{Diverge} List u8 =
 
 -- The verdict line keelc prints, then (for people) what went wrong.
 def errLine : List u8 -> List u8 ->{Diverge} List u8 =
-  \kind msg. append "error [" (append kind (append "]\n  " msg))
+  \kind msg. append "error [" (append kind (append "]: " msg))
+
+-- An error raised inside a term with no position yet gets the term's: file:line:col: error …
+-- (Keel.Check.atPos). "unsupported: …" stays as it is.
+def placeErr : List u8 -> i64 -> i64 -> Option (List u8) ->{Diverge, Panic} Option (List u8) =
+  \f l c er. case er of
+    { Some(m) -> if startsWith "error [" m then Some(append f (append ":" (append (string.fromInt l) (append ":" (append (string.fromInt c) (append ": " m)))))) else Some(m)
+    | None -> None }
+
+-- Pass 1's errors are sticky: only one raised inside the term (none before it) is placed.
+def placeSt : Option (List u8) -> List u8 -> i64 -> i64 -> St ->{Diverge, Panic} St =
+  \before f l c st. case before of
+    { Some(m) -> st
+    | None -> case st of { St(n, ts, es, used, lits, e) -> St(n, ts, es, used, lits, placeErr f l c e) } }
+
+def startsWith : List u8 -> List u8 -> Bool =
+  \p s. case p of
+    { Nil -> true
+    | Cons(x, pr) -> case s of { Nil -> false | Cons(y, sr) -> x == y && startsWith (unbox pr) (unbox sr) } }
+
+-- A term without its positions on top.
+def unAt : Term -> Term = \e. case e of { EAt(f, l, c, b) -> unAt (unbox b) | _ -> e }
 
 -- The first error wins.
 def orErr : Option (List u8) -> Option (List u8) -> Option (List u8) =
@@ -269,7 +293,7 @@ def builtinData : Unit -> List Decl = \u.
 -- The leading λs of a definition (at most 7, as Keel.Check.arity).
 def arity : Term -> i64 = \e. let n = lams e in if n < 7 then n else 7
 
-def lams : Term -> i64 = \e. case e of { ELam(x, t, b) -> 1 +% lams (unbox b) | _ -> 0 }
+def lams : Term -> i64 = \e. case e of { ELam(x, t, b) -> 1 +% lams (unbox b) | EAt(f, l, c, b) -> lams (unbox b) | _ -> 0 }
 
 -- §1.2, §4.2: is a type linear?
 def isLin : Sig -> Ty ->{Diverge} Bool =
@@ -709,7 +733,9 @@ def special : Unit -> List (List u8) = \u.
 
 def check : St -> Env -> Term -> Ty ->{Diverge, Panic} C =
   \st env tm ex. case tm of
-    { ELam(x, t, b) -> (case shallow st ex of
+    { EAt(f, l, c, e) -> (case check st env (unbox e) ex of
+        { C(e2, eff, st2) -> C(EAt(f, l, c, box e2), eff, placeSt (stErr st) f l c st2) })
+    | ELam(x, t, b) -> (case shallow st ex of
         { TFun(p, e, r) -> lamAgainst st env x t (unbox b) (unbox p) e (unbox r)
         | TLFun(p, e, r) -> lamAgainst st env x t (unbox b) (unbox p) e (unbox r)
         | _ -> checkBy st env tm ex })
@@ -790,7 +816,9 @@ def lamAgainst : St -> Env -> List u8 -> Ty -> Term -> Ty -> List (List u8) -> T
 
 def infer : St -> Env -> Term ->{Diverge, Panic} R =
   \st env tm. case tm of
-    { EVar(x) -> (case envLocal env x of
+    { EAt(f, l, c, e) -> (case infer st env (unbox e) of
+        { R(e2, t, eff, st2) -> R(EAt(f, l, c, box e2), t, eff, placeSt (stErr st) f l c st2) })
+    | EVar(x) -> (case envLocal env x of
         { Some(xt) -> let (x2, t) = xt in R(EVar(x2), t, Nil, st)
         | None -> case get x (sigDefs (envSig env)) of
             { Some(t) -> (case t of
@@ -1132,6 +1160,7 @@ def zonkTerm : St -> Term ->{Diverge, Panic} (Term, St) =
     | ECocase(d, tys, bs) -> let (bs2, st) = zonkAlts st (unbox bs) in (ECocase(d, box (map (\t. finalTy st t) (unbox tys)), box bs2), st)
     | EProj(e, o) -> let (e2, st) = zonkTerm st (unbox e) in (EProj(box e2, o), st)
     | EBox(e) -> let (e2, st) = zonkTerm st (unbox e) in (EBox(box e2), st)
+    | EAt(f, l, c, e) -> let (e2, st) = zonkTerm st (unbox e) in (EAt(f, l, c, box e2), st)
     | EUnbox(e) -> let (e2, st) = zonkTerm st (unbox e) in (EUnbox(box e2), st)
     | EPair(a, b) -> let (a2, st) = zonkTerm st (unbox a) in let (b2, st) = zonkTerm st (unbox b) in (EPair(box a2, box b2), st)
     | _ -> (tm, st) }
@@ -1190,7 +1219,8 @@ def registerPairOps : Unit -> List (List u8) = \u. string.split ' ' "write8 writ
 
 def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, Panic} Q =
   \s rec ctx tm. case tm of
-    { EVar(x) -> (case get x ctx of
+    { EAt(f, l, c, e) -> (case cinfer s rec ctx (unbox e) of { Q(t, eff, u, er) -> Q(t, eff, u, placeErr f l c er) })
+    | EVar(x) -> (case get x ctx of
         { Some(t) -> Q(t, allocOf s t, (if isLin s t then one x else Nil), None)
         | None -> case get x (sigDefs s) of
             { Some(t) -> (case t of
@@ -1379,7 +1409,7 @@ def bindIn : Sig -> List (List u8) -> map.Map (List u8) Ty -> List (List u8, Ty)
 
 -- The head and arguments of an application.
 def spine : Term -> List Term ->{Diverge} (Term, List Term) =
-  \tm args. case tm of { EApp(f, a) -> spine (unbox f) (Cons(unbox a, box args)) | _ -> (tm, args) }
+  \tm args. case tm of { EApp(f, a) -> spine (unbox f) (Cons(unbox a, box args)) | EAt(f, l, c, b) -> spine (unbox b) args | _ -> (tm, args) }
 
 def capp : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term -> Term -> Term ->{Diverge, Panic} Q =
   \s rec ctx tm f a.
@@ -1618,7 +1648,8 @@ def caseAlts : Sig -> List (List u8) -> map.Map (List u8) Ty -> List u8 -> List 
 -- Every term directly inside one (its children).
 def children : Term -> List Term =
   \tm. case tm of
-    { EConvert(t, e) -> ty1T (unbox e)
+    { EAt(f, l, c, e) -> ty1T (unbox e)
+    | EConvert(t, e) -> ty1T (unbox e)
     | EPrim(op, a, b) -> Cons(unbox a, box (ty1T (unbox b)))
     | EIf(c, a, b) -> Cons(unbox c, box Cons(unbox a, box (ty1T (unbox b))))
     | ELam(x, t, b) -> ty1T (unbox b)
@@ -1689,7 +1720,7 @@ def setHas : List u8 -> List (List u8) ->{Diverge} Bool =
 
 -- A definition's parameters (its leading λs) and body.
 def params : Term -> (List (List u8), Term) =
-  \tm. case tm of { ELam(x, t, b) -> let (ps, e) = params (unbox b) in (Cons(x, box ps), e) | _ -> (Nil, tm) }
+  \tm. case tm of { ELam(x, t, b) -> let (ps, e) = params (unbox b) in (Cons(x, box ps), e) | EAt(f, l, c, b) -> params (unbox b) | _ -> (Nil, tm) }
 
 -- What a local is: VPart(part?, k) for parameter k or a part of it, else VNone.
 data V = VNone | VPart(Bool, i64)
@@ -1765,7 +1796,8 @@ def dropL : forall (a : Free). i64 -> List a ->{Diverge} List a =
 -- A reference to a member of the group (directly, or through a let-bound name).
 def memberOf : List (List u8) -> TEnv -> Term ->{Diverge} Option (List u8) =
   \g env h. case h of
-    { EVar(x) -> (case env of { TEnv(vals, funs, assigned) ->
+    { EAt(f, l, c, b) -> memberOf g env (unbox b)
+    | EVar(x) -> (case env of { TEnv(vals, funs, assigned) ->
         if elem x g && not (has x vals) then Some(x) else get x funs })
     | ETyApp(f, tys) -> if elem f g then Some(f) else None
     | _ -> None }
@@ -1773,7 +1805,8 @@ def memberOf : List (List u8) -> TEnv -> Term ->{Diverge} Option (List u8) =
 -- A parameter or a part of one, through unbox.
 def valueOf : TEnv -> Term ->{Diverge} V =
   \env e. case e of
-    { EUnbox(x) -> valueOf env (unbox x)
+    { EAt(f, l, c, b) -> valueOf env (unbox b)
+    | EUnbox(x) -> valueOf env (unbox x)
     | EVar(x) -> (case env of { TEnv(vals, funs, assigned) -> case get x vals of { Some(v) -> v | None -> VNone } })
     | _ -> VNone }
 
@@ -1902,9 +1935,9 @@ def checkCore : List Decl -> List Decl -> Term ->{Diverge, Panic} List u8 =
                           { Some(m) -> Some(m)
                           | None ->
                               let eff = sDelete "Alloc" eff0 in
-                              if not (isNil eff) then Some(errLine "Unhandled" (append "def " (append f (append " has effects " (showSet eff)))))
+                              atBody e (if not (isNil eff) then Some(errLine "Unhandled" (append "def " (append f (append " has effects " (showSet eff)))))
                               else if sub t2 body then None
-                              else Some(mismatch body t2) } } })
+                              else Some(mismatch body t2)) } } })
             | _ -> None }) user in
           case defErr of
             { Some(m) -> m
@@ -1940,6 +1973,10 @@ def polyRecursion : List Decl ->{Diverge, Panic} Option (List u8) =
 
 def tyApps : Term ->{Diverge} List (List u8, List Ty) =
   \tm. append (case tm of { ETyApp(f, tys) -> Cons((f, unbox tys), box Nil) | _ -> Nil }) (concatMap (\c. tyApps c) (children tm))
+
+-- Errors about a definition as a whole point at its body (Keel.Check.atPos').
+def atBody : Term -> Option (List u8) ->{Diverge, Panic} Option (List u8) =
+  \e er. case e of { EAt(f, l, c, b) -> placeErr f l c er | _ -> er }
 
 -- The verdict on a program: the prelude's declarations, the entry module's, and its prog.
 def verdict : List Decl -> List (Bool, Decl) -> Option Term ->{Diverge, Panic} List u8 =

@@ -376,7 +376,11 @@ selfhostCheckChecks dir = do
           Nothing -> pure []
           Just want -> do
             (_, printed, _) <- readCreateProcessWithExitCode (shell ("echo " ++ f ++ " | " ++ exe)) ""
-            let got = takeWhile (/= '\n') printed
+            -- Up to the kind: the messages are the checker's own.
+            let line1 = takeWhile (/= '\n') printed
+                got = case breakOn "error [" line1 of
+                  Just (pre, rest) -> pre ++ takeWhile (/= ']') rest ++ "]"
+                  Nothing -> line1
             pure [if "unsupported:" `isPrefixOf` got then Nothing else Just (f, want, got)]
       let compared = [r | Just r <- results]
           bad = [(f, w, g) | (f, w, g) <- compared, w /= g]
@@ -386,7 +390,10 @@ selfhostCheckChecks dir = do
         ["FAIL selfhost/prelude.kl is not keelc's prelude (Keel.Prelude.preludeSource)" | prelude /= preludeSource]
           ++ ["FAIL selfhost/check.kl disagrees with keelc on " ++ f ++ ": keelc says " ++ w ++ ", the checker " ++ g | (f, w, g) <- bad]
   where
-    -- The type system's verdict, without position or message; Nothing when the file doesn't
+    breakOn pat s = case [(take i s, drop i s) | i <- [0 .. length s - length pat], pat `isPrefixOf` drop i s] of
+      r : _ -> Just r
+      [] -> Nothing
+    -- The type system's verdict, with the error's position but not its message; Nothing when the file doesn't
     -- load. Errors come from the whole pipeline; main's type and effect from the elaborated
     -- core, before optimization (inlining can drop an effect, as square's Alloc in
     -- examples/hello.kl).
@@ -394,7 +401,7 @@ selfhostCheckChecks dir = do
       loadModules f >>= \case
         Left _ -> pure Nothing
         Right (surface, _) -> pure . Just $ case inferProgram surface >>= \core -> compile core >> checkProgram (elaborate core) of
-          Left e -> "error [" ++ show (errKind e) ++ "]"
+          Left (TypeError k _ p) -> maybe "" (\(pf, l, c) -> pf ++ ":" ++ show l ++ ":" ++ show c ++ ": ") p ++ "error [" ++ show k ++ "]"
           Right (t, eff) -> "ok: main : " ++ prettyTy t ++ (if null (prettyEff eff) then "" else " ! " ++ prettyEff eff)
     klFiles d = do
       entries <- map (d </>) <$> listDirectory d
