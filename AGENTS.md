@@ -20,8 +20,11 @@ messages, and examples that the test suite runs.
   compared with the evaluator and checked for leaks (`live=0`), then RISC-V under QEMU. x86-64
   runs too when `KEEL_X86_HOST` names an ssh host (ask the user for it); otherwise it's skipped
   with a message. Report results as the suite prints them, skipped parts included.
-- **Two parsers:** the test suite checks that `ref/selfhost/parser.kl` prints the same tree as
-  `ref/src/Keel/Parser.hs` for every test file, so a syntax change goes into both.
+- **Self-hosted front end:** the test suite checks that `ref/selfhost/parser.kl` prints the
+  same tree as `ref/src/Keel/Parser.hs`, `ref/selfhost/check.kl` reaches `keelc`'s verdict,
+  and `ref/selfhost/run.kl` prints what `keelc run` prints for every test file; so a syntax
+  change goes into both parsers, and a semantic change into `ref/selfhost/eval.kl` as well as
+  `ref/src/Keel/Eval.hs`.
 - **Specs:** a language change also updates `spec/surface.md` (syntax) or `spec/core.md`
   (semantics). Add new mistakes agents make to the skill's table.
 - **The hook reinstalls keelc:** with `git config core.hooksPath .githooks`, a commit or merge (pull, fast-forward) that
