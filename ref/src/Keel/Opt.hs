@@ -33,7 +33,7 @@ import Data.List (intercalate)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
-import Keel.Check (localTypes, recursiveGroups, typeOfClosed)
+import Keel.Check (buildSig, localTypesIn, recursiveGroups, typeOfClosedIn)
 import Keel.Syntax
 
 optimize :: Program -> Program
@@ -92,7 +92,9 @@ liftClosed (Program decls main) = Program (decls' ++ [Def f t e | (f, t, e) <- r
     liftDecl d = case d of
       Def f t e -> Def f t <$> liftIn e
       _ -> pure d
-    liftIn e = go (localTypes decls e) e
+    -- The signature is built once: building it is a pass over every declaration.
+    sig = buildSig decls
+    liftIn e = go (either (const M.empty) (`localTypesIn` e) sig) e
     go tys tm = case spine tm of
       -- The elaborator names the function before effectful arguments (let a = f in a …).
       _ | Let x (Var g) b <- tm, g `S.member` globals -> go tys (replaceVars (M.singleton x (Var g)) b)
@@ -109,7 +111,7 @@ liftClosed (Program decls main) = Program (decls' ++ [Def f t e | (f, t, e) <- r
       case mapM (`M.lookup` tys) captured of
         Just cts
           | lifts
-          , Right t <- typeOfClosed decls (foldr (uncurry Lam) a' (zip captured cts)) -> do
+          , Right t <- sig >>= (`typeOfClosedIn` foldr (uncurry Lam) a' (zip captured cts)) -> do
               (n, acc) <- get
               let name = "lam'" ++ show n
               put (n + 1, (name, t, foldr (uncurry Lam) a' (zip captured cts)) : acc)

@@ -28,11 +28,13 @@ terminatingGroups decls groups = M.map (\g -> if g `S.member` total then S.empty
           arity f = length (fst (params (fromMaybe UnitLit (M.lookup f defs))))
           -- ponytail: tries every choice of positions; a group with more than 4096 stays diverging.
           choices = sequence [[(f, i) | i <- [0 .. arity f - 1]] | f <- members]
-       in product (map arity members) <= 4096 && any (\c -> all (decreases g (M.fromList c)) members) choices
-    decreases g idx f =
+          -- Each member's parameters, body and starting env, once: the same for every choice.
+          info = M.fromList [(f, start f) | f <- members]
+       in product (map arity members) <= 4096 && any (\c -> all (decreases g info (M.fromList c)) members) choices
+    start f =
       let (ps, body) = params (fromMaybe UnitLit (M.lookup f defs))
-          env = Env (M.fromList [(p, Just (False, k)) | (k, p) <- zip [0 ..] ps]) M.empty (assigned body)
-       in walk g idx (idx M.! f) env body
+       in (body, Env (M.fromList [(p, Just (False, k)) | (k, p) <- zip [0 ..] ps]) M.empty (assigned body))
+    decreases g info idx f = let (body, env) = info M.! f in walk g idx (idx M.! f) env body
 
 -- | Every local variable, and what it is: a parameter or a part of one (Just (True, k): a part
 -- of parameter k), or another name for a group member (in eFuns).

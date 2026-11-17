@@ -74,8 +74,7 @@ main = do
       job <- jobFor rest
       case cmd of
         "check" -> do
-          (sources, core) <- load (jobEntry job)
-          mono <- orDie (showErr sources (typecheck core))
+          (sources, _, mono) <- loadChecked (jobEntry job)
           (t, eff) <- orDie (showErr sources (checkProgram mono))
           putStrLn ("ok: main : " ++ prettyTy t ++ (if null (prettyEff eff) then "" else " ! " ++ prettyEff eff))
         "run" -> do
@@ -183,11 +182,15 @@ newProject name = do
 -- | Load the entry file with its imports, and infer: the sources (for error messages) and the
 -- λK₃ program the core pipeline takes. Core errors are reported here too, with positions.
 load :: FilePath -> IO (M.Map FilePath String, Program)
-load f = do
+load f = (\(sources, core, _) -> (sources, core)) <$> loadChecked f
+
+-- | Also the monomorphic program the check produced (keelc check needs nothing more).
+loadChecked :: FilePath -> IO (M.Map FilePath String, Program, Program)
+loadChecked f = do
   (surface, sources) <- orDie =<< loadModules f
   core <- orDie (showErr sources (inferProgram surface))
-  _ <- orDie (showErr sources (typecheck core))
-  pure (sources, core)
+  mono <- orDie (showErr sources (typecheck core))
+  pure (sources, core, mono)
 
 -- | With -g, cc turns the line table into DWARF and runs dsymutil (OUT.dSYM), so lldb can
 -- break on and step through .kl lines.

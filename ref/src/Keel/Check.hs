@@ -4,7 +4,7 @@
 --
 -- @infer@ implements Γ ⊢ e ⇒ τ ! ε ▷ U: it synthesizes a type, the effect of evaluating the
 -- term, and the set U of linear local variables the term uses.
-module Keel.Check (ErrKind (..), TypeError (..), atPos, checkProgram, localTypes, recursiveGroups, typeOfClosed) where
+module Keel.Check (ErrKind (..), TypeError (..), Sig, atPos, buildSig, checkProgram, localTypes, localTypesIn, recursiveGroups, typeOfClosed, typeOfClosedIn) where
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Applicative ((<|>))
@@ -182,8 +182,11 @@ checkProgram (Program decls main) = do
 -- | The type of a closed term (no free locals) in a program's signature; used by the optimizer
 -- to give lifted λs their declared types.
 typeOfClosed :: [Decl] -> Term -> TC Ty
-typeOfClosed decls tm = do
-  sig <- buildSig decls
+typeOfClosed decls tm = buildSig decls >>= (`typeOfClosedIn` tm)
+
+-- | The same with the signature built once (it costs a pass over every declaration).
+typeOfClosedIn :: Sig -> Term -> TC Ty
+typeOfClosedIn sig tm = do
   (t, _, _) <- infer sig S.empty M.empty tm
   pure t
 
@@ -345,7 +348,7 @@ buildSig userDecls = do
       ops = [(op, (l, a, r)) | (l, os) <- effs, (op, a, r) <- os]
       labels = map fst effs ++ [panicE, divergeE, allocE]
       names xs = map fst xs
-      unique what ns = when (length ns /= length (nub ns)) $ err BadDecl ("duplicate " ++ what ++ " name")
+      unique what ns = when (length ns /= S.size (S.fromList ns)) $ err BadDecl ("duplicate " ++ what ++ " name")
   unique "type" (names datas ++ names codatas)
   unique "constructor" (names cons)
   unique "def" (names defs)
