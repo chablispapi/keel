@@ -246,6 +246,15 @@ the size of the assembly. Of the 479,000 instructions, the inlined reference-cou
 36 copies of `std.map`'s `balance`. `build` still type-checks twice (in `load` and in the
 back end's `prepareAt`), about 0.4 s.
 
+**Identical code folding** (`Keel.Fold`, 2026-11-17), after range analysis in `prepareAt`, so
+every back end gets it (debug builds skip it, to keep one function per definition in the line
+table). Lowered functions that are equal up to local names and up to the folding of the
+functions they reference are emitted once, using the partition refinement of linkers' ICF.
+The interrupt handler is never folded. On `selfhost/repl.kl`, 787 of 3,043 functions fold.
+The assembly shrinks by 16.6%, to 465,672 lines, and the build drops from 7.0 to 6.4 s. 14
+copies of `std.map`'s `balance` become one. So do optimizer specializations that came out
+identical, which merging by memory layout would have missed.
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and

@@ -26,6 +26,7 @@ import Data.Text.Encoding qualified as TE
 import Numeric (showOct)
 import Keel.Asm qualified as K
 import Keel.Check (checkProgram)
+import Keel.Fold (fold)
 import Keel.Lower
 import Keel.Runtime qualified as R
 import Keel.Range (ranges)
@@ -61,7 +62,7 @@ prepareAt word debug p = do
   checked <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram checked)
   let mono = resolveWord word checked
-  lp <- ranges <$> lower word mono
+  lp <- (if debug then id else fold) . ranges <$> lower word mono
   let Program decls _ = mono
   pure (optionDecl : decls, resolveTyWord word t, lp)
 
