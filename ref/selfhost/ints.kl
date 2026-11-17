@@ -1,0 +1,71 @@
+-- Integers as the self-hosted interpreter holds them: an i64 bit pattern plus a width. The
+-- results match the reference evaluator (ref/src/Keel/Eval.hs, prim and Convert), which
+-- computes on unbounded Integers.
+--
+--   import ints
+--   ints.showInt (ints.widthOf "u8") 255
+
+import std.string
+
+-- W(signed, bits): bits is 8, 16, 32 or 64.
+data W = W(Bool, i64)
+
+-- "i8" "i16" "i32" "i64" "u8" "u16" "u32" "u64", and "usize" as u64.
+def widthOf : List u8 -> W =
+  \n. if string.equal n "usize" then W(false, 64)
+      else case n of
+        { Cons(c, rest) -> W(c == 'i', bitsOf (unbox rest))
+        | Nil -> W(false, 64) }
+
+private def bitsOf : List u8 -> i64 =
+  \s. if string.equal s "8" then 8
+      else if string.equal s "16" then 16
+      else if string.equal s "32" then 32
+      else 64
+
+-- The canonical bit pattern of x at width w: the low bits, sign- or zero-extended.
+def norm : W -> i64 -> i64 =
+  \w x. case w of
+    { W(s, bits) ->
+        if bits == 64 then x
+        else let sh = 64 -% bits in
+          if s then (x lsl sh) lsr sh
+          else (((x as u64) lsl (sh as u64)) lsr (sh as u64)) as i64 }
+
+-- The count of a shift, clamped to [0, 64]: signed counts are compared as signed, unsigned
+-- ones as unsigned (so a huge u64 count is 64).
+private def clampCount : W -> i64 -> i64 =
+  \w b. case w of
+    { W(s, bits) ->
+        if s then (if b < 0 then 0 else if b > 64 then 64 else b)
+        else if (b as u64) > 64 then 64 else b }
+
+-- Decimal digits of an unsigned n, most significant first, onto acc.
+private def digitsU64 : u64 -> List u8 ->{Diverge, Panic} List u8 =
+  \n acc. let d = Cons((n % 10 + 48) as u8, box acc) in if n < 10 then d else digitsU64 (n / 10) d
+
+-- Decimal text: signed widths as signed numbers, unsigned ones from the bit pattern.
+def showInt : W -> i64 ->{Diverge, Panic} List u8 =
+  \w x. case w of
+    { W(s, bits) ->
+        if s && x < 0 then Cons(45, box (digitsU64 (((0 - (x + 1)) as u64) + 1) Nil))
+        else digitsU64 (x as u64) Nil }
+
+-- a < b at width w.
+def ltInt : W -> i64 -> i64 -> Bool =
+  \w a b. case w of
+    { W(s, bits) -> if s then a < b else (a as u64) < (b as u64) }
+
+-- a << b at width w: a count of 64 or more gives 0; the result wraps to the width.
+def shl : W -> i64 -> i64 -> i64 =
+  \w a b. let c = clampCount w b in
+    if c >= 64 then 0 else norm w (a lsl c)
+
+-- a >> b at width w: arithmetic on signed widths, logical on unsigned ones.
+def shr : W -> i64 -> i64 -> i64 =
+  \w a b. case w of
+    { W(s, bits) ->
+        let c = clampCount w b in
+        if c >= 64 then (if s && a < 0 then -1 else 0)
+        else if s then a lsr c
+        else ((a as u64) lsr (c as u64)) as i64 }

@@ -1,0 +1,317 @@
+-- The self-hosted evaluator: Keel's semantics on the elaborated core checker.program returns,
+-- ported from Keel.Eval (ref/src/Keel/Eval.hs, the authority). Call by value, left to right.
+-- spec/interpreter.md has the design.
+--
+-- eval is plain recursion. keelc compiles tail calls as jumps, so the calls marked "tail" below
+-- keep an interpreted tail call in constant native stack: don't wrap their results.
+--
+-- Integers are their bit pattern in an i64 with their width (ints.kl). Globals live in a map
+-- outside every closure's environment; a global that isn't a λ is evaluated where it is used
+-- (top-level bodies are effect-free, the checker sees to it).
+
+import std.string
+import std.map
+import std.array
+import parser
+import checker
+import ints
+
+data Value =
+    VUnit | VInt(W, i64) | VFloat(f64) | VBool(Bool)
+  | VCon(List u8, Box (List Value)) | VBox(Box Value) | VPair(Box Value, Box Value)
+  | VClo(Box (List (List u8, Value)), List u8, Term)
+  | VCodata(Box (List (List u8, Value)), List Alt)
+  | VArray(Box (Array Value))
+
+-- A handler frame: the clauses Alt(operation, (parameter), body) and the env at the handle.
+data H = H(List Alt, List (List u8, Value))
+
+-- A value, or a panic of the interpreted program; either way the cell words.
+data Out = Val(Value, Array i64) | Bad(List u8, Array i64)
+
+-- Globals: every definition's body by name.
+data G = G(map.Map (List u8) Term)
+
+def lookupEnv : List u8 -> List (List u8, Value) -> Option Value =
+  \x env. case env of
+    { Nil -> None
+    | Cons(kv, rest) -> let (k, v) = kv in if string.equal k x then Some(v) else lookupEnv x (unbox rest) }
+
+def global : G -> List u8 -> Option Term = \g x. case g of { G(m) -> map.lookup string.compare x m }
+
+def isLocal : List u8 -> List (List u8, Value) -> Bool =
+  \x env. case lookupEnv x env of { Some(v) -> true | None -> false }
+
+def isGlobal : G -> List u8 -> Bool = \g x. case global g x of { Some(e) -> true | None -> false }
+
+def bindAll : List (List u8) -> List Value -> List (List u8, Value) -> List (List u8, Value) =
+  \xs vs env. case xs of
+    { Nil -> env
+    | Cons(x, xr) -> case vs of
+        { Nil -> env
+        | Cons(v, vr) -> Cons((x, v), box (bindAll (unbox xr) (unbox vr) env)) } }
+
+def int : W -> i64 -> Value = \w x. VInt(w, x)
+def i64W : Unit -> W = \u. W(true, 64)
+
+-- The evaluator ------------------------------------------------------------------------------
+
+def eval : G -> List H -> List (List u8, Value) -> Term -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+  \g hs env tm cells. case tm of
+    { EAt(f, l, c, e) -> eval g hs env (unbox e) cells -- tail
+    | EVar(x) -> (case lookupEnv x env of
+        { Some(v) -> Val(v, cells)
+        | None -> case global g x of
+            { Some(e) -> eval g Nil Nil e cells -- tail
+            | None -> Bad(append "stuck: unbound " x, cells) } })
+    | ETyApp(f, tys) ->
+        if isLocal f env || isGlobal g f then eval g hs env (EVar(f)) cells
+        else Bad(append "unsupported: " f, cells)
+    | EUnit -> Val(VUnit, cells)
+    | EBool(b) -> Val(VBool(b), cells)
+    | ENum(neg, mag, it) -> let w = widthOf it in Val(VInt(w, norm w (if neg then 0 -% (mag as i64) else mag as i64)), cells)
+    | EFloat(neg, m, e) -> Bad("unsupported: floats", cells)
+    | EConvert(to, e) -> (case eval g hs env (unbox e) cells of
+        { Val(v, cells) -> (case v of
+            { VInt(w, x) -> if string.equal to "f64" then Bad("unsupported: floats", cells) else (let tw = widthOf to in Val(VInt(tw, norm tw x), cells))
+            | _ -> Bad("unsupported: floats", cells) })
+        | bad -> bad })
+    | EPrim(op, a, b) -> (case eval g hs env (unbox a) cells of
+        { Val(va, cells) -> (case eval g hs env (unbox b) cells of
+            { Val(vb, cells) -> prim op va vb cells
+            | bad -> bad })
+        | bad -> bad })
+    | EIf(c, a, b) -> (case eval g hs env (unbox c) cells of
+        { Val(v, cells) -> (case v of
+            { VBool(t) -> if t then eval g hs env (unbox a) cells else eval g hs env (unbox b) cells -- tail
+            | _ -> Bad("stuck: if on a non-Bool", cells) })
+        | bad -> bad })
+    | ELam(x, t, b) -> Val(VClo(box env, x, unbox b), cells)
+    | EApp(f, a) -> apply g hs env (unbox f) (unbox a) cells -- tail
+    | ELet(x, e, b) -> (case eval g hs env (unbox e) cells of
+        { Val(v, cells) -> eval g hs (Cons((x, v), box env)) (unbox b) cells -- tail
+        | bad -> bad })
+    | ESeq(a, b) -> (case eval g hs env (unbox a) cells of
+        { Val(v, cells) -> eval g hs env (unbox b) cells -- tail
+        | bad -> bad })
+    | ECon(c, tys, args) -> (case evalAll g hs env (unbox args) cells of
+        { Vals(vs, cells) -> Val(VCon(c, box vs), cells)
+        | Stop(m, cells) -> Bad(m, cells) })
+    | ECase(e, alts) -> (case eval g hs env (unbox e) cells of
+        { Val(v, cells) -> (case v of
+            { VCon(c, vs) -> (case pick c (unbox alts) of
+                { Some(al) -> (case al of { Alt(k, xs, body) -> eval g hs (bindAll xs (unbox vs) env) body cells }) -- tail
+                | None -> Bad(append "stuck: no alternative for " c, cells) })
+            | _ -> Bad("stuck: case on a non-constructor", cells) })
+        | bad -> bad })
+    | EBox(e) -> (case eval g hs env (unbox e) cells of { Val(v, cells) -> Val(VBox(box v), cells) | bad -> bad })
+    | EUnbox(e) -> (case eval g hs env (unbox e) cells of
+        { Val(v, cells) -> (case v of { VBox(x) -> Val(unbox x, cells) | _ -> Bad("stuck: unbox of a non-box", cells) })
+        | bad -> bad })
+    | EPair(a, b) -> (case eval g hs env (unbox a) cells of
+        { Val(va, cells) -> (case eval g hs env (unbox b) cells of
+            { Val(vb, cells) -> Val(VPair(box va, box vb), cells)
+            | bad -> bad })
+        | bad -> bad })
+    | ELetPair(x, y, e, b) -> (case eval g hs env (unbox e) cells of
+        { Val(v, cells) -> (case v of
+            { VPair(va, vb) -> eval g hs (Cons((y, unbox vb), box Cons((x, unbox va), box env))) (unbox b) cells -- tail
+            | _ -> Bad("stuck: let-pair of a non-pair", cells) })
+        | bad -> bad })
+    | EHandle(l, body, cs) -> eval g (Cons(H(unbox cs, env), box hs)) env (unbox body) cells
+    | ECocase(d, tys, bs) -> Val(VCodata(box env, unbox bs), cells)
+    | EProj(e, o) -> (case eval g hs env (unbox e) cells of
+        { Val(v, cells) -> (case v of
+            { VCodata(cenv, bs) -> (case pick o bs of
+                { Some(al) -> (case al of { Alt(k, xs, body) -> eval g hs (unbox cenv) body cells }) -- tail
+                | None -> Bad(append "stuck: no observation " o, cells) })
+            | _ -> Bad("stuck: observation of a non-codata value", cells) })
+        | bad -> bad })
+    | _ -> Bad("stuck: surface construct in core", cells) }
+
+-- The alternative for constructor c, else the _ one, in source order.
+def pick : List u8 -> List Alt -> Option Alt =
+  \c alts. case firstAlt c alts of { Some(a) -> Some(a) | None -> firstAlt "_" alts }
+
+def firstAlt : List u8 -> List Alt -> Option Alt =
+  \c alts. case alts of
+    { Nil -> None
+    | Cons(al, rest) -> case al of { Alt(k, xs, b) -> if string.equal k c then Some(al) else firstAlt c (unbox rest) } }
+
+data Vs = Vals(List Value, Array i64) | Stop(List u8, Array i64)
+
+def evalAll : G -> List H -> List (List u8, Value) -> List Term -> Array i64 ->{Diverge, Panic, IO, Input} Vs =
+  \g hs env ts cells. case ts of
+    { Nil -> Vals(Nil, cells)
+    | Cons(t, rest) -> case eval g hs env t cells of
+        { Val(v, cells) -> (case evalAll g hs env (unbox rest) cells of
+            { Vals(vs, cells) -> Vals(Cons(v, box vs), cells)
+            | stop -> stop })
+        | Bad(m, cells) -> Stop(m, cells) } }
+
+-- f a: an operation when f names one (not a local or a global), else a closure call.
+def apply : G -> List H -> List (List u8, Value) -> Term -> Term -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+  \g hs env f a cells. case opName g env f of
+    { Some(op) -> (case eval g hs env a cells of
+        { Val(v, cells) -> perform g hs op v cells -- tail
+        | bad -> bad })
+    | None -> case eval g hs env f cells of
+        { Val(vf, cells) -> (case eval g hs env a cells of
+            { Val(va, cells) -> (case vf of
+                -- The body runs under the handlers active at the call (deep handlers).
+                { VClo(cenv, x, body) -> eval g hs (Cons((x, va), cenv)) body cells -- tail
+                | _ -> Bad("stuck: application of a non-closure", cells) })
+            | bad -> bad })
+        | bad -> bad } }
+
+def opName : G -> List (List u8, Value) -> Term -> Option (List u8) =
+  \g env f. case f of
+    { EAt(p, l, c, e) -> opName g env (unbox e)
+    | EVar(x) -> if isLocal x env || isGlobal g x then None else Some(x)
+    | _ -> None }
+
+-- The innermost handler for op runs its clause with the handlers outside it, in the env at
+-- its handle plus the parameter; the clause's value is the operation's result.
+def perform : G -> List H -> List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+  \g hs op v cells. case hs of
+    { Nil -> machine op v cells
+    | Cons(h, outer) -> case h of
+        { H(cs, henv) -> case firstAlt op cs of
+            { Some(al) -> (case al of { Alt(k, xs, body) -> eval g (unbox outer) (bindAll xs (Cons(v, box Nil)) henv) body cells }) -- tail
+            | None -> perform g (unbox outer) op v cells } } }
+
+-- Operations no handler caught.
+def machine : List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+  \op v cells.
+    if string.equal op "out" then (case v of { VInt(w, x) -> print (showInt w x); putc('\n'); Val(VUnit, cells) | _ -> Bad("stuck: out", cells) })
+    else if string.equal op "putc" then (case v of { VInt(w, x) -> putc(x as u8); Val(VUnit, cells) | _ -> Bad("stuck: putc", cells) })
+    else if string.equal op "getc" then Val(VInt(i64W (), getc ()), cells)
+    else if string.equal op "%cellLoad" then (case v of
+      { VInt(w, k) -> Val(VInt(W(false, 64), array.get cells k), cells)
+      | _ -> Bad("stuck: %cellLoad", cells) })
+    else if string.equal op "%cellStore" then (case v of
+      { VPair(k, x) -> (case (unbox k, unbox x) of
+          { (VInt(wk, i), VInt(wx, y)) -> Val(VUnit, array.set cells i y)
+          | _ -> Bad("stuck: %cellStore", cells) })
+      | _ -> Bad("stuck: %cellStore", cells) })
+    else Bad(append "unhandled operation " (append op " (no device memory in the evaluator)"), cells)
+
+-- Primitives ----------------------------------------------------------------------------------
+
+def prim : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
+  \op a b cells. case (a, b) of
+    { (VInt(w, x), VInt(w2, y)) ->
+        if string.equal op "==" then Val(VBool(x == y), cells)
+        else if string.equal op "<" then Val(VBool(ltInt w x y), cells)
+        else if string.equal op "land" then Val(VInt(w, x land y), cells)
+        else if string.equal op "lor" then Val(VInt(w, x lor y), cells)
+        else if string.equal op "lxor" then Val(VInt(w, x lxor y), cells)
+        else if string.equal op "lsl" then Val(VInt(w, shl w x y), cells)
+        else if string.equal op "lsr" then Val(VInt(w, shr w x y), cells)
+        else (case op of
+          { Cons(base, suffix) -> arith base (unbox suffix) w x y cells
+          | Nil -> Bad("stuck: primitive", cells) })
+    | (VBool(x), VBool(y)) -> if string.equal op "==" then Val(VBool(x == y), cells) else Bad("stuck: primitive on Bool", cells)
+    | _ -> Bad("unsupported: floats", cells) }
+
+-- Integer arithmetic, as Eval.hs: the exact result, range-checked against the width, then the
+-- operator's mode: checked (panic), % (wrap), | (saturate) or ? (Option).
+def arith : u8 -> List u8 -> W -> i64 -> i64 -> Array i64 ->{Diverge, Panic} Out =
+  \base suffix w x y cells.
+    if (base == '/' || base == '%') && y == 0 then Bad("division by zero", cells)
+    else
+      let exact = exactOf base w x y in
+      let fits = case exact of { Some(r) -> inRange w r | None -> false } in
+      if fits then
+        (let r = case exact of { Some(r) -> r | None -> 0 } in
+         if string.equal suffix "?" then Val(VCon("Some", box Cons(VInt(w, r), box Nil)), cells) else Val(VInt(w, r), cells))
+      else if string.equal suffix "?" then Val(VCon("None", box Nil), cells)
+      else if string.equal suffix "%" then Val(VInt(w, norm w (wrapOf base x y)), cells)
+      else if string.equal suffix "|" then Val(VInt(w, saturate base w x y exact), cells)
+      else Bad(append "arithmetic overflow: " (append (showInt w x) (append (symOf base) (append (showInt w y) (append " in " (wName w))))), cells)
+
+-- The result in the 64-bit domain (signed for every width but u64), or None when it doesn't
+-- fit there. Narrower widths are range-checked afterwards.
+def exactOf : u8 -> W -> i64 -> i64 ->{Panic} Option i64 =
+  \base w x y. case w of
+    { W(signed, bits) ->
+        if not signed && bits == 64 then
+          (let ux = x as u64 in let uy = y as u64 in
+           case (if base == '+' then ux +? uy else if base == '-' then ux -? uy else if base == '*' then ux *? uy
+                 else if base == '/' then Some(ux / uy) else Some(ux % uy)) of
+             { Some(r) -> Some(r as i64) | None -> None })
+        else if base == '+' then x +? y
+        else if base == '-' then x -? y
+        else if base == '*' then x *? y
+        else if x == minI64 () && y == 0 -% 1 then None
+        else if base == '/' then Some(x / y)
+        else Some(x % y) }
+
+def minI64 : Unit -> i64 = \u. 1 lsl 63
+
+def wrapOf : u8 -> i64 -> i64 -> i64 =
+  \base x y. if base == '+' then x +% y else if base == '-' then x -% y else x *% y
+
+-- Saturate toward the side the exact result lies on.
+def saturate : u8 -> W -> i64 -> i64 -> Option i64 -> i64 =
+  \base w x y exact.
+    let (lo, hi) = bounds w in
+    case exact of
+      { Some(r) -> if r < lo then lo else hi
+      | None -> case w of
+          { W(signed, bits) ->
+              if not signed && bits == 64 then (if base == '-' then 0 else 0 -% 1)
+              else if base == '+' then (if y > 0 then hi else lo)
+              else if base == '-' then (if y < 0 then hi else lo)
+              else if (x < 0) == (y < 0) then hi else lo } }
+
+-- The range of a width narrower than 64 bits (in the signed 64-bit domain).
+def bounds : W -> (i64, i64) =
+  \w. case w of
+    { W(signed, bits) ->
+        if bits >= 64 then (minI64 (), (minI64 ()) -% 1)
+        else if signed then (0 -% (1 lsl (bits -% 1)), (1 lsl (bits -% 1)) -% 1)
+        else (0, (1 lsl bits) -% 1) }
+
+def inRange : W -> i64 -> Bool =
+  \w r. case w of { W(signed, bits) -> if bits >= 64 then true else (let (lo, hi) = bounds w in r >= lo && r <= hi) }
+
+def symOf : u8 -> List u8 =
+  \b. if b == '+' then " + " else if b == '-' then " - " else if b == '*' then " * " else if b == '/' then " / " else " % "
+
+def wName : W ->{Diverge, Panic} List u8 =
+  \w. case w of { W(signed, bits) -> Cons(if signed then 'i' else 'u', box (string.fromInt bits)) }
+
+-- Showing a value as keelc run's `result:` line does.
+def show : Value ->{Diverge, Panic} List u8 =
+  \v. case v of
+    { VUnit -> "()"
+    | VInt(w, x) -> showInt w x
+    | VFloat(d) -> "<float>"
+    | VBool(b) -> if b then "true" else "false"
+    | VClo(e, x, b) -> "<closure>"
+    | VCon(c, vs) -> (case unbox vs of
+        { Nil -> c
+        | more -> append c (append "(" (append (string.join ", " (map show more)) ")")) })
+    | VBox(a) -> append "box " (show (unbox a))
+    | VPair(a, b) -> append "(" (append (show (unbox a)) (append ", " (append (show (unbox b)) ")")))
+    | VCodata(e, bs) -> "<codata>"
+    | VArray(xs) -> append "[" (append (string.join ", " (map show (array.toList (unbox xs)))) "]") }
+
+-- Running a program ---------------------------------------------------------------------------
+
+-- The cell area's initial words, slot by slot (Syntax.cellInits).
+def cellInits : List Decl ->{Diverge} Array i64 =
+  \ds. prelude.foldl (\arr d. case d of
+    { DCell(n, it, isArr, len, v) -> pushN arr (if isArr then len as i64 else 1) (v as i64)
+    | _ -> arr }) array.empty ds
+
+def pushN : Array i64 -> i64 -> i64 ->{Diverge} Array i64 =
+  \arr n v. if n <= 0 then arr else pushN (array.push arr v) (n -% 1) v
+
+def globalsOf : List Decl -> G =
+  \ds. G(prelude.foldl (\m d. case d of { DDef(f, t, e) -> map.insert string.compare f e m | _ -> m }) map.Tip ds)
+
+-- main's value, or the panic message.
+def runMain : List Decl -> Term ->{Diverge, Panic, IO, Input} Out =
+  \ds m. eval (globalsOf ds) Nil Nil m (cellInits ds)

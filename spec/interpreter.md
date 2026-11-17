@@ -287,8 +287,9 @@ into the same `sequence` in `Native.hs`:
    rejects; `selfhostCheckChecks` already compares those.
 3. Expected: `loadModules f >>= inferProgram >>= compile`, then
    `runProgramAt 64 (machineFor f)`. Render `output ++ "result: " ++ show v` or
-   `output ++ "panic: " ++ msg`, followed by the written files in a fixed format: one
-   `file <path>` line, then the contents, for each file in path order.
+   `output ++ "panic: " ++ msg`, followed by the written files in path order, each as a
+   `file <path> <length>` line, then its contents, then a newline. The length makes contents
+   that don't end in a newline unambiguous.
 4. Actual: `printf '%s\n%s' f (exampleInput f) | run-exe`. run.kl's mock prints the written
    files in the same format after the result line. Compare stdout only; nothing touches the
    disk.
