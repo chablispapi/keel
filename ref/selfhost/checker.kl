@@ -681,18 +681,18 @@ def freshTys : St -> List (List u8) ->{Diverge, Panic} (List Ty, St) =
     { Nil -> (Nil, st)
     | Cons(p, rest) -> let (t, st) = freshTy st in let (ts, st) = freshTys st (unbox rest) in (Cons(t, box ts), st) }
 
--- Xs(bitdata ↦ (underlying integer, fields), cell ↦ (element type, (array?, length)),
+-- Xs(bitdata ↦ (underlying integer, fields), cell ↦ (element type, (array?, (length, first slot))),
 -- queue ↦ (capacity, (message type, constructors with their field integer types))).
 data Xs = Xs(
   map.Map (List u8) (List u8, List Field),
-  map.Map (List u8) (List u8, (Bool, u64)),
+  map.Map (List u8) (List u8, (Bool, (u64, u64))),
   map.Map (List u8) (u64, (List u8, List (List u8, List (List u8)))))
 
 -- Env(signature, source name ↦ (core name, type), recursive group of this definition, Xs).
 data Env = Env(Sig, map.Map (List u8) (List u8, Ty), List (List u8), Xs)
 
 def envBits : Env -> map.Map (List u8) (List u8, List Field) = \env. case env of { Env(s, ls, rec, xs) -> case xs of { Xs(b, c, q) -> b } }
-def envCells : Env -> map.Map (List u8) (List u8, (Bool, u64)) = \env. case env of { Env(s, ls, rec, xs) -> case xs of { Xs(b, c, q) -> c } }
+def envCells : Env -> map.Map (List u8) (List u8, (Bool, (u64, u64))) = \env. case env of { Env(s, ls, rec, xs) -> case xs of { Xs(b, c, q) -> c } }
 def envQueues : Env -> map.Map (List u8) (u64, (List u8, List (List u8, List (List u8)))) = \env. case env of { Env(s, ls, rec, xs) -> case xs of { Xs(b, c, q) -> q } }
 
 def envSig : Env -> Sig = \env. case env of { Env(s, ls, rec, xs) -> s }
@@ -766,7 +766,7 @@ def check : St -> Env -> Term -> Ty ->{Diverge, Panic} C =
                     { C3(args2, eff, st) -> C(ECon(c, box (unbox dtys), box args2), eff, st) })
             else checkBy st env tm ex
         | _ -> checkBy st env tm ex })
-    | EIf(c, a, b) ->
+    | EIf(c, a, b) -> if isNotLess (unbox a) (unbox b) && isSome (notLess (unbox c)) then checkBy st env tm ex else
         (case check st env (unbox c) TBool of { C(c2, ec, st) ->
          case check st env (unbox a) ex of { C(a2, ea, st) ->
          case check st env (unbox b) ex of { C(b2, eb, st) -> C(EIf(box c2, box a2, box b2), sUnion ec (sUnion ea eb), st) } } })
@@ -847,7 +847,7 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
             | None ->
                 if has x (sigOps (envSig env)) then R(tm, TUnit, Nil, failSt st "Mismatch" (append "operation " (append x " must be applied")))
                 else if has x (envCells env) then (case get x (envCells env) of
-                  { Some(info) -> let (it, lenp) = info in let (arr, n) = lenp in R(tm, TUnit, Nil, failSt st "Mismatch" (cellUse x arr))
+                  { Some(info) -> let (it, lenp) = info in let (arr, no) = lenp in R(tm, TUnit, Nil, failSt st "Mismatch" (cellUse x arr))
                   | None -> R(tm, TUnit, Nil, st) })
                 else if eq x "arrayEmpty" then (let (m, st) = freshTy st in R(ETyApp(x, box (ty1 m)), TData("Array", box (ty1 m)), Nil, st))
                 else if isSome (floatOpType x) || isSome (arrayOpType x TUnit) || eq x "arena" then R(tm, TUnit, Nil, failSt st "Mismatch" (append x " must be applied to its arguments"))
@@ -871,16 +871,19 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
                 else R(EConvert(to, box e2), TInt(to), ee, st)
             | TVar(v) -> if isMeta v then R(EConvert(to, box e2), TInt(to), ee, st) else R(tm, TUnit, Nil, failSt st "Mismatch" "conversion of non-integer")
             | z -> R(tm, TUnit, Nil, failSt st "Mismatch" (append "conversion of non-integer " (showTy z))) } })
+    | EIf(c, a, b) -> (case notLess (unbox c) of
+        { Some(ge) -> if isNotLess (unbox a) (unbox b) then infer st env ge else inferIf st env c a b
+        | None -> inferIf st env c a b })
     | EPrim(op, a, b) ->
         (case infer st env (unbox a) of { R(a2, ta, ea, st) ->
          case check st env (unbox b) ta of { C(b2, eb, st) ->
+           if eq op "%ge" then
+             (if tyEq (zonk st ta) (TInt("f64")) then R(EPrim(">=", box a2, box b2), TBool, sUnion ea eb, st)
+              else R(mIf (EPrim("<", box a2, box b2)) (EBool(false)) (EBool(true)), TBool, sUnion ea eb, st))
+           else
            let te = primType op ta in let (t, extra) = te in
            let extra = if tyEq (zonk st ta) (TInt("f64")) then Nil else extra in
            R(EPrim(op, box a2, box b2), t, sUnion ea (sUnion eb extra), st) } })
-    | EIf(c, a, b) ->
-        (case check st env (unbox c) TBool of { C(c2, ec, st) ->
-         case infer st env (unbox a) of { R(a2, ta, ea, st) ->
-         case check st env (unbox b) ta of { C(b2, eb, st) -> R(EIf(box c2, box a2, box b2), ta, sUnion ec (sUnion ea eb), st) } } })
     | ELam(x, t, b) ->
         let (t2, st) = fill st (allocTy t) in
         let (x2, es) = binder st env x (content t2) in let (env2, st) = es in
@@ -985,6 +988,25 @@ def infer : St -> Env -> Term ->{Diverge, Panic} R =
 
 -- A polymorphic definition at these types and fresh effect variables: f[τ̄; ε̄]. The core
 -- term carries the effect arguments after the types, each as the row of Unit ->ε Unit.
+def inferIf : St -> Env -> Box Term -> Box Term -> Box Term ->{Diverge, Panic} R =
+  \st env c a b.
+    case check st env (unbox c) TBool of { C(c2, ec, st) ->
+    case infer st env (unbox a) of { R(a2, ta, ea, st) ->
+    case check st env (unbox b) ta of { C(b2, eb, st) -> R(EIf(box c2, box a2, box b2), ta, sUnion ec (sUnion ea eb), st) } } }
+
+-- The parser writes a >= b and a <= b as if a < b then false else true (bare literal
+-- branches, which no written if has), maybe with the operands bound first. notLess marks the
+-- comparison %ge; inference makes it >= at f64 (IEEE's) and gives the if back otherwise.
+def isNotLess : Term -> Term -> Bool =
+  \a b. case (unAt a, unAt b) of { (EBool(x), EBool(y)) -> not x && y | _ -> false }
+
+def notLess : Term -> Option Term =
+  \c. case c of
+    { EAt(f, l, k, e) -> (case notLess (unbox e) of { Some(g) -> Some(EAt(f, l, k, box g)) | None -> None })
+    | ELet(x, e, b) -> (case notLess (unbox b) of { Some(g) -> Some(ELet(x, e, box g)) | None -> None })
+    | EPrim(op, a, b) -> if eq op "<" then Some(EPrim("%ge", a, b)) else None
+    | _ -> None }
+
 def instantiate : St -> Env -> List u8 -> List (List u8, List u8) -> List (List u8) -> Ty -> List Ty ->{Diverge, Panic} R =
   \st env f vs es body tys.
     let (effs, st) = freshEffs st es in
@@ -1153,8 +1175,6 @@ def binders : St -> Env -> List (List u8, Ty) ->{Diverge, Panic} (List (List u8)
 
 -- Bitdata, cells and queues (Keel.Infer) ---------------------------------------------------
 
--- ponytail: cell slots aren't numbered (every offset is 0): the checker never reads one.
-
 def num : u64 -> List u8 -> Term = \v it. ENum(false, v, it)
 def mApp : Term -> Term -> Term = \f a. EApp(box f, box a)
 def mPrim : List u8 -> Term -> Term -> Term = \op a b. EPrim(op, box a, box b)
@@ -1259,7 +1279,7 @@ def xsApp : St -> Env -> Term -> Term ->{Diverge, Panic} Option R =
                 if isLocal env c then None
                 else (case get c (envCells env) of
                   { None -> None
-                  | Some(info) -> let (it, lenp) = info in let (arr, n) = lenp in Some(cellAccess st env x c it arr n args) }) })
+                  | Some(info) -> let (it, lenp) = info in let (arr, no) = lenp in let (n, off) = no in Some(cellAccess st env x c it arr n off args) }) })
         else if eq x "post" then
           (case spread a of
             { None -> None
@@ -1274,17 +1294,17 @@ def xsApp : St -> Env -> Term -> Term ->{Diverge, Panic} Option R =
         else None
     | _ -> None }
 
-def cellAccess : St -> Env -> List u8 -> List u8 -> List u8 -> Bool -> u64 -> List Term ->{Diverge, Panic} R =
-  \st env acc c it arr n args.
+def cellAccess : St -> Env -> List u8 -> List u8 -> List u8 -> Bool -> u64 -> u64 -> List Term ->{Diverge, Panic} R =
+  \st env acc c it arr n off args.
     let shared = one "Shared" in
     let bad = R(EUnit, TUnit, Nil, failSt st "Mismatch" (cellUse c arr)) in
-    let slot = \i. mPrim "-" (num (n -% 1u64) "usize") (mPrim "-" (num (n -% 1u64) "usize") i) in
+    let slot = \i. mPrim "-" (num (off +% n -% 1u64) "usize") (mPrim "-" (num (n -% 1u64) "usize") i) in
     if eq acc "get" && not arr then
-      (case args of { Nil -> R(cellLd it (num 0 "usize"), TInt(it), shared, st) | _ -> bad })
+      (case args of { Nil -> R(cellLd it (num off "usize"), TInt(it), shared, st) | _ -> bad })
     else if eq acc "set" && not arr then
       (case args of
         { Cons(v, rest) -> if isNil (unbox rest) then
-            (case check st env v (TInt(it)) of { C(v2, ev, st) -> R(cellSt (num 0 "usize") v2, TUnit, sUnion shared ev, st) })
+            (case check st env v (TInt(it)) of { C(v2, ev, st) -> R(cellSt (num off "usize") v2, TUnit, sUnion shared ev, st) })
           else bad
         | Nil -> bad })
     else if eq acc "getAt" && arr then
@@ -1330,7 +1350,7 @@ def postTerm : St -> Env -> List u8 -> u64 -> List u8 -> List (List u8, List (Li
                   { None -> bad
                   | Some(jf) -> let (j, fs) = jf in
                       if length (unbox es) != length fs then R(EUnit, TUnit, Nil, failSt st "Mismatch" (append c " has a different number of fields"))
-                      else postBody st env n j fs (unbox es) })
+                      else postBody st env q n j fs (unbox es) })
             | _ -> bad })
       | Nil -> bad }
 
@@ -1342,8 +1362,8 @@ def ctorIndex : List u8 -> List (List u8, List (List u8)) -> i64 ->{Diverge, Pan
 def numbered : List u8 -> i64 -> i64 ->{Diverge, Panic} List (List u8) =
   \prefix i k. if i < k then Cons(append prefix (string.fromInt i), box (numbered prefix (i + 1) k)) else Nil
 
-def postBody : St -> Env -> u64 -> i64 -> List (List u8) -> List Term ->{Diverge, Panic} R =
-  \st env n j fs es.
+def postBody : St -> Env -> List u8 -> u64 -> i64 -> List (List u8) -> List Term ->{Diverge, Panic} R =
+  \st env q n j fs es.
     let tys = map (\f. TInt(f)) fs in
     case checkArgs st env es tys of { C3(es2, ee, st) ->
     let (xs, rest) = binders st env (zipL (numbered "post%" 0 (length fs)) tys) in
@@ -1351,13 +1371,14 @@ def postBody : St -> Env -> u64 -> i64 -> List (List u8) -> List Term ->{Diverge
     let (h, rest) = binder st env "post%h" (TInt("u32")) in
     let (env3, st) = rest in
     let hv = EVar(h) in
-    let at = mPrim "+%" (num 0 "usize") (mConv "usize" (mPrim "land" hv (num (n -% 1u64) "u32"))) in
+    let off = \c. case get (append q (Cons('%', box c))) (envCells env) of { Some(info) -> let (it, r) = info in let (arr, no) = r in let (k, o) = no in o | None -> 0 } in
+    let at = \c. mPrim "+%" (num (off c) "usize") (mConv "usize" (mPrim "land" hv (num (n -% 1u64) "u32"))) in
     let wrap = \x. mPrim "+%" x (num 1 "u32") in
-    let ld = \u. cellLd "u32" (num 0 "usize") in
-    let full = mPrim "==" (mPrim "-%" hv (ld ())) (num n "u32") in
-    let stores = Cons(cellSt at (num (j as u64) "u32"),
-                      box (append (map (\x. cellSt at (EVar(x))) xs) (Cons(cellSt (num 0 "usize") (wrap hv), box Nil)))) in
-    let body = mLet h (ld ()) (mIf full (cellSt (num 0 "usize") (wrap (ld ()))) (seqAll stores)) in
+    let ld = \c. cellLd "u32" (num (off c) "usize") in
+    let full = mPrim "==" (mPrim "-%" hv (ld "tail")) (num n "u32") in
+    let stores = Cons(cellSt (at "tag") (num (j as u64) "u32"),
+                      box (append (map (\ix. let (i, x) = ix in cellSt (at (append "f" (string.fromInt i))) (EVar(x))) (zipL (range (length xs)) xs)) (Cons(cellSt (num (off "head") "usize") (wrap hv), box Nil)))) in
+    let body = mLet h (ld "head") (mIf full (cellSt (num (off "lost") "usize") (wrap (ld "lost"))) (seqAll stores)) in
     R(letAll (zipL xs es2) body, TUnit, sInsert "Shared" ee, st) }
 
 -- receive(q) as a case's scrutinee: the queue.
@@ -1456,12 +1477,22 @@ def xsOf : Sig -> List Decl ->{Diverge, Panic} Xs =
   \s user.
     let queues = map (\qd. let (q, dn) = qd in let (d, n) = dn in
       (q, (n, (d, map (\c. (ctorName c, map (\f. case f of { TInt(it) -> it | _ -> "i64" }) (ctorFields c))) (dataCtors s d))))) (queueDecls user) in
-    let own = concatMap (\d. case d of { DCell(n, it, arr, len, v) -> Cons((n, (it, (arr, len))), box Nil) | _ -> Nil }) user in
-    let qcells = concatMap (\qi. let (q, info) = qi in let (n, dcs) = info in let (d, cs) = dcs in
-      let k = foldl (\m c. let (cn, fs) = c in if length fs > m then length fs else m) 0 cs in
-      append (map (\c. (append q (Cons('%', box c)), ("u32", (false, 0)))) (string.split ' ' "head tail lost seen"))
-        (Cons((append q "%tag", ("u32", (true, n))), box (map (\i. (append q (append "%f" (string.fromInt i)), ("usize", (true, n)))) (range k))))) queues in
-    Xs(bitMap user, fromPairs (append own qcells), fromPairs queues)
+    let (slots, end) = foldl (\acc d. let (cs, o) = acc in case d of
+      { DCell(n, it, arr, len, v) -> (Cons((n, (it, (arr, (len, o)))), box cs), o +% (if arr then len else 1u64))
+      | _ -> acc }) (Nil, 0u64) (cellDecls s user) in
+    Xs(bitMap user, fromPairs slots, fromPairs queues)
+
+-- The program's cells in declaration order, each queue's (Keel.Syntax.queueCells) in its place.
+def cellDecls : Sig -> List Decl ->{Diverge, Panic} List Decl =
+  \s user. concatMap (\d. case d of
+    { DCell(n, it, arr, len, v) -> Cons(d, box Nil)
+    | DQueue(q, dn, n) -> queueCells q n (foldl (\m c. if length (ctorFields c) > m then length (ctorFields c) else m) 0 (dataCtors s dn))
+    | _ -> Nil }) user
+
+def queueCells : List u8 -> u64 -> i64 ->{Diverge, Panic} List Decl =
+  \q n k. let mk = \c it arr. DCell(append q (Cons('%', box c)), it, arr, if arr then n else 0, 0) in
+    append (map (\c. mk c "u32" false) (string.split ' ' "head tail lost seen"))
+      (Cons(mk "tag" "u32" true, box (map (\i. mk (append "f" (string.fromInt i)) "usize" true) (range k))))
 
 -- Keel.Infer.queueSides: only def interrupt, and what it calls, posts to a queue; only main's
 -- side (what main calls, without going through def interrupt) receives.
@@ -1650,7 +1681,8 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
             { Some(m) -> Q(TUnit, Nil, Nil, er)
             | None ->
                 if not (isIntTy ta || tyEq ta (TInt("f64")) || (tyEq ta TBool && eq op "==")) then qErr "Mismatch" (append "arithmetic on " (showTy ta))
-                else if tyEq ta (TInt("f64")) && not (eq op "+" || eq op "-" || eq op "*" || eq op "/" || eq op "==" || eq op "<") then
+                else if eq op ">=" && not (tyEq ta (TInt("f64"))) then qErr "Mismatch" "core >= is only on f64"
+                else if tyEq ta (TInt("f64")) && not (eq op "+" || eq op "-" || eq op "*" || eq op "/" || eq op "==" || eq op "<" || eq op ">=") then
                   qErr "Mismatch" "f64 has only + - * / and comparisons (no %, +% +| +? or bit operations)"
                 else (case expect s rec ctx ta (unbox b) of
                   { Q(t0, eb, ub, er) -> case er of
@@ -1663,7 +1695,7 @@ def cinfer : Sig -> List (List u8) -> map.Map (List u8) Ty -> Term ->{Diverge, P
                                   else if isNil suffix then Q(ta, sUnion ea (if tyEq ta (TInt("f64")) then eb else sInsert "Panic" eb), u, None)
                                   else if eq suffix "?" then Q(TData("Option", box (ty1 ta)), sUnion ea eb, u, None)
                                   else Q(ta, sUnion ea eb, u, None)
-                              | None -> if eq op "==" || eq op "<" then Q(TBool, sUnion ea eb, u, None) else Q(ta, sUnion ea eb, u, None) } } } }) } })
+                              | None -> if eq op "==" || eq op "<" || eq op ">=" then Q(TBool, sUnion ea eb, u, None) else Q(ta, sUnion ea eb, u, None) } } } }) } })
     | EIf(c, a, b) -> (case expect s rec ctx TBool (unbox c) of
         { Q(t0, ec, uc, er) -> case er of
             { Some(m) -> Q(TUnit, Nil, Nil, er)
@@ -2318,7 +2350,7 @@ def inferAll : Sig -> List Decl -> Term ->{Diverge, Panic} (List Decl, (Term, Op
           (case check st env e body of { C(e2, eff, st) ->
              let (e3, st) = finish st e2 in (append ds (Cons(DDef(f, resolveBits bm t, e3), box Nil)), st) })
       | DBitdata(n, it, fs) -> (ds, st)
-      | DQueue(n, dn, len) -> (ds, st)
+      | DQueue(n, dn, len) -> (append ds (cellDecls s (Cons(d, box Nil))), st)
       | DCell(n, it, arr, len, v) -> (append ds (Cons(d, box Nil)), withErr st (cellErr n it arr len v))
       | DData(lin, n, ps, cs) -> (append ds (Cons(DData(lin, n, ps, map (\c. resolveCtor bm c) cs), box Nil)), st)
       | DCodata(n, ps, os) -> (append ds (Cons(DCodata(n, ps, map (\c. resolveCtor bm c) os), box Nil)), st)
@@ -2333,12 +2365,16 @@ def inferAll : Sig -> List Decl -> Term ->{Diverge, Panic} (List Decl, (Term, Op
 def resolveCtor : map.Map (List u8) (List u8, List Field) -> Ctor ->{Diverge} Ctor =
   \bm c. case c of { Ctor(n, fs) -> Ctor(n, map (\t. resolveBits bm t) fs) }
 
--- Keel.Check.checkProgram on the user's definitions and main: the verdict line.
-def checkCore : List Decl -> List Decl -> Term ->{Diverge, Panic} List u8 =
-  \lib user prog.
-    let (s, sigErr) = buildSig (append lib user) in
+-- An elaborated program (every declaration, the prelude's first, and main) with main's type
+-- and effects, or the first error.
+data Core = Core(List Decl, Term, Ty, List (List u8)) | Rejected(List u8)
+
+-- Keel.Check.checkProgram on the elaborated declarations and main.
+def checkCore : List Decl -> Term ->{Diverge, Panic} Core =
+  \user prog.
+    let (s, sigErr) = buildSig user in
     case sigErr of
-      { Some(m) -> m
+      { Some(m) -> Rejected(m)
       | None ->
           let groups = terminatingGroups (defsOf user) (recursiveGroups (defsOf user)) in
           let defErr = firstErr (\d. case d of
@@ -2357,16 +2393,16 @@ def checkCore : List Decl -> List Decl -> Term ->{Diverge, Panic} List u8 =
                               else Some(mismatch body t2)) } } })
             | _ -> None }) user in
           case defErr of
-            { Some(m) -> m
+            { Some(m) -> Rejected(m)
             | None -> case cinfer s Nil map.Tip prog of
                 { Q(t, eff, u, er) -> case er of
-                    { Some(m) -> m
+                    { Some(m) -> Rejected(m)
                     | None ->
                         let extra = sDiff eff (topLevelEffects ()) in
-                        if not (isNil extra) then errLine "Unhandled" (append "main performs " (showSet extra))
-                        else case interruptErr user eff of { Some(m) -> m | None -> case polyRecursion user of
-                          { Some(m) -> m
-                          | None -> append "ok: main : " (append (showTy t) (if isNil eff then "" else append " ! " (showSet eff))) } } } } } }
+                        if not (isNil extra) then Rejected(errLine "Unhandled" (append "main performs " (showSet extra)))
+                        else case interruptErr user eff of { Some(m) -> Rejected(m) | None -> case polyRecursion user of
+                          { Some(m) -> Rejected(m)
+                          | None -> Core(user, prog, t, eff) } } } } } }
 
 -- The trap handler: def interrupt takes the cause, may not allocate, and its effects are main's
 -- as well, since it runs inside main.
@@ -2704,18 +2740,24 @@ def elabDecl : Decl ->{Diverge, Panic} Decl =
 
 def elabMain : Term ->{Diverge, Panic} Term = \prog. fst (expr map.Tip prog 0 idK)
 
--- The verdict on a program: the prelude's declarations, the entry module's, and its prog.
+-- A program: the prelude's declarations, the entry module's, and its main. The prelude's
+-- definitions are inferred too, so their literals have widths.
+def program : List Decl -> List (Bool, Decl) -> Term ->{Diverge, Panic} Core =
+  \prelude decls prog.
+    let user = map (\pd. let (p, d) = pd in d) decls in
+    let all = map allocDecl (append (withPrelude prelude user) user) in
+    let (s, sigErr) = buildSig all in
+    let (core, rest) = inferAll s all prog in let (main2, err) = rest in
+    case err of
+      { Some(m) -> Rejected(m)
+      | None -> case checkRefs core main2 of
+          { Some(m) -> Rejected(m)
+          | None -> checkCore (map elabDecl core) (elabMain main2) } }
+
+-- The verdict line: `ok: main : T ! {E…}`, or the error.
 def verdict : List Decl -> List (Bool, Decl) -> Option Term ->{Diverge, Panic} List u8 =
   \prelude decls entry. case entry of
     { None -> "unsupported: no main"
-    | Some(prog) ->
-        let user = map (\pd. let (p, d) = pd in d) decls in
-        let lib = map allocDecl (withPrelude prelude user) in
-          let user = map allocDecl user in
-          let (s, sigErr) = buildSig (append lib user) in
-          let (core, rest) = inferAll s user prog in let (main2, err) = rest in
-          case err of
-            { Some(m) -> m
-            | None -> case checkRefs core main2 of
-                { Some(m) -> m
-                | None -> checkCore lib (map elabDecl core) (elabMain main2) } } }
+    | Some(prog) -> case program prelude decls prog of
+        { Rejected(m) -> m
+        | Core(ds, m, t, eff) -> append "ok: main : " (append (showTy t) (if isNil eff then "" else append " ! " (showSet eff))) } }

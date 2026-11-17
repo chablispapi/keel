@@ -1,0 +1,24 @@
+-- Check a Keel program and print its elaborated core, the program the self-hosted
+-- interpreter runs: every declaration (the prelude's first) and main, as S-expressions, then
+-- main's type and effects. stdin holds the entry file's path, as for check.kl:
+--
+--   echo examples/fact.kl | keelc run selfhost/core.kl
+--
+-- The result is 0, or -1 when the program doesn't load or is rejected.
+
+import load
+import checker
+import sexp
+
+main =
+  case programOf (firstLine (readAll ())) of
+    { Err(e) -> println e; -1
+    | Ok(p) -> let (lib, rest) = p in let (decls, entry) = rest in
+        case entry of
+          { None -> println "unsupported: no main"; -1
+          | Some(prog) -> case checker.program lib decls prog of
+              { Rejected(m) -> println m; -1
+              | Core(ds, m, t, eff) ->
+                  each (\d. pDecl d; putc('\n')) ds;
+                  print "(main "; pTerm m; println ")";
+                  print "-- main : "; print (checker.showTy t); print " ! "; println (checker.showSet eff); 0 } } }

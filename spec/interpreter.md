@@ -38,7 +38,8 @@ exactly what `Eval.hs` handles. M0 checks that this is true.
 | File | Phase | Role |
 |---|---|---|
 | `ref/selfhost/load.kl` (new, ~180 lines) | A | everything in `check.kl` above the verdict: `Result`, `visit`, `Scope`, `Res`, `plain`/`name`/`term`/`decl`, `baseName`, `programOf`, plus `resolveTerm` for prompt input |
-| `ref/selfhost/check.kl` | A | becomes thin: `programOf`, then `checker.verdict` |
+| `ref/selfhost/check.kl` | A | becomes thin: `programOf`, then `checker.verdict` (done) |
+| `ref/selfhost/sexp.kl`, `core.kl` | A | S-expression printers (from `parse.kl`) and the core dump (done) |
 | `ref/selfhost/checker.kl` | A | `program` returns the elaborated program and its entry's type and effects; real cell slot numbering |
 | `ref/selfhost/eval.kl` (new, ~1000–1400 lines) | A | value model, evaluator, `show` |
 | `ref/selfhost/run.kl` (new, ~250 lines) | A | batch driver, plus the mock device handler (files, loopback net) ported from `Eval.hs`'s `machine`/`network` |
@@ -215,6 +216,39 @@ Each one ends green on its slice of the corpus.
 | M5 | loopback net in the mock: listeners, sockets, 64 KiB buffers, `poll` readiness, `pollWait`/`clockMs`, fd and port allocation, exact failure strings | `test/net/*`; **Phase A done** |
 | M6 | REPL: `EXPR`, `let`, decls, error recovery, cell persistence, `:load`/`:r`, `:type`, `:clear`, `:{ :}`, `:help`, `:quit`, EOF | golden scripts in `ref/test/repl/`, including `1 + 2` → `3`, `let x = 2` then `x * 3` → `6`, `cell c : u32 = 0`, `set(c, 41)`, `get(c) + 1` → `42` |
 | M7 | performance: environment lookup, closure size, caching prelude globals | whole-corpus time plus session startup, reported like `checker.kl`'s measurement block |
+
+## M0 results
+
+**(a) The checker's output, 2026-11-17: done.** `checker.program` returns
+`Core(decls, main, type, effects) | Rejected(msg)`, and `verdict` formats it. `selfhost/core.kl`
+prints the core as S-expressions (`sexp.kl`, split out of `parse.kl`). It was compared with
+keelc's `elaborate (inferProgram p)` on every file in the corpus. All 76 accepted files print the
+same tree, and keelc rejects the 78 files selfhost rejects. The comparison ignores four
+differences of notation, which the evaluator handles by name:
+
+- keelc's `Perform op e` is `(app op e)`. An application of a name that is neither local nor
+  global, and is an operation, performs it.
+- keelc's `ArrayPrim`/`FloatPrim` are the builtin's name applied, with an array operation's
+  head as `(tyapp arrayGet (a))`. `arena` is `(app arena f)`.
+- A `tyapp` carries its effect arguments as `(-> Unit (row) Unit)` types. They are erased.
+- keelc marks one-shot lambdas `\o`; selfhost does not. They evaluate the same.
+
+Getting there took four checker changes:
+
+- **The prelude is inferred** with the program. It used to be only in the signature, so its
+  literals had no width (`printU64`'s `10` must be u64). keelc's meta numbering now matches too
+  (`?58`, not `?1`).
+- **Cell slots are numbered** as `Syntax.cellSlots`. Queues expand in place into their
+  `head tail lost seen tag f0…` cells, and these appear as `DCell`s in the core, so the
+  evaluator computes the initial words as `cellInits` does.
+- **`post` uses each cell's own slot.** A full queue now increments `lost` as keelc does (it
+  used to write `head`).
+- **`>=` and `<=` on f64** become core `>=` (keelc's `FGe`, IEEE semantics on NaN) through
+  `notLess`, as in `Keel.Infer`. On integers they stay `if a < b then false else true`.
+
+The two traps listed for M0(a) were not real. Literal widths were already solved by
+`finish`/`zonkTerm`. The `f64`-suffix `unsupported` is unreachable in the corpus, because float
+literals are `EFloat`.
 
 ## Testing
 
