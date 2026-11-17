@@ -16,7 +16,7 @@ module Main (main) where
 import Cases (Expect (..))
 import Cases qualified
 import Control.Monad (forM, unless)
-import Data.List (isInfixOf, isPrefixOf, isSuffixOf, stripPrefix)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf, sort, stripPrefix)
 import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import GHC.Clock (getMonotonicTime)
@@ -37,10 +37,10 @@ import Keel.Mono (compile)
 import Keel.Syntax
 import Numeric (showFFloat)
 import Sexp (sexpModule)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, getTemporaryDirectory, listDirectory, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getTemporaryDirectory, listDirectory, removePathForcibly)
 import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
-import System.FilePath ((</>))
+import System.FilePath (replaceExtension, (</>))
 import System.Process (env, proc, readCreateProcessWithExitCode, readProcessWithExitCode, shell)
 import System.Timeout (timeout)
 
@@ -463,23 +463,75 @@ selfhostEvalChecks dir = do
           putStrLn ("selfhost evaluator: " ++ show agrees ++ " agree, " ++ show unsup ++ " unsupported")
           pure fails
   where
-    dropResult s = case reverse (lines s) of
-      l : ls | "result: " `isPrefixOf` l -> unlines (reverse ls)
-      _ -> s
-    firstDiff expStr gotStr = go (lines expStr) (lines gotStr)
-      where
-        go (e : es) (g : gs)
-          | e == g = go es gs
-          | otherwise = fmt e g
-        go (e : _) [] = fmt e "<EOF>"
-        go [] (g : _) = fmt "<EOF>" g
-        go [] [] = fmt (show expStr) (show gotStr)
-        fmt e g = "  expected: " ++ e ++ "\n  got:      " ++ g
     klFiles d = do
       entries <- map (d </>) <$> listDirectory d
       fmap concat $ forM entries $ \e -> do
         isDir <- doesDirectoryExist e
         if isDir then klFiles e else pure [e | ".kl" `isSuffixOf` e]
+
+-- | Drop the trailing @result: …@ line printed by the native runtime.
+dropResult :: String -> String
+dropResult s = case reverse (lines s) of
+  l : ls | "result: " `isPrefixOf` l -> unlines (reverse ls)
+  _ -> s
+
+-- | Report the first differing line between expected and actual output.
+firstDiff :: String -> String -> String
+firstDiff expStr gotStr = go (lines expStr) (lines gotStr)
+  where
+    go (e : es) (g : gs)
+      | e == g = go es gs
+      | otherwise = fmt e g
+    go (e : _) [] = fmt e "<EOF>"
+    go [] (g : _) = fmt "<EOF>" g
+    go [] [] = fmt (show expStr) (show gotStr)
+    fmt e g = "  expected: " ++ e ++ "\n  got:      " ++ g
+
+-- | The self-hosted REPL (selfhost/repl.kl), built natively, must match each golden script
+-- @test/repl/NAME.in@ against @test/repl/NAME.out@ (without the native runtime's trailing
+-- @result: …@ line).
+selfhostReplChecks :: FilePath -> IO [String]
+selfhostReplChecks dir = do
+  t0 <- getMonotonicTime
+  loaded <- loadModules "selfhost/repl.kl"
+  case loaded >>= either (Left . show) Right . inferProgram . fst >>= compileNative of
+    Left e -> pure ["FAIL selfhost/repl.kl: " ++ e]
+    Right asm -> do
+      let exe = dir </> "selfhost-repl"
+      writeFile (exe ++ ".s") asm
+      built <- buildNative False (exe ++ ".s") exe
+      case built of
+        Left err -> pure ["FAIL selfhost/repl.kl: " ++ err]
+        Right () -> do
+          t1 <- getMonotonicTime
+          putStrLn ("selfhost repl: built repl.kl in " ++ showFFloat (Just 1) (t1 - t0) " s")
+          names <- sort . filter (".in" `isSuffixOf`) <$> listDirectory "test/repl"
+          results <- forM names $ \name -> do
+            let inPath = "test/repl" </> name
+                outPath = "test/repl" </> replaceExtension name "out"
+            hasOut <- doesFileExist outPath
+            if not hasOut
+              then pure (Just ("FAIL selfhost/repl.kl: " ++ inPath ++ ": missing " ++ outPath))
+              else do
+                input <- readFile inPath
+                expected <- readFile outPath
+                res <- timeout (30 * 1000000) (readCreateProcessWithExitCode (proc exe []) input)
+                pure $ case res of
+                  Nothing ->
+                    Just ("FAIL selfhost/repl.kl: " ++ inPath ++ ": timed out after 30 s")
+                  Just (ExitFailure c, printed, err) ->
+                    let note = "exited with " ++ show c ++ (if null err then "" else " (" ++ takeWhile (/= '\n') err ++ ")")
+                     in Just ("FAIL selfhost/repl.kl: " ++ inPath ++ ": " ++ note ++ "\n" ++ firstDiff expected (dropResult printed))
+                  Just (ExitSuccess, printed, _) ->
+                    let got = dropResult printed
+                     in if got == expected
+                          then Nothing
+                          else Just ("FAIL selfhost/repl.kl: " ++ inPath ++ ":\n" ++ firstDiff expected got)
+          let fails = [msg | Just msg <- results]
+              totalScripts = length names
+              passed = totalScripts - length fails
+          putStrLn ("selfhost repl: " ++ show passed ++ " of " ++ show totalScripts ++ " scripts pass")
+          pure fails
 
 -- | Programs that type-check but that keelc must refuse to compile, with this message.
 compileErrors :: [(FilePath, String)]
@@ -524,7 +576,7 @@ main = do
   dir <- (</> "keel-native-tests") <$> getTemporaryDirectory
   createDirectoryIfMissing True dir
   loaded <- mapM loadExample exampleFiles
-  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir, selfhostCheckChecks dir, selfhostEvalChecks dir, reuseChecks dir]
+  modErrs <- concat <$> sequence [concat <$> mapM checkModuleError moduleErrors, concat <$> mapM checkCompileError compileErrors, lspChecks, selfhostChecks dir, selfhostCheckChecks dir, selfhostEvalChecks dir, selfhostReplChecks dir, reuseChecks dir]
   let programs = cases ++ specCases ++ concatMap snd loaded
   failures <- (\fs -> concatMap fst loaded ++ modErrs ++ fs) . concat <$> forM (zip [0 :: Int ..] programs) (uncurry (runCase dir False))
   -- The examples have source positions: build them again with debug info.
@@ -537,7 +589,7 @@ main = do
         , either (not . ("not supported yet" `isInfixOf`)) (const True) r
         ]
       allFailures = failures ++ debugFailures ++ refused
-      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 5
+      total = length programs + length debugPrograms + length unsupportedCases + length exampleFiles + length moduleErrors + length compileErrors + 6
   mapM_ putStrLn allFailures
   putStrLn (show (total - length allFailures) ++ "/" ++ show total ++ " native cases passed")
   rvFailures <-

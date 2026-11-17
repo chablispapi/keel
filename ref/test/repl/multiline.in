@@ -1,0 +1,5 @@
+:{
+data Pair = P(i64, i64)
+def first : Pair -> i64 = \p. case p of { P(a, _) -> a }
+:}
+first (P(7, 8))

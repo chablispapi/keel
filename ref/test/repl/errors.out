@@ -1,0 +1,6 @@
+keel> <interactive>:1:1: error [Unbound]: nope
+keel> <interactive>:1:5: error [Mismatch]: expected Bool, got an integer
+keel> 4
+keel> panic: arithmetic overflow: 9223372036854775807 + 1 in i64
+keel> 4
+keel> 

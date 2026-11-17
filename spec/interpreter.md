@@ -1,6 +1,6 @@
 # A self-hosted interpreter and REPL
 
-Status: proposed 2026-11-13, revised 2026-11-13 after review. Phase A (M0–M5) done 2026-11-17.
+Status: proposed 2026-11-13, revised 2026-11-13 after review. Phase A (M0–M5) done 2026-11-17; M6, the REPL, done the same day (see "M6 as built").
 
 ## Goal
 

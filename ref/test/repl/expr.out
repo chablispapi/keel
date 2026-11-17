@@ -1,0 +1,9 @@
+keel> 3
+keel> true
+keel> Some(4)
+keel> Cons(104, box Cons(105, box Nil))
+keel> 7
+()
+keel> 250
+keel> 0x4008000000000000
+keel> 

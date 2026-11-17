@@ -1,0 +1,188 @@
+-- keel>, a REPL on the self-hosted front end and evaluator (spec/interpreter.md, Phase B):
+--
+--   keelc build selfhost/repl.kl -o keel && ./keel
+--
+-- An expression is checked as the session's main and evaluated; `let x = e` binds a value;
+-- def, data, cell and the other declarations accumulate; :load starts over from a file.
+-- Every line is checked again with the whole session, so types, effects and linearity are
+-- exactly keelc's. A line that fails changes nothing.
+--
+-- Limits: no line editing or history (rlwrap works from outside); no Ctrl-C, so a divergent
+-- expression hangs; no redefinition (use :clear or :load); no import at the prompt (:load a
+-- file that imports). Files and the network are the in-memory mock of selfhost/run.kl, so no
+-- file can be read that the session didn't write; stdout and stdin are real.
+
+import std.string
+import load
+import checker
+import parser
+import eval
+
+-- The file loaded ("" for none), the declarations entered at the prompt, and the world (cells
+-- and the mocked devices), all kept between commands.
+data Session = Session(List u8, List (Bool, Decl), World)
+
+-- A line of stdin, or None at the end of input.
+def readLineOpt : List u8 ->{Input, Diverge} Option (List u8) =
+  \acc. let c = getc () in
+    if c < 0 then (case acc of { Nil -> None | _ -> Some(reverse acc) })
+    else if c == 10 then Some(reverse acc)
+    else readLineOpt (Cons(c as u8, box acc))
+
+def trim : List u8 -> List u8 = \s. reverse (dropSpace (reverse (dropSpace s)))
+
+def dropSpace : List u8 -> List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == ' ' || c == '\t' || c == '\r' then dropSpace (unbox rest) else s }
+
+def startsWith : List u8 -> List u8 -> Bool = \p s. checker.startsWith p s
+
+-- The text after the first word.
+def afterWord : List u8 -> List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == ' ' then trim (unbox rest) else afterWord (unbox rest) }
+
+def firstWord : List u8 -> List u8 =
+  \s. case s of { Nil -> Nil | Cons(c, rest) -> if c == ' ' then Nil else Cons(c, box (firstWord (unbox rest))) }
+
+def isDecl : List u8 ->{Diverge} Bool =
+  \line. checker.elem (firstWord line) (string.split ' ' "def data linear codata effect cell queue bitdata private")
+
+def help : Unit ->{Diverge} List u8 = \u. string.join "\n" (Cons(
+  "  EXPR          check and evaluate an expression", box Cons(
+  "  let x = e     bind a value (effect-free; use def otherwise)", box Cons(
+  "  def ..., data ...  declare, as in a file (also cell, queue, effect, codata, bitdata)", box Cons(
+  "  :type EXPR    its type and effects (:t)", box Cons(
+  "  :load PATH    start over from a file (:l); :r reloads it", box Cons(
+  "  :clear        drop what was declared at the prompt", box Cons(
+  "  :{ ... :}     a multi-line input", box Cons(
+  "  :quit         leave (:q, or end of input)", box Nil)))))))))
+
+-- The session's program with these prompt declarations and this main, checked.
+def checkWith : Session -> List (Bool, Decl) -> Term ->{Files, Diverge, Panic} checker.Core =
+  \s extra m. case s of
+    { Session(path, decls, w) -> case programWith path (append decls extra) (Some(m)) of
+        { Err(e) -> Rejected(e)
+        | Ok(p) -> let (lib, rest) = p in let (ds, entry) = rest in
+            case entry of { Some(m2) -> checker.program lib ds m2 | None -> Rejected("no main") } } }
+
+-- The text as an expression.
+def parseExpr : List u8 ->{Diverge, Panic} Result Term (List u8) =
+  \text. case parseTextAt (append "main = " text) (0 - 6) of
+    { Err(e) -> Err(e)
+    | Ok(m) -> case m of { Module(imps, ds, entry) -> case entry of { Some(e) -> Ok(e) | None -> Err("not an expression") } } }
+
+-- An error in what was typed at the prompt: positions are in the input, not the loaded file.
+def here : Session -> List u8 ->{Diverge, Panic} List u8 =
+  \s msg. case s of
+    { Session(path, decls, w) ->
+        let file = if checker.isNil path then "repl.kl" else path in
+        if startsWith (append file ":") msg then append "<interactive>" (dropN (prelude.length file) msg) else msg }
+
+def dropN : i64 -> List u8 ->{Diverge} List u8 =
+  \n xs. if n <= 0 then xs else (case xs of { Nil -> Nil | Cons(x, rest) -> dropN (n -% 1) (unbox rest) })
+
+def effText : List (List u8) ->{Diverge} List u8 =
+  \eff. if checker.isNil eff then "" else append " ! " (checker.showSet eff)
+
+def runExpr : Session -> List u8 ->{Files, IO, Input, Diverge, Panic} Session =
+  \s text. case parseExpr text of
+    { Err(e) -> println e; s
+    | Ok(e) -> case checkWith s Nil e of
+        { Rejected(msg) -> println (here s msg); s
+        | Core(ds, m, t, eff) -> case s of
+            { Session(path, decls, w) -> case runIn w ds m of
+                { Val(v, w2) -> println (show v); Session(path, decls, w2)
+                | Bad(msg, w2) -> print "panic: "; println msg; Session(path, decls, w2) } } } }
+
+def typeOf : Session -> List u8 ->{Files, IO, Diverge, Panic} Unit =
+  \s text. case parseExpr text of
+    { Err(e) -> println e
+    | Ok(e) -> case checkWith s Nil e of
+        { Rejected(msg) -> println (here s msg)
+        | Core(ds, m, t, eff) ->
+            -- A bare name has its declared type, ∀ included.
+            case declaredType (trim text) ds of
+              { Some(dt) -> println (checker.showTy dt)
+              | None -> print (checker.showTy t); println (effText eff) } } }
+
+def declaredType : List u8 -> List Decl -> Option Ty =
+  \x ds. case ds of
+    { Nil -> None
+    | Cons(d, rest) -> case d of { DDef(f, t, e) -> if string.equal f x then Some(t) else declaredType x (unbox rest) | _ -> declaredType x (unbox rest) } }
+
+def declare : Session -> List u8 ->{Files, IO, Diverge, Panic} Session =
+  \s text. case parseText text of
+    { Err(e) -> println e; s
+    | Ok(m) -> case m of
+        { Module(imps, ds, entry) ->
+            if not (checker.isNil imps) then (println "import works only in a :load-ed file"; s)
+            else commit s ds } }
+
+-- Add declarations if the program still checks.
+def commit : Session -> List (Bool, Decl) ->{Files, IO, Diverge, Panic} Session =
+  \s ds. case checkWith s ds EUnit of
+    { Rejected(msg) -> println (here s msg); s
+    | Core(core, m, t, eff) -> case s of
+        { Session(path, decls, w) -> println "ok"; Session(path, append decls ds, growCells w core) } }
+
+-- let x = e: a def with e's type, when e is effect-free.
+def letBind : Session -> List u8 ->{Files, IO, Diverge, Panic} Session =
+  \s text. let x = trim (takeTo '=' text) in let rhs = dropTo '=' text in
+    case parseExpr rhs of
+      { Err(e) -> println e; s
+      | Ok(e) -> case checkWith s Nil e of
+          { Rejected(msg) -> println (here s msg); s
+          | Core(ds, m, t, eff) ->
+              let effs = checker.sDelete "Alloc" eff in
+              if not (checker.isNil effs) then (print "let needs an effect-free expression, and this one has "; print (checker.showSet effs); println "; use def"; s)
+              else case checkWith s (Cons((false, DDef(x, t, e)), box Nil)) EUnit of
+                { Rejected(msg) -> println (here s msg); s
+                | Core(core, m2, t2, eff2) -> case s of
+                    { Session(path, decls, w) ->
+                        print x; print " : "; println (checker.showTy t);
+                        Session(path, append decls (Cons((false, DDef(x, t, e)), box Nil)), growCells w core) } } } }
+
+def takeTo : u8 -> List u8 -> List u8 =
+  \c s. case s of { Nil -> Nil | Cons(x, rest) -> if x == c then Nil else Cons(x, box (takeTo c (unbox rest))) }
+
+def dropTo : u8 -> List u8 -> List u8 =
+  \c s. case s of { Nil -> Nil | Cons(x, rest) -> if x == c then unbox rest else dropTo c (unbox rest) }
+
+-- :load path: the file alone, cells as it declares them.
+def loadFile : Session -> List u8 ->{Files, IO, Diverge, Panic} Session =
+  \s path. let fresh = Session(path, Nil, freshWorld ()) in
+    case checkWith fresh Nil EUnit of
+      { Rejected(msg) -> println msg; s
+      | Core(core, m, t, eff) -> print "ok: loaded "; println path; Session(path, Nil, growCells (freshWorld ()) core) }
+
+-- Lines up to :} joined, for :{.
+def block : List u8 ->{IO, Input, Diverge} List u8 =
+  \acc. print "     | "; case readLineOpt Nil of
+    { None -> acc
+    | Some(l) -> if string.equal (trim l) ":}" then acc else block (if checker.isNil acc then l else append acc (Cons('\n', box l))) }
+
+def input : Session -> List u8 ->{Files, IO, Input, Diverge, Panic} Session =
+  \s line.
+    if startsWith "let " line then letBind s (afterWord line)
+    else if isDecl line then declare s line
+    else runExpr s line
+
+def command : Session -> List u8 ->{Files, IO, Input, Diverge, Panic} Option Session =
+  \s line. let cmd = firstWord line in let arg = afterWord line in
+    if string.equal cmd ":q" || string.equal cmd ":quit" then None
+    else if string.equal cmd ":help" || string.equal cmd ":h" || string.equal cmd ":?" then (println (help ()); Some(s))
+    else if string.equal cmd ":t" || string.equal cmd ":type" then (typeOf s arg; Some(s))
+    else if string.equal cmd ":l" || string.equal cmd ":load" then Some(loadFile s arg)
+    else if string.equal cmd ":r" || string.equal cmd ":reload" || string.equal cmd ":clear" then
+      (case s of { Session(path, decls, w) -> if checker.isNil path then Some(Session(path, Nil, freshWorld ())) else Some(loadFile s path) })
+    else if string.equal cmd ":{" then Some(input s (trim (block Nil)))
+    else (print "unknown command "; print cmd; println " (:help lists them)"; Some(s))
+
+def loop : Session ->{Files, IO, Input, Diverge, Panic} i64 =
+  \s. print "keel> "; case readLineOpt Nil of
+    { None -> putc('\n'); 0
+    | Some(raw) -> let line = trim raw in
+        if checker.isNil line then loop s
+        else if startsWith ":" line then (case command s line of { Some(s2) -> loop s2 | None -> putc('\n'); 0 })
+        else loop (input s line) }
+
+main = loop (Session(Nil, Nil, freshWorld ()))

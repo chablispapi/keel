@@ -1,0 +1,7 @@
+keel> ok: loaded examples/fact.kl
+keel> 120
+keel> ok: loaded examples/fact.kl
+keel> 6
+keel> missing test/repl/does-not-exist.kl
+keel> 2
+keel> 

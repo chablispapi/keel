@@ -208,16 +208,35 @@ def dropN : forall (a : Free). i64 -> List a ->{Diverge} List a =
 -- A program from its entry file: the prelude's declarations, every module's declarations
 -- under program-wide names, and the entry's main; or why it couldn't be loaded.
 def programOf : List u8 ->{Files, Diverge, Panic} Result (List Decl, (List (Bool, Decl), Option Term)) (List u8) =
-  \path. case load "selfhost/prelude.kl" of
+  \path. programWith path Nil None
+
+-- The same with declarations added to the entry module and, when given, another main (the
+-- REPL's input). With no path the entry is an empty module, repl.
+def programWith : List u8 -> List (Bool, Decl) -> Option Term ->{Files, Diverge, Panic} Result (List Decl, (List (Bool, Decl), Option Term)) (List u8) =
+  \path extra main2. case load "selfhost/prelude.kl" of
     { Err(e) -> Err(e)
     | Ok(pre) -> case pre of
-        { Module(pimps, pds, pentry) -> case visit (dirOf path) Nil (baseName path) path Nil of
+        { Module(pimps, pds, pentry) ->
+            let entry = if checker.isNil path then "repl" else baseName path in
+            let found = if checker.isNil path then Ok(Cons(("repl", ("repl.kl", Module(Nil, Nil, None))), box Nil)) else visit (dirOf path) Nil entry path Nil in
+            case found of
             { Err(e) -> Err(e)
-            | Ok(ms) ->
-                let entry = baseName path in
+            | Ok(ms0) ->
+                let ms = map (\nm. let (n, pm) = nm in let (fp, m) = pm in
+                  if string.equal n entry then (case m of { Module(imps, ds, own) -> (n, (fp, Module(imps, append ds extra, case main2 of { Some(e) -> Some(e) | None -> own }))) })
+                  else nm) ms0 in
                 let lib = map (\pd. let (priv, d) = pd in d) pds in
                 let sc = Scope(namesBy false ms, namesBy true ms, checker.concatMap checker.declared lib, entry) in
                 let resolved = map (\nm. resolve sc nm) ms in
                 let decls = checker.concatMap (\dm. let (ds, m) = dm in map (\d. (false, d)) ds) resolved in
                 let mains = checker.concatMap (\dm. let (ds, m) = dm in case m of { Some(e) -> Cons(e, box Nil) | None -> Nil }) resolved in
                 Ok((lib, (decls, case mains of { Cons(e, rest) -> Some(e) | Nil -> None }))) } } }
+
+-- Source text typed at a prompt, parsed as a module, or the parse error.
+def parseText : List u8 ->{Diverge, Panic} Result Module (List u8) = \text. parseTextAt text 1
+
+-- The same, with the first character at this column (a prefix the user didn't type can
+-- start left of column 1).
+def parseTextAt : List u8 -> i64 ->{Diverge, Panic} Result Module (List u8) =
+  \text col. let (m, ts) = parser.parse (lexer.lex text 1 col) in
+    case parser.tok ts of { Error(msg) -> Err(msg) | _ -> Ok(m) }

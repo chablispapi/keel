@@ -1,0 +1,3 @@
+cell c : u32 = 0
+set(c, 41)
+get(c) + 1

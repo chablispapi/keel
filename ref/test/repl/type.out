@@ -1,0 +1,4 @@
+keel> ∀a b 'e. (a →{'e} b) → List[a] →{'e} List[b]
+keel> i64 ! {Panic}
+keel> ∀a. List[a] →{Panic} i64
+keel> 

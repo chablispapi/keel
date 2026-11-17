@@ -1,0 +1,6 @@
+:load examples/fact.kl
+fact 5
+:r
+fact 3
+:load test/repl/does-not-exist.kl
+fact 2

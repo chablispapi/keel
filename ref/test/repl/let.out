@@ -1,0 +1,5 @@
+keel> x : i64
+keel> 6
+keel> error [BadDecl]: duplicate def name
+keel> let needs an effect-free expression, and this one has {IO}; use def
+keel> 

@@ -645,3 +645,18 @@ def dropN : forall (a : Free). i64 -> List a ->{Diverge} List a =
 
 def any : forall (a : Free) 'e. (a ->{'e} Bool) -> List a ->{'e} Bool =
   \p xs. case xs of { Nil -> false | Cons(x, rest) -> if p x then true else any p (unbox rest) }
+
+-- For the REPL: a world with no cells yet, and running in a world kept between commands.
+-- Declarations only ever append cells, so the world grows to the program's cells.
+def freshWorld : Unit -> World = \u. World(array.empty, Fs(Nil, Nil, Nil, Nil), Net(Nil, Nil, 3, 49152, 0))
+
+def growCells : World -> List Decl ->{Diverge, Panic} World =
+  \w ds. let want = cellInits ds in
+    let have = cellsOf w in
+    withCells w (growFrom have want (array.length have))
+
+def growFrom : Array i64 -> Array i64 -> i64 ->{Diverge, Panic} Array i64 =
+  \have want i. if i >= array.length want then have else growFrom (array.push have (array.get want i)) want (i + 1)
+
+def runIn : World -> List Decl -> Term ->{Diverge, Panic, IO, Input} Out =
+  \w ds m. eval (globalsOf ds) Nil Nil m (growCells w ds)
