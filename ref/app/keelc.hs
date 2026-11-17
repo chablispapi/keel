@@ -35,7 +35,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Keel.Infer (inferProgram)
 import Keel.Lsp (serve)
 import Keel.Modules (loadModules)
-import Keel.Mono (compile)
+import Keel.Mono (compile, typecheck)
 import Keel.X86 (compileX86, linkCommand)
 import System.Info qualified as Info
 import Keel.RiscV (Board (..), compileRiscVFor)
@@ -75,7 +75,7 @@ main = do
       case cmd of
         "check" -> do
           (sources, core) <- load (jobEntry job)
-          mono <- orDie (showErr sources (compile core))
+          mono <- orDie (showErr sources (typecheck core))
           (t, eff) <- orDie (showErr sources (checkProgram mono))
           putStrLn ("ok: main : " ++ prettyTy t ++ (if null (prettyEff eff) then "" else " ! " ++ prettyEff eff))
         "run" -> do
@@ -186,7 +186,7 @@ load :: FilePath -> IO (M.Map FilePath String, Program)
 load f = do
   (surface, sources) <- orDie =<< loadModules f
   core <- orDie (showErr sources (inferProgram surface))
-  _ <- orDie (showErr sources (compile core))
+  _ <- orDie (showErr sources (typecheck core))
   pure (sources, core)
 
 -- | With -g, cc turns the line table into DWARF and runs dsymutil (OUT.dSYM), so lldb can

@@ -27,7 +27,7 @@ import Keel.Check (TypeError (..))
 import Keel.Infer (inferProgram)
 import Keel.Modules (importPath, loadModulesWith)
 import Keel.Parser (parseModule)
-import Keel.Mono (compile)
+import Keel.Mono (typecheck)
 import Keel.Syntax
 import Numeric (readHex, showHex)
 import System.Directory (doesFileExist)
@@ -152,7 +152,7 @@ diagnose overlay file = do
     loaded <- loadModulesWith readSource entry
     let ds = case loaded of
           Left e -> [fromString entry e]
-          Right (prog, _) -> case inferProgram prog >>= compile of
+          Right (prog, _) -> case inferProgram prog >>= typecheck of
             Left (TypeError k msg pos) -> case pos of
               Just (f, l, c) -> [Diag f l c (msg ++ " [" ++ show k ++ "]")]
               Nothing -> [Diag entry 1 1 (msg ++ " [" ++ show k ++ "]")]

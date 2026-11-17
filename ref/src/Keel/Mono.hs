@@ -3,7 +3,7 @@
 --
 -- The output has no ∀, no type application, and no type variables outside data and codata
 -- declarations, which stay as layout templates instantiated at closed types.
-module Keel.Mono (monomorphize, isClosed, compile, compileWith) where
+module Keel.Mono (monomorphize, isClosed, typecheck, compile, compileWith) where
 
 import Control.Monad (forM_, unless)
 import Data.List (intercalate)
@@ -14,19 +14,27 @@ import Keel.Elab (checkRefs, elaborate)
 import Keel.Opt (optimizeWith)
 import Keel.Syntax
 
--- | The whole pipeline: place rules, elaboration, type checking, monomorphization,
--- optimization, and a final check of the result.
+-- | Every error a program can have: place rules, elaboration, type checking and
+-- monomorphization (which rejects polymorphic recursion and accidental handling). The
+-- monomorphic program, checked. keelc check and the language server stop here: the optimizer
+-- is most of compile's time and finds no errors in a correct compiler.
+typecheck :: Program -> Either TypeError Program
+typecheck p = do
+  checkRefs p
+  let core = elaborate p
+  _ <- checkProgram core
+  mono <- monomorphize core
+  _ <- checkProgram mono
+  pure mono
+
+-- | The whole pipeline: typecheck, then optimization and a final check of the result.
 compile :: Program -> Either TypeError Program
 compile = compileWith False
 
 -- | With @debug@, positions survive optimization (for the line table).
 compileWith :: Bool -> Program -> Either TypeError Program
 compileWith debug p = do
-  checkRefs p
-  let core = elaborate p
-  _ <- checkProgram core
-  mono <- monomorphize core
-  _ <- checkProgram mono
+  mono <- typecheck p
   -- Optimize (spec/perf.md) and check again: an optimizer bug shows up as a type error.
   let opt = optimizeWith debug mono
   _ <- checkProgram opt
