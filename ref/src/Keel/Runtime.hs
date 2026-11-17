@@ -465,16 +465,15 @@ alloc a maxSmall = do
 dropBlock :: Monad m => Asm m -> m ()
 dropBlock a = do
   fn a "_keel_drop"
+  -- Most drops only decrement: do that before setting up the frame.
+  decrement fast
   frame a 3
+  jump a zero
+  label a fast
+  ret a
   label a top
-  load a (Half32 True) (T 0) (A 0) (-8)
-  branch a Lts (T 0) (I 0) done -- immortal
-  op a Shr (T 1) (T 0) (I 10)
-  branch a Eq (T 1) (I 0) "_keel_panic_rc" -- the count was 0: a freed block
-  op a Sub (T 0) (T 0) (I 1024)
-  store a (Half32 False) (T 0) (A 0) (-8)
-  op a Shr (T 1) (T 0) (I 10)
-  branch a Ne (T 1) (I 0) done
+  decrement done
+  label a zero
   loadSym a (T 1) "_keel_arena_base"
   branch a Geu (A 0) (R (T 1)) done -- in an open arena: freed when it closes
   stat a 24 (T 1) (T 2)
@@ -539,7 +538,19 @@ dropBlock a = do
   load a Word (T 0) Sp (slot a 1)
   jump a elems
   where
+    -- Decrement A 0's count; go to @out@ unless it reached zero (or the block is immortal).
+    decrement out = do
+      load a (Half32 True) (T 0) (A 0) (-8)
+      branch a Lts (T 0) (I 0) out -- immortal
+      op a Shr (T 1) (T 0) (I 10)
+      branch a Eq (T 1) (I 0) "_keel_panic_rc" -- the count was 0: a freed block
+      op a Sub (T 0) (T 0) (I 1024)
+      store a (Half32 False) (T 0) (A 0) (-8)
+      op a Shr (T 1) (T 0) (I 10)
+      branch a Ne (T 1) (I 0) out
     top = local a "drop_top"
+    fast = local a "drop_fast"
+    zero = local a "drop_zero"
     done = local a "drop_ret"
     split = local a "drop_split"
     loop = local a "drop_loop"
