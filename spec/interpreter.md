@@ -67,8 +67,9 @@ type Globals = map.Map (List u8) Global                -- never captured by a cl
   is allowed because top-level bodies are effect-free, which the checker enforces. Because
   globals are never in a local `Env`, local environments stay small, so an association list is
   fine. A REPL `def` is a map insert.
-- Every recursive `Value` field goes through `Box`, `List`, `Array` or a function. Keel rejects
-  anything else as `InfiniteSize`.
+- Every recursive `Value` field goes through `Box` or a function. `List` alone is not enough:
+  `Cons` holds its element unboxed, so `VClo(List (…, Value), …)` is `InfiniteSize`. Hence
+  `Box Env`.
 - **Devices are effects, not state.** eval.kl *performs* the builtin operations it does not
   model: `out`, `putc`, `getc`, `openFile`, `createFile`, `appendFile`, `readByte`,
   `writeBytes`, `closeFile`, `tcpListen`/`tcpAccept`/`tcpConnect`, `sock*`, `pollWait` and
@@ -82,7 +83,7 @@ type Globals = map.Map (List u8) Global                -- never captured by a cl
 
   The only state eval.kl threads itself is the cell array (`Array u64`, O(1) load and store).
   Output is written as it happens, so a panic needs no flush step. `eval` returns
-  `Val(Value, Cells) | Bad(List u8, Cells)` (plus `Call` if M0 picks the trampoline). `Bad` is a
+  `Val(Value, Cells) | Bad(List u8, Cells)`. `Bad` is a
   panic of the interpreted program, and only interpreter bugs panic the interpreter itself.
 - **Integers follow `Eval.hs`'s shape (`Eval.hs:364`)**: compute the exact result, then
   range-check it against the width. Values are stored as their bit pattern in an `i64`.
@@ -95,15 +96,12 @@ type Globals = map.Map (List u8) Global                -- never captured by a cl
   - Shift counts are clamped to 64, and a shift of 64 is a special case because the native
     shift would not give `Eval.hs`'s Integer result. `>>` is arithmetic on signed widths and
     logical on unsigned ones.
-- **Native stack: decided in M0, not later.** `keelc run` runs on GHC's growable stack. A
-  natively built interpreter does not. The corpus includes `selfhost/*.kl`, so the interpreter
-  will run `parser.kl` and `checker.kl`, both of which recurse over long lists without tail
-  calls. M0 measures and picks one design:
-  - *Trampoline*: `eval` takes a tail-position flag. An application in tail position returns
-    `Call(env', hs, body, cells)`, and a driver loop typed `Diverge` bounces it. This bounds
-    tail loops only.
-  - *CEK*: an explicit continuation stack. This bounds everything. Pick it if any corpus file's
-    non-tail depth times the `eval` frame size comes near the native stack.
+- **Native stack: plain recursion (decided in M0).** `eval` is an ordinary recursive function,
+  with no trampoline and no CEK machine. keelc compiles tail calls as jumps, so if `eval` calls
+  itself in tail position for an application's body, a `let` body, the branches of `if` and
+  `case`, and the second half of `;`, an interpreted tail call takes no native stack. **Keep
+  those calls in tail position:** no wrapping or post-processing of their result. Non-tail
+  interpreted calls cost about 2.5 native frames each (see M0 results).
 
 ### Semantics to port, in order
 
@@ -250,7 +248,36 @@ The two traps listed for M0(a) were not real. Literal widths were already solved
 `finish`/`zonkTerm`. The `f64`-suffix `unsupported` is unreachable in the corpus, because float
 literals are `EFloat`.
 
-## Testing
+**(b) Stack, 2026-11-17: plain recursion.**
+
+- On the host targets, a native Keel program runs on the OS main-thread stack (`AArch64.hs:1554`,
+  `X86.hs:1094`). It honours `ulimit -s`, has no overflow check, and dies with SIGSEGV (exit 139)
+  on overflow. RISC-V uses a fixed `.bss` stack: 8 MiB on `Virt`, 64 KiB on `Pico2`
+  (`RiscV.hs:70`). Tail calls are jumps (`AArch64.hs:692`).
+- A toy evaluator shaped like `eval.kl` (parser `Term`s, an association-list env, globals in a
+  map, an `Out` result threading a word) was measured against native code on
+  `down n = 1 + down (n - 1)`. Native code reaches depth ≈260k in 8 MiB (≈32 B per frame), the
+  toy ≈104k (≈80 B per interpreted call). An interpreted tail loop (`sumTo 3000000 0`) runs in
+  64 KiB.
+- Every corpus program that builds natively (66, with the batch differential's inputs) runs in
+  64 KiB, so even a 10× interpreter overhead fits in the default 8 MiB. The deep case is outside
+  the corpus: `core.kl` checking its own 4.3k lines natively needs 2–4 MiB, so interpreting that
+  would need about 10–30 MiB. Document `ulimit -s 65520` (the macOS hard limit) for it rather
+  than build a CEK machine.
+
+**(c) Costs, 2026-11-17.** Medians of 3 runs on the M-series host:
+
+| What | Time |
+|---|---|
+| `keelc check selfhost/core.kl` (parser + checker + load + sexp, ≈4.3k lines) | 10.5 s |
+| `keelc build selfhost/core.kl` / `check.kl` | 16.3 s / 14.8 s |
+| native `core.kl` on `examples/fact.kl` (prelude + program: infer, elaborate, check) | 0.02 s |
+| native `core.kl` on itself | 0.68 s |
+
+Re-checking the session on every REPL line is therefore cheap, unless the loaded file is the
+size of the checker. The cost is in the build. `run.kl` and `repl.kl` will each take about
+20 s+ to build, and `cabal test` builds both.
+
 
 **`selfhostEvalChecks` (batch differential).** Same shape as `selfhostCheckChecks`, and wired
 into the same `sequence` in `Native.hs`:
