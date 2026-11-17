@@ -217,6 +217,35 @@ LLVM's clang when it is installed and link with `cc`: that build went from 4.4 t
 (0.53 s in keelc). Before that, `_ -> e` defaults stopped being copied into each constructor
 (139,000 → 89,000 lines).
 
+Profiled again on 2026-11-17, with `selfhost/repl.kl` (≈5,500 lines with its imports; 558,000
+lines of assembly). `keelc check` took 13.5 s and `keelc build` 20 s. The time went to the
+compiler, not the assembler:
+
+- **The optimizer ran twice per command, and `check` ran it too.** `load`, which every
+  command runs first, called the whole of `compile` to report errors. The command then
+  compiled again. `Keel.Mono.typecheck` is now the pipeline up to the checked monomorphic
+  program. `load`, `check` and the language server stop there.
+- **`liftClosed` rebuilt the signature for every definition and every candidate λ**
+  (`localTypes`, `typeOfClosed`), and `buildSig`'s duplicate check used `nub`, which is
+  quadratic. That was half of all time. The signature is now built once, and duplicates are
+  found with a set.
+- **Termination recomputed a member's assigned variables for every choice of parameter
+  positions** (up to 4,096 per group). It now computes them once per member.
+
+The emitted assembly is byte-identical. Medians of 3 runs:
+
+| File | `check` | `build` | `asm` | Assembly lines |
+|---|---|---|---|---|
+| `selfhost/repl.kl` | 13.5 → 0.76 s | 20 → 6.97 s | 3.43 s | 558,190 |
+| `selfhost/check.kl` | 9.1 → 0.59 s | 5.98 s | 2.82 s | 492,239 |
+| `examples/fact.kl` | 0.02 s | 0.19 s | 0.02 s | 504 |
+
+Of `repl.kl`'s build, keelc now takes about 3.4 s and LLVM's clang 3.7 s, both proportional to
+the size of the assembly. Of the 479,000 instructions, the inlined reference-count increment
+(6 instructions, 15,401 copies) is 19%. Monomorphization duplicates generic code per type:
+36 copies of `std.map`'s `balance`. `build` still type-checks twice (in `load` and in the
+back end's `prepareAt`), about 0.4 s.
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and
