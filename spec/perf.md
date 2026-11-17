@@ -255,6 +255,14 @@ The assembly shrinks by 16.6%, to 465,672 lines, and the build drops from 7.0 to
 copies of `std.map`'s `balance` become one. So do optimizer specializations that came out
 identical, which merging by memory layout would have missed.
 
+**Rejected: the reference-count increment out of line** (2026-11-17). Replacing the inline
+6-instruction increment with `bl _keel_dup` shrank `repl.kl`'s assembly a further 16.6% and its
+build by 0.3 s (6.3 → 6.0 s). Measured A/B, interleaved, median of 7: the `bench/` programs
+and the larger Haskell-comparison workloads stayed within ±2%, because the optimizer already
+keeps refcounting out of their hot loops. Real programs got slower: the self-hosted checker on
+its own source by 15% (665 → 762 ms) and the self-hosted interpreter by 24%
+(1410 → 1752 ms). The increment stays inline.
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and
