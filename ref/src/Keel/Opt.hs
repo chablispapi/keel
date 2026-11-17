@@ -22,10 +22,12 @@
 --    tail position, so their return clause is the identity). All or nothing: a handler that is
 --    still needed somewhere stays where it was, so no clause ever needs a lift.
 -- 5. __Dead definitions__ (not reachable from @main@) are removed.
+-- 6. __Constant calls__ ('foldConstants', run per word size by the back ends): a call whose
+--    arguments are all constants and whose value is plain data is evaluated at build time.
 --
 -- Inlined code is renamed apart, since the core forbids shadowing. The result is checked
 -- again by the core checker ("Keel.Mono".compile).
-module Keel.Opt (optimize, optimizeWith) where
+module Keel.Opt (foldConstants, optimize, optimizeWith) where
 
 import Control.Monad (forM)
 import Control.Monad.Trans.State.Strict (State, evalState, get, gets, modify, put, runState, state)
@@ -34,6 +36,7 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
 import Keel.Check (buildSig, localTypesIn, recursiveGroups, typeOfClosedIn)
+import Keel.Eval (Value (..), evalClosed, globalsOf)
 import Keel.Syntax
 
 optimize :: Program -> Program
@@ -486,3 +489,58 @@ removeDead (Program decls main) = Program [d | d <- decls, keep d] main
       | otherwise = go (S.insert f seen) (maybe [] refs (M.lookup f defs) ++ fs)
     keep (Def f _ _) = f `S.member` live
     keep _ = True
+
+-- Constant calls ------------------------------------------------------------------------------
+
+-- | Evaluate calls of top-level functions whose arguments are all constants
+-- (@string.split ' ' "data def let"@, @keywords ()@) at build time, when they return plain
+-- data (integers, Bool, Unit, constructors, boxes, pairs) within a budget: lowering makes such
+-- a value a static block, so the program neither builds nor frees it. A call that panics,
+-- runs out of fuel or performs an operation it doesn't handle itself stays a call. Runs on a
+-- program resolved for its word size ('resolveWord'), as the evaluator expects.
+foldConstants :: Program -> Program
+foldConstants prog@(Program decls main) = case buildSig decls of
+  Left _ -> prog
+  Right sig -> Program [onDecl sig d | d <- decls] (go sig M.empty main)
+  where
+    globals = globalsOf decls
+    fuel = 100000 -- applications per call
+    maxNodes = 10000 -- terms in the folded value
+    cons = M.fromList [(c, (d, ps, fs)) | Data _ d ps cs <- optionDecl : decls, (c, fs) <- cs]
+    onDecl sig (Def f t e) = Def f t (go sig M.empty e)
+    onDecl _ d = d
+    -- env: the variables let-bound to constants (inlining leaves arguments there).
+    go sig env tm = case tm of
+      Let x e body | Just c <- constant env (stripAt e) ->
+        let body' = go sig (M.insert x c env) body
+         in if x `S.member` freeVars body' then Let x e body' else body' -- a constant: nothing to run
+      _ -> fromMaybe (descend (go sig env) tm) (fold sig env tm)
+    fold sig env tm = do
+      (Var f, args@(_ : _)) <- pure (spine (stripAt tm))
+      True <- pure (M.member f globals && M.notMember f env)
+      call <- foldl App (Var f) <$> mapM (constant env) args
+      Right ty <- pure (typeOfClosedIn sig call)
+      v <- evalClosed fuel globals call
+      tm' <- toTerm ty v
+      True <- pure (size tm' <= maxNodes && typeOfClosedIn sig tm' == Right ty)
+      pure tm'
+    -- The constant a term denotes, with let-bound constants substituted.
+    constant env tm = case tm of
+      UnitLit -> Just tm
+      BoolLit _ -> Just tm
+      IntLit _ _ -> Just tm
+      Var x -> M.lookup x env
+      Con c tys as -> Con c tys <$> mapM (constant env . stripAt) as
+      Box a -> Box <$> constant env (stripAt a)
+      Pair a b -> Pair <$> constant env (stripAt a) <*> constant env (stripAt b)
+      _ -> Nothing
+    toTerm ty v = case (ty, v) of
+      (TUnit, VUnit) -> Just UnitLit
+      (TBool, VBool b) -> Just (BoolLit b)
+      (TInt it, VInt _ n) -> Just (IntLit it n)
+      (TBox t, VBox a) -> Box <$> toTerm t a
+      (TPair a b, VPair x y) -> Pair <$> toTerm a x <*> toTerm b y
+      (TData d tys, VCon c vs) | Just (d', ps, fs) <- M.lookup c cons, d' == d, length fs == length vs ->
+        let inst = substTy (M.fromList (zip ps tys)) M.empty
+         in Con c tys <$> sequence (zipWith toTerm (map inst fs) vs)
+      _ -> Nothing

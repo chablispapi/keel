@@ -31,6 +31,7 @@ import Keel.Lower
 import Keel.Runtime qualified as R
 import Keel.Range (ranges)
 import Keel.Mono (compileWith)
+import Keel.Opt (foldConstants)
 import Keel.Syntax
 
 -- | The whole pipeline: check, elaborate, monomorphize, lower, emit.
@@ -61,7 +62,7 @@ prepareAt :: Int -> Bool -> Program -> Either String ([Decl], Ty, LProg)
 prepareAt word debug p = do
   checked <- either (Left . show) Right (compileWith debug p)
   (t, _) <- either (Left . show) Right (checkProgram checked)
-  let mono = resolveWord word checked
+  let mono = foldConstants (resolveWord word checked)
   lp <- (if debug then id else fold) . ranges <$> lower word mono
   let Program decls _ = mono
   pure (optionDecl : decls, resolveTyWord word t, lp)

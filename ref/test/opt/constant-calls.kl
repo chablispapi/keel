@@ -1,0 +1,20 @@
+-- Calls whose arguments are all constants are evaluated at build time when they return data:
+-- the keyword list is a static block, never built or freed (Native.hs checks allocs=0).
+import std.string
+
+def member : List u8 -> List (List u8) -> Bool =
+  \w ws. case ws of { Nil -> false | Cons(x, rest) -> if string.equal w x then true else member w (unbox rest) }
+
+def keyword : List u8 -> Bool = \w. member w (string.split ' ' "data def let in case of")
+
+-- Output stays at run time.
+def greet : Unit ->{IO} i64 = \u. println "hello"; 1
+
+-- Past the build-time budget: computed when the program runs.
+def count : i64 -> i64 ->{Panic, Diverge} i64 = \i acc. if i == 0 then acc else count (i - 1) (acc + 1)
+
+main =
+  out(if keyword "let" then 1 else 0);
+  out(if keyword "lets" then 1 else 0);
+  out(greet ());
+  count 1000000 0

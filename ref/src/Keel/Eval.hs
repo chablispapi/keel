@@ -3,7 +3,7 @@
 -- Theorem 1.
 {-# LANGUAGE ForeignFunctionInterface #-}
 
-module Keel.Eval (Value (..), Outcome (..), Machine (..), evalProgram, evalProgramWith, evalProgramOn, runProgramOn, runProgramAt) where
+module Keel.Eval (Value (..), Outcome (..), Machine (..), evalClosed, globalsOf, evalProgram, evalProgramWith, evalProgramOn, runProgramOn, runProgramAt) where
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
@@ -73,7 +73,7 @@ data Machine = Machine {mInput :: String, mFiles :: FilePath -> Maybe String, mH
 -- | Evaluation can panic, and changes the world: input not yet read, output written (newest
 -- chunk first), the open files' unread bytes by handle, the files written (Nothing: none can
 -- be) and the handles writing them, and the network (if there is one).
-data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wWritten :: Maybe (M.Map FilePath String), wWriting :: M.Map Integer FilePath, wNet :: Maybe Net, wCells :: M.Map Integer Value}
+data World = World {wInput :: String, wOutput :: [String], wFiles :: FilePath -> Maybe String, wOpen :: M.Map Integer String, wWritten :: Maybe (M.Map FilePath String), wWriting :: M.Map Integer FilePath, wNet :: Maybe Net, wCells :: M.Map Integer Value, wFuel :: Maybe Int}
 
 -- | A loopback network, all inside the program: listeners by fd (port, connections waiting to
 -- be accepted), connected sockets by fd, the next fd and free port, and a clock that only
@@ -111,12 +111,29 @@ runProgramAt word m p = runResolved m (resolveWord word p)
 runResolved :: Machine -> Program -> (Outcome, String, M.Map FilePath String)
 runResolved (Machine input files hosted) (Program decls main) = (either Panicked Done r, concat (reverse (wOutput w)), fromMaybe M.empty (wWritten w))
   where
-    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if hosted then Just M.empty else Nothing) M.empty (if hosted then Just (Net M.empty M.empty 3 49152 0) else Nothing) (M.fromList (zip [0 ..] [VInt u64 v | v <- cellInits decls])))
+    (r, w) = runState (runExceptT (eval [] globals main)) (World input [] files M.empty (if hosted then Just M.empty else Nothing) M.empty (if hosted then Just (Net M.empty M.empty 3 49152 0) else Nothing) (M.fromList (zip [0 ..] [VInt u64 v | v <- cellInits decls])) Nothing)
     -- ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
+    globals = globalsOf decls
+
+-- | ρ_Σ: the recursive knot of top-level definitions. Their bodies are effect-free (checked).
+globalsOf :: [Decl] -> Env
+globalsOf decls = globals
+  where
     globals = M.fromList [(f, pureValue (eval [] globals e)) | Def f _ e <- decls]
-    pureValue m = case runState (runExceptT m) (World "" [] (const Nothing) M.empty Nothing M.empty Nothing M.empty) of
-      (Right v, World _ [] _ _ _ _ _ _) -> v
+    pureValue m = case runState (runExceptT m) (emptyWorld Nothing) of
+      (Right v, World {wOutput = []}) -> v
       _ -> stuck "effectful top-level definition"
+
+emptyWorld :: Maybe Int -> World
+emptyWorld = World "" [] (const Nothing) M.empty Nothing M.empty Nothing M.empty
+
+-- | The value of a closed term over these definitions (resolved for the word size), if it has
+-- one within @fuel@ applications and without the machine: Nothing when it panics, runs out of
+-- fuel, or performs an operation no handler in it catches (output, input, cells, files).
+evalClosed :: Int -> Env -> Term -> Maybe Value
+evalClosed fuel globals tm = case fst (runState (runExceptT (eval [] globals tm)) (emptyWorld (Just fuel))) of
+  Right v -> Just v
+  Left _ -> Nothing
 
 -- | @hs@ is the handler stack, innermost first. Evaluation order is CBV: every subterm runs in
 -- the monad, left to right, before its value is used.
@@ -153,7 +170,7 @@ eval hs env tm = case tm of
     va <- eval hs env a
     case vf of
       -- The body runs under the handlers active at the call (deep handlers).
-      VClo cenv x body -> eval hs (M.insert x va cenv) body
+      VClo cenv x body -> spend >> eval hs (M.insert x va cenv) body
       _ -> stuck "application of a non-closure"
   Let x e body -> do
     v <- eval hs env e
@@ -192,6 +209,15 @@ eval hs env tm = case tm of
       _ -> stuck ("observation " ++ o ++ " of a non-codata value")
   _ -> stuck ("surface construct in core: " ++ show tm)
 
+-- | One application, when evaluation has a limit.
+spend :: Run ()
+spend = do
+  fuel <- lift (gets wFuel)
+  case fuel of
+    Nothing -> pure ()
+    Just n | n <= 0 -> throwE "out of fuel"
+    Just n -> lift (modify (\w -> w {wFuel = Just (n - 1)}))
+
 -- | Find the innermost handler for @op@ and run its clause with the handlers *outside* it,
 -- so a clause performing the same operation reaches the next handler out. The clause's value
 -- is the operation's result: tail-resumptive, so no continuation is captured.
@@ -199,7 +225,9 @@ perform :: [Handler] -> String -> Value -> Run Value
 perform hs op v = case break handles hs of
   (_, Handler clauses cenv : outer) | Just (x, body) <- M.lookup op clauses ->
     eval outer (M.insert x v cenv) body
-  _ -> machine op v
+  _ -> do
+    folding <- lift (gets wFuel)
+    maybe (machine op v) (const (throwE "the machine, while folding")) folding
   where
     handles (Handler clauses _) = M.member op clauses
 

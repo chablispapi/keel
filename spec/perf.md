@@ -276,6 +276,19 @@ refcounting. A/B, interleaved, median of 7: the self-hosted interpreter −24%, 
 frame, and returns at once when the count stays above zero. That gave 1–2.5% on the
 self-hosted programs and left the microbenchmarks unchanged.
 
+**Calls with constant arguments evaluated at build time** (same day, `Keel.Opt.foldConstants`).
+The self-hosted front end tests keywords with `member w (string.split ' ' "data def let …")`,
+which built and freed the whole word list on every call (the lexer does it for every
+identifier). The back ends now evaluate any call of a top-level function whose arguments are
+all constants, possibly through `let`s left by inlining, with the reference evaluator. It runs
+after `resolveWord`, with a budget of 100,000 applications and no machine. If the result is
+plain data (integers, Bool, Unit, constructors, boxes, pairs; at most 10,000 terms) and has the
+call's type, it replaces the call, and lowering makes it a static block. A call that panics,
+runs out of fuel, or performs an operation it doesn't handle stays a call. A/B, interleaved,
+median of 7, sources unchanged: parser −66%, REPL −35%, checker −24%, interpreter and `bench/`
+unchanged. Build time is within noise. `test/opt/constant-calls.kl` checks that the program
+makes no allocation.
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and

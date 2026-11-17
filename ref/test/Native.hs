@@ -226,6 +226,7 @@ exampleFiles =
   , ("test/memory/reuse-fast.kl", (Just "374", ""))
   , ("test/opt/capture.kl", (Just "10354", "10\n20\n30\n"))
   , ("test/opt/handlers.kl", (Just "5", "70\n108\n101\n"))
+  , ("test/opt/constant-calls.kl", (Just "1000000", "1\n0\nhello\n1\n"))
   , ("test/syntax/termination.kl", (Just "1", "2\n11\n3\n4\n9\n15\n"))
   , ("test/memory/packed.kl", (Just "(13144, Node(1, box Leaf, box Node(2, box Leaf, box Leaf)))", ""))
   , ("test/memory/reuse-fast-panic.kl", (Nothing, "1\n2147483647\n"))
@@ -862,6 +863,8 @@ runCase dir debug i (name, prog) = case (compile prog, compileNativeWith debug p
             ++ [failMsg ("expected no allocation: " ++ show stats) | name == "test/syntax/known-con.kl", maybe True ((/= 0) . allocs) stats]
             -- Handlers whose operations are all in sight become their clauses: no frames.
             ++ [failMsg ("expected the handlers to be eliminated: " ++ show stats) | name == "test/opt/handlers.kl", maybe True ((/= 0) . allocs) stats]
+            -- Constant calls returning data become static blocks at build time.
+            ++ [failMsg ("expected the constant calls to be folded: " ++ show stats) | name == "test/opt/constant-calls.kl", maybe True ((/= 0) . allocs) stats]
   where
     failMsg msg = "FAIL " ++ name ++ (if debug then " (-g)" else "") ++ ": " ++ msg
 
