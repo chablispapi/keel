@@ -877,10 +877,18 @@ borrowSigs blockWords ptrs funs statics mainF = fixpoint start
           let body = funBody f
               used = S.fromList (concatMap (consumedIn sigs) (rhss body) ++ rets body) <> reusedScrutinees blockWords body
            in [(i, k) | (k, p) <- zip [0 ..] (funParams f), p `S.member` used]
-        -- The caller's own borrowed parameters may be passed on in a tail call; owned values not.
+        -- The caller's own borrowed parameters may be passed on in a tail call, and so may the
+        -- pointer fields read from them (refcount keeps those too: nothing to drop after the
+        -- call); owned values not.
         tailOwned i f =
-          let bor = S.fromList [p | Just bs <- [i >>= (`M.lookup` sigs)], (p, True) <- zip (funParams f) bs]
+          let bor0 = S.fromList [p | Just bs <- [i >>= (`M.lookup` sigs)], (p, True) <- zip (funParams f) bs]
+              -- Names are unique and subExprs lists bindings before their uses: one pass.
+              bor = foldl fieldOf bor0 (subExprs (funBody f))
            in [(j, k) | (j, as) <- tailCalls (funBody f), (k, AVar v) <- zip [0 ..] as, v `S.member` ptrs, v `S.notMember` bor]
+        fieldOf s ex = case ex of
+          Bind x (RField (AVar a) _) _ | a `S.member` s, x `S.member` ptrs -> S.insert x s
+          Bind x (RRel (AVar a) _) _ | a `S.member` s, x `S.member` ptrs -> S.insert x s
+          _ -> s
 
 -- | The functions main can reach, by calls or through closures and static blocks.
 reachableFuns :: M.Map Int Fun -> [(Int, String, [Int])] -> Fun -> S.Set Int

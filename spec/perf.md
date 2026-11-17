@@ -263,6 +263,19 @@ keeps refcounting out of their hot loops. Real programs got slower: the self-hos
 its own source by 15% (665 → 762 ms) and the self-hosted interpreter by 24%
 (1410 → 1752 ms). The increment stays inline.
 
+**Borrowed parameters through recursive tail calls** (2026-11-17, `spec/m4.md` Phase 0).
+`borrowSigs` made a parameter owned when a tail call passed it anything but one of the caller's
+own borrowed parameters. That included fields read from them, which `refcount` already keeps
+without owning. So `std.string.compare`, whose tail call passes `unbox xs` and `unbox ys`,
+owned both strings, and paid two increments and two calls to `_keel_drop` per character.
+Fields of borrowed variables now count as borrowed there too, and `compare` does no
+refcounting. A/B, interleaved, median of 7: the self-hosted interpreter −24%, the checker
+−19%, the REPL −20%, the parser −9%. The `bench/` programs are unchanged.
+
+**A frameless fast path in `_keel_drop`** (same day): it decrements before setting up its
+frame, and returns at once when the count stays above zero. That gave 1–2.5% on the
+self-hosted programs and left the microbenchmarks unchanged.
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and
