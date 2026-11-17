@@ -17,15 +17,13 @@ import eval
 def readLine : List u8 ->{Input, Diverge} List u8 =
   \acc. let c = getc () in if c < 0 || c == 10 then reverse acc else readLine (Cons(c as u8, box acc))
 
--- What the evaluator doesn't do yet: floats, arrays, files and the network.
+-- What the evaluator doesn't do yet: files and the network.
 def unsupportedIn : List Decl -> Term ->{Diverge} Option (List u8) =
   \ds m.
     let terms = Cons(m, box (checker.concatMap (\d. case d of { DDef(f, t, e) -> Cons(e, box Nil) | _ -> Nil }) ds)) in
-    let names = string.split ' ' "floatSqrt floatToBits floatFromBits floatExp floatLog floatSin floatCos floatPow floatFloor arrayEmpty arrayNew arrayLength arrayGet arraySet arrayPush arrayPop arena openFile createFile appendFile readByte writeBytes closeFile tcpListen tcpAccept tcpConnect sockPort sockSend sockRecv sockClose pollWait clockMs" in
+    let names = string.split ' ' "openFile createFile appendFile readByte writeBytes closeFile tcpListen tcpAccept tcpConnect sockPort sockSend sockRecv sockClose pollWait clockMs" in
     checker.firstOf (\t. case t of
-      { EFloat(n, m2, e) -> Some("floats")
-      | EConvert(to, e) -> if string.equal to "f64" then Some("floats") else None
-      | EVar(x) -> if checker.elem x names then Some(x) else None
+      { EVar(x) -> if checker.elem x names then Some(x) else None
       | ETyApp(x, tys) -> if checker.elem x names then Some(x) else None
       | _ -> None }) (checker.concatMap checker.universe terms)
 

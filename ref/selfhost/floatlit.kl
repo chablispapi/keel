@@ -1,0 +1,136 @@
+-- The bit pattern of a decimal float literal, as keelc computes it: the exact value m * 10^e
+-- rounded once to the nearest double, ties to even. A zero value is +0.0, even when negated.
+--
+--   import floatlit
+--   floatlit.literalBits false 12345 (-11)     -- 1.2345e-7
+
+-- Naturals are lists of 32-bit limbs, least significant first. A natural has no zero top
+-- limb (zero is Nil), so comparing lengths compares sizes.
+
+-- x * s + c, limb by limb: s and c are below 2^32, so every product fits in a u64.
+private def mulAdd : List u64 -> u64 -> u64 ->{Diverge, Panic} List u64 =
+  \xs s c. case xs of
+    { Nil -> if c == 0 then Nil else Cons(c, box Nil)
+    | Cons(x, rest) ->
+        let p = x * s + c in
+        Cons(p % 4294967296, box (mulAdd (unbox rest) s (p / 4294967296))) }
+
+-- n * 2^k, for k >= 0, in steps of at most 2^30.
+private def pow2Mul : List u64 -> i64 ->{Diverge, Panic} List u64 =
+  \n k. if k >= 30 then pow2Mul (mulAdd n 1073741824 0) (k - 30)
+        else if k > 0 then mulAdd n ((1 as u64) lsl (k as u64)) 0
+        else n
+
+-- n * 10^k, for k >= 0.
+private def pow10Mul : List u64 -> i64 ->{Diverge, Panic} List u64 =
+  \n k. if k <= 0 then n else pow10Mul (mulAdd n 10 0) (k - 1)
+
+-- The natural with the value of x, a u64.
+private def ofU64 : u64 ->{Diverge, Panic} List u64 =
+  \x. trimL (Cons(x % 4294967296, box Cons(x / 4294967296, box Nil)))
+
+-- The list reversed onto acc.
+private def revL : List u64 -> List u64 ->{Diverge, Panic} List u64 =
+  \xs acc. case xs of
+    { Nil -> acc
+    | Cons(x, rest) -> revL (unbox rest) (Cons(x, box acc)) }
+
+-- Drops the zero limbs at the front of a most-significant-first list.
+private def dropZeros : List u64 ->{Diverge, Panic} List u64 =
+  \ms. case ms of
+    { Nil -> Nil
+    | Cons(x, rest) -> if x == 0 then dropZeros (unbox rest) else Cons(x, rest) }
+
+-- A list with its zero top limbs removed.
+private def trimL : List u64 ->{Diverge, Panic} List u64 =
+  \xs. revL (dropZeros (revL xs Nil)) Nil
+
+-- a - b with a borrow bw taken from the bottom limb; the result is not trimmed.
+private def subFrom : List u64 -> List u64 -> u64 ->{Diverge, Panic} List u64 =
+  \a b bw. case a of
+    { Nil -> Nil
+    | Cons(x, ra) ->
+        let (y, rb) = case b of { Nil -> (0, Nil) | Cons(y0, rb0) -> (y0, unbox rb0) } in
+        let d = x + 4294967296 - y - bw in
+        Cons(d % 4294967296, box (subFrom (unbox ra) rb (if d >= 4294967296 then 0 else 1))) }
+
+-- a - b, for a >= b.
+private def subN : List u64 -> List u64 ->{Diverge, Panic} List u64 =
+  \a b. trimL (subFrom a b 0)
+
+private def lenL : List u64 ->{Diverge, Panic} i64 =
+  \xs. case xs of { Nil -> 0 | Cons(_, rest) -> 1 + lenL (unbox rest) }
+
+-- -1, 0 or 1 by the limbs of two equal-length naturals, most significant first.
+private def cmpSame : List u64 -> List u64 ->{Diverge, Panic} i64 =
+  \a b. case a of
+    { Nil -> 0
+    | Cons(x, ra) -> case b of
+        { Nil -> 0
+        | Cons(y, rb) ->
+            if x < y then -1 else if x > y then 1 else cmpSame (unbox ra) (unbox rb) } }
+
+-- -1, 0 or 1 as a < b, a == b, a > b.
+private def cmpL : List u64 -> List u64 ->{Diverge, Panic} i64 =
+  \a b. let la = lenL a in
+    let lb = lenL b in
+    if la < lb then -1
+    else if la > lb then 1
+    else cmpSame (revL a Nil) (revL b Nil)
+
+-- The bits in a 32-bit limb.
+private def bits32 : u64 ->{Diverge, Panic} i64 =
+  \x. if x == 0 then 0 else 1 + bits32 (x / 2)
+
+-- The bit length of a natural: 0 for zero.
+private def bitLen : List u64 ->{Diverge, Panic} i64 =
+  \xs. case xs of
+    { Nil -> 0
+    | Cons(x, rest) -> case rest of
+        { Nil -> bits32 x
+        | Cons(_, _) -> 32 + bitLen (unbox rest) } }
+
+-- Where n / (d * 2^k) lies: -1 below 2^52, 1 at or above 2^53, 0 in between.
+private def placeOf : List u64 -> List u64 -> i64 ->{Diverge, Panic} i64 =
+  \n d k. let a = if k < 0 then pow2Mul n (0 - k) else n in
+    let b = if k > 0 then pow2Mul d k else d in
+    if cmpL a (pow2Mul b 52) < 0 then -1
+    else if cmpL a (pow2Mul b 53) >= 0 then 1
+    else 0
+
+-- The k at which n / (d * 2^k) is in [2^52, 2^53), searched from k.
+private def findK : List u64 -> List u64 -> i64 ->{Diverge, Panic} i64 =
+  \n d k. let p = placeOf n d k in
+    if p < 0 then findK n d (k - 1)
+    else if p > 0 then findK n d (k + 1)
+    else k
+
+-- The quotient and remainder of n by d, for a quotient below 2^54: one bit per step, from
+-- bit i down to 0. Call with i = 53 and q = 0, r = n.
+private def divBits : List u64 -> i64 -> u64 -> List u64 ->{Diverge, Panic} (u64, List u64) =
+  \d i q r. if i < 0 then (q, r)
+    else let t = pow2Mul d i in
+      if cmpL t r <= 0 then divBits d (i - 1) (q + ((1 as u64) lsl (i as u64))) (subN r t)
+      else divBits d (i - 1) q r
+
+-- The double nearest to m * 10^e, negated when isNeg (zero stays +0.0).
+def literalBits : Bool -> u64 -> i64 ->{Diverge, Panic} u64 =
+  \isNeg m e. if m == 0 then 0 else
+    let n = pow10Mul (ofU64 m) (if e > 0 then e else 0) in
+    let d = pow10Mul (ofU64 1) (if e < 0 then 0 - e else 0) in
+    -- The estimate from bit lengths, adjusted so that q is in [2^52, 2^53).
+    let k1 = findK n d (bitLen n - bitLen d - 53) in
+    -- Below the normal range the exponent stays at the subnormal scale, -1074.
+    let k = if k1 + 1075 < 1 then -1074 else k1 in
+    let nn = if k < 0 then pow2Mul n (0 - k) else n in
+    let dd = if k > 0 then pow2Mul d k else d in
+    let (q0, r) = divBits dd 53 0 nn in
+    -- Round to nearest, ties to even: 2r against dd.
+    let c = cmpL (mulAdd r 2 0) dd in
+    let q1 = if c > 0 || (c == 0 && q0 % 2 == 1) then q0 + 1 else q0 in
+    let (q, kk) = if q1 == 9007199254740992 then (4503599627370496, k + 1) else (q1, k) in
+    let ex = if q >= 4503599627370496 then kk + 1075 else 0 in
+    if ex >= 2047 then 0x7ff0_0000_0000_0000
+    else
+      let bits = ((ex as u64) lsl 52) lor (q land 4503599627370495) in
+      if isNeg then bits lor 0x8000_0000_0000_0000 else bits

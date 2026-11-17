@@ -15,6 +15,7 @@ import std.array
 import parser
 import checker
 import ints
+import floatlit
 
 data Value =
     VUnit | VInt(W, i64) | VFloat(f64) | VBool(Bool)
@@ -66,15 +67,17 @@ def eval : G -> List H -> List (List u8, Value) -> Term -> Array i64 ->{Diverge,
             | None -> Bad(append "stuck: unbound " x, cells) } })
     | ETyApp(f, tys) ->
         if isLocal f env || isGlobal g f then eval g hs env (EVar(f)) cells
-        else Bad(append "unsupported: " f, cells)
+        else if string.equal f "arrayEmpty" then Val(VArray(box array.empty), cells)
+        else Bad(append "stuck: unbound " f, cells)
     | EUnit -> Val(VUnit, cells)
     | EBool(b) -> Val(VBool(b), cells)
     | ENum(neg, mag, it) -> let w = widthOf it in Val(VInt(w, norm w (if neg then 0 -% (mag as i64) else mag as i64)), cells)
-    | EFloat(neg, m, e) -> Bad("unsupported: floats", cells)
+    | EFloat(neg, m, e) -> Val(VFloat(floatFromBits (literalBits neg m e)), cells)
     | EConvert(to, e) -> (case eval g hs env (unbox e) cells of
         { Val(v, cells) -> (case v of
-            { VInt(w, x) -> if string.equal to "f64" then Bad("unsupported: floats", cells) else (let tw = widthOf to in Val(VInt(tw, norm tw x), cells))
-            | _ -> Bad("unsupported: floats", cells) })
+            { VInt(w, x) -> if string.equal to "f64" then Val(VFloat(intToFloat w x), cells) else (let tw = widthOf to in Val(VInt(tw, norm tw x), cells))
+            | VFloat(d) -> Val(VInt(widthOf to, floatToInt (widthOf to) d), cells)
+            | _ -> Bad("stuck: conversion of a non-number", cells) })
         | bad -> bad })
     | EPrim(op, a, b) -> (case eval g hs env (unbox a) cells of
         { Val(va, cells) -> (case eval g hs env (unbox b) cells of
@@ -87,7 +90,12 @@ def eval : G -> List H -> List (List u8, Value) -> Term -> Array i64 ->{Diverge,
             | _ -> Bad("stuck: if on a non-Bool", cells) })
         | bad -> bad })
     | ELam(x, t, b) -> Val(VClo(box env, x, unbox b), cells)
-    | EApp(f, a) -> apply g hs env (unbox f) (unbox a) cells -- tail
+    | EApp(f, a) -> (case builtinHead g env tm Nil of
+        { Some(hb) -> let (name, args) = hb in
+            (case evalAll g hs env args cells of
+              { Vals(vs, cells) -> builtin g hs name vs cells -- tail
+              | Stop(m, cells) -> Bad(m, cells) })
+        | None -> apply g hs env (unbox f) (unbox a) cells }) -- tail
     | ELet(x, e, b) -> (case eval g hs env (unbox e) cells of
         { Val(v, cells) -> eval g hs (Cons((x, v), box env)) (unbox b) cells -- tail
         | bad -> bad })
@@ -196,6 +204,77 @@ def machine : List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
       | _ -> Bad("stuck: %cellStore", cells) })
     else Bad(append "unhandled operation " (append op " (no device memory in the evaluator)"), cells)
 
+-- Builtins: array operations, float functions and arena, applied to all their arguments ----
+
+def builtinNames : Unit ->{Diverge} List (List u8) =
+  \u. string.split ' ' "arrayNew arrayLength arrayGet arraySet arrayPush arrayPop arena floatSqrt floatToBits floatFromBits floatExp floatLog floatSin floatCos floatPow floatFloor"
+
+-- An application whose head names a builtin (not shadowed): the name and the arguments.
+def builtinHead : G -> List (List u8, Value) -> Term -> List Term ->{Diverge} Option (List u8, List Term) =
+  \g env tm args. case tm of
+    { EAt(p, l, c, e) -> builtinHead g env (unbox e) args
+    | EApp(f, a) -> builtinHead g env (unbox f) (Cons(unbox a, box args))
+    | EVar(x) -> builtinNamed g env x args
+    | ETyApp(x, tys) -> builtinNamed g env x args
+    | _ -> None }
+
+def builtinNamed : G -> List (List u8, Value) -> List u8 -> List Term ->{Diverge} Option (List u8, List Term) =
+  \g env x args.
+    if isNil args || isLocal x env || isGlobal g x || not (checker.elem x (builtinNames ())) then None else Some((x, args))
+
+def isNil : List Term -> Bool = \ts. case ts of { Nil -> true | Cons(t, r) -> false }
+
+def outOfBounds : Array i64 -> Out = \cells. Bad("array index out of bounds", cells)
+
+def builtin : G -> List H -> List u8 -> List Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+  \g hs name vs cells. case vs of
+    { Cons(a, r1) -> (case unbox r1 of
+        { Nil -> builtin1 g hs name a cells -- tail
+        | Cons(b, r2) -> (case unbox r2 of
+            { Nil -> builtin2 name a b cells
+            | Cons(c, r3) -> builtin3 name a b c cells }) })
+    | Nil -> Bad("stuck: builtin without arguments", cells) }
+
+def builtin1 : G -> List H -> List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+  \g hs name a cells.
+    if string.equal name "arena" then (case a of
+      { VClo(cenv, x, body) -> eval g hs (Cons((x, VUnit), cenv)) body cells -- tail
+      | _ -> Bad("stuck: arena of a non-closure", cells) })
+    else case a of
+      { VArray(xs) ->
+          if string.equal name "arrayLength" then Val(VInt(i64W (), array.length (unbox xs)), cells)
+          else if string.equal name "arrayPop" then (if array.length (unbox xs) == 0 then outOfBounds cells else Val(VArray(box (array.pop (unbox xs))), cells))
+          else Bad("stuck: array builtin", cells)
+      | VFloat(d) ->
+          if string.equal name "floatSqrt" then Val(VFloat(floatSqrt d), cells)
+          else if string.equal name "floatToBits" then Val(VInt(W(false, 64), (floatToBits d) as i64), cells)
+          else if string.equal name "floatExp" then Val(VFloat(floatExp d), cells)
+          else if string.equal name "floatLog" then Val(VFloat(floatLog d), cells)
+          else if string.equal name "floatSin" then Val(VFloat(floatSin d), cells)
+          else if string.equal name "floatCos" then Val(VFloat(floatCos d), cells)
+          else if string.equal name "floatFloor" then Val(VFloat(floatFloor d), cells)
+          else Bad("stuck: float builtin", cells)
+      | VInt(w, x) -> if string.equal name "floatFromBits" then Val(VFloat(floatFromBits (x as u64)), cells) else Bad("stuck: builtin", cells)
+      | _ -> Bad("stuck: builtin", cells) }
+
+def builtin2 : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
+  \name a b cells. case (a, b) of
+    { (VFloat(x), VFloat(y)) -> if string.equal name "floatPow" then Val(VFloat(floatPow x y), cells) else Bad("stuck: float builtin", cells)
+    | (VInt(w, n), x) -> if string.equal name "arrayNew" then (if n < 0 then outOfBounds cells else Val(VArray(box (array.make n x)), cells)) else Bad("stuck: builtin", cells)
+    | (VArray(xs), VInt(w, i)) ->
+        if string.equal name "arrayGet" then (if i < 0 || i >= array.length (unbox xs) then outOfBounds cells else Val(array.get (unbox xs) i, cells))
+        else if string.equal name "arrayPush" then Val(VArray(box (array.push (unbox xs) b)), cells)
+        else Bad("stuck: array builtin", cells)
+    | (VArray(xs), x) -> if string.equal name "arrayPush" then Val(VArray(box (array.push (unbox xs) x)), cells) else Bad("stuck: array builtin", cells)
+    | _ -> Bad("stuck: builtin", cells) }
+
+def builtin3 : List u8 -> Value -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
+  \name a b c cells. case (a, (b, c)) of
+    { (VArray(xs), (VInt(w, i), x)) ->
+        if string.equal name "arraySet" then (if i < 0 || i >= array.length (unbox xs) then outOfBounds cells else Val(VArray(box (array.set (unbox xs) i x)), cells))
+        else Bad("stuck: array builtin", cells)
+    | _ -> Bad("stuck: builtin", cells) }
+
 -- Primitives ----------------------------------------------------------------------------------
 
 def prim : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
@@ -212,7 +291,20 @@ def prim : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
           { Cons(base, suffix) -> arith base (unbox suffix) w x y cells
           | Nil -> Bad("stuck: primitive", cells) })
     | (VBool(x), VBool(y)) -> if string.equal op "==" then Val(VBool(x == y), cells) else Bad("stuck: primitive on Bool", cells)
-    | _ -> Bad("unsupported: floats", cells) }
+    | (VFloat(x), VFloat(y)) ->
+        if string.equal op "+" then Val(VFloat(x + y), cells)
+        else if string.equal op "-" then Val(VFloat(x - y), cells)
+        else if string.equal op "*" then Val(VFloat(x * y), cells)
+        else if string.equal op "/" then Val(VFloat(x / y), cells)
+        else if string.equal op "==" then Val(VBool(x == y), cells)
+        else if string.equal op "<" then Val(VBool(x < y), cells)
+        else if string.equal op ">=" then Val(VBool(x >= y), cells)
+        else Bad("stuck: float primitive", cells)
+    | _ -> Bad("stuck: primitive on mixed values", cells) }
+
+-- n as f64, rounding to nearest; u64 from its unsigned bit pattern.
+def intToFloat : W -> i64 -> f64 =
+  \w x. case w of { W(signed, bits) -> if not signed && bits == 64 then (x as u64) as f64 else x as f64 }
 
 -- Integer arithmetic, as Eval.hs: the exact result, range-checked against the width, then the
 -- operator's mode: checked (panic), % (wrap), | (saturate) or ? (Option).
@@ -287,7 +379,7 @@ def show : Value ->{Diverge, Panic} List u8 =
   \v. case v of
     { VUnit -> "()"
     | VInt(w, x) -> showInt w x
-    | VFloat(d) -> "<float>"
+    | VFloat(d) -> append "0x" (hexU64 (floatToBits d))
     | VBool(b) -> if b then "true" else "false"
     | VClo(e, x, b) -> "<closure>"
     | VCon(c, vs) -> (case unbox vs of

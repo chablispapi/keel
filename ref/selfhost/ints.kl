@@ -69,3 +69,42 @@ def shr : W -> i64 -> i64 -> i64 =
         if c >= 64 then (if s && a < 0 then -1 else 0)
         else if s then a lsr c
         else ((a as u64) lsr (c as u64)) as i64 }
+
+-- Lowercase hex digits of n with no leading zeros, onto acc; "0" for 0.
+private def hexAcc : u64 -> List u8 ->{Diverge, Panic} List u8 =
+  \n acc. let c = n % 16 in
+    let d = Cons((if c < 10 then c + 48 else c + 87) as u8, box acc) in
+      if n < 16 then d else hexAcc (n / 16) d
+
+-- Lowercase hex text of n, as Haskell's showHex n "".
+def hexU64 : u64 ->{Diverge, Panic} List u8 =
+  \n. hexAcc n Nil
+
+-- The clamp of a non-NaN float to the range of a width: truncated toward zero, saturating at
+-- both ends (infinities included). u64 is split at 2^63, which an i64 can't hold.
+private def floatClamp : Bool -> i64 -> f64 ->{Panic} i64 =
+  \s bits d.
+    if bits == 64 then
+      (if s then
+         (if d >= 9.223372036854776e18 then 9223372036854775807
+          else if d <= 0.0 - 9.223372036854776e18 then 0 - 9223372036854775807 - 1
+          else d as i64)
+       else
+         (if d >= 1.8446744073709552e19 then -1
+          else if d <= 0.0 then 0
+          else if d >= 9.223372036854776e18
+            then ((d - 9.223372036854776e18) as i64) +% (0 - 9223372036854775807 - 1)
+          else d as i64))
+    else
+      let hi = if s then (1 lsl (bits - 1)) - 1 else (1 lsl bits) - 1 in
+      let lo = if s then 0 - (1 lsl (bits - 1)) else 0 in
+      let hiF = hi as f64 in
+      let loF = lo as f64 in
+      if d >= hiF then hi else if d <= loF then lo else d as i64
+
+-- d as T, as ref/src/Keel/Eval.hs's floatOp (FToInt t) computes it: NaN gives 0, the rest
+-- truncates toward zero and clamps to the width's range. The result is the canonical bit
+-- pattern (see norm).
+def floatToInt : W -> f64 ->{Panic} i64 =
+  \w d. case w of
+    { W(s, bits) -> if d == d then floatClamp s bits d else 0 }
