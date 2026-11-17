@@ -27,8 +27,8 @@ data Value =
 -- A handler frame: the clauses Alt(operation, (parameter), body) and the env at the handle.
 data H = H(List Alt, List (List u8, Value))
 
--- A value, or a panic of the interpreted program; either way the cell words.
-data Out = Val(Value, Array i64) | Bad(List u8, Array i64)
+-- A value, or a panic of the interpreted program; either way the world as it is then.
+data Out = Val(Value, World) | Bad(List u8, World)
 
 -- Globals: every definition's body by name.
 data G = G(map.Map (List u8) Term)
@@ -57,7 +57,7 @@ def i64W : Unit -> W = \u. W(true, 64)
 
 -- The evaluator ------------------------------------------------------------------------------
 
-def eval : G -> List H -> List (List u8, Value) -> Term -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+def eval : G -> List H -> List (List u8, Value) -> Term -> World ->{Diverge, Panic, IO, Input} Out =
   \g hs env tm cells. case tm of
     { EAt(f, l, c, e) -> eval g hs env (unbox e) cells -- tail
     | EVar(x) -> (case lookupEnv x env of
@@ -146,9 +146,9 @@ def firstAlt : List u8 -> List Alt -> Option Alt =
     { Nil -> None
     | Cons(al, rest) -> case al of { Alt(k, xs, b) -> if string.equal k c then Some(al) else firstAlt c (unbox rest) } }
 
-data Vs = Vals(List Value, Array i64) | Stop(List u8, Array i64)
+data Vs = Vals(List Value, World) | Stop(List u8, World)
 
-def evalAll : G -> List H -> List (List u8, Value) -> List Term -> Array i64 ->{Diverge, Panic, IO, Input} Vs =
+def evalAll : G -> List H -> List (List u8, Value) -> List Term -> World ->{Diverge, Panic, IO, Input} Vs =
   \g hs env ts cells. case ts of
     { Nil -> Vals(Nil, cells)
     | Cons(t, rest) -> case eval g hs env t cells of
@@ -158,7 +158,7 @@ def evalAll : G -> List H -> List (List u8, Value) -> List Term -> Array i64 ->{
         | Bad(m, cells) -> Stop(m, cells) } }
 
 -- f a: an operation when f names one (not a local or a global), else a closure call.
-def apply : G -> List H -> List (List u8, Value) -> Term -> Term -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+def apply : G -> List H -> List (List u8, Value) -> Term -> Term -> World ->{Diverge, Panic, IO, Input} Out =
   \g hs env f a cells. case opName g env f of
     { Some(op) -> (case eval g hs env a cells of
         { Val(v, cells) -> perform g hs op v cells -- tail
@@ -180,7 +180,7 @@ def opName : G -> List (List u8, Value) -> Term -> Option (List u8) =
 
 -- The innermost handler for op runs its clause with the handlers outside it, in the env at
 -- its handle plus the parameter; the clause's value is the operation's result.
-def perform : G -> List H -> List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+def perform : G -> List H -> List u8 -> Value -> World ->{Diverge, Panic, IO, Input} Out =
   \g hs op v cells. case hs of
     { Nil -> machine op v cells
     | Cons(h, outer) -> case h of
@@ -189,19 +189,21 @@ def perform : G -> List H -> List u8 -> Value -> Array i64 ->{Diverge, Panic, IO
             | None -> perform g (unbox outer) op v cells } } }
 
 -- Operations no handler caught.
-def machine : List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+def machine : List u8 -> Value -> World ->{Diverge, Panic, IO, Input} Out =
   \op v cells.
     if string.equal op "out" then (case v of { VInt(w, x) -> print (showInt w x); putc('\n'); Val(VUnit, cells) | _ -> Bad("stuck: out", cells) })
     else if string.equal op "putc" then (case v of { VInt(w, x) -> putc(x as u8); Val(VUnit, cells) | _ -> Bad("stuck: putc", cells) })
     else if string.equal op "getc" then Val(VInt(i64W (), getc ()), cells)
     else if string.equal op "%cellLoad" then (case v of
-      { VInt(w, k) -> Val(VInt(W(false, 64), array.get cells k), cells)
+      { VInt(w, k) -> Val(VInt(W(false, 64), array.get (cellsOf cells) k), cells)
       | _ -> Bad("stuck: %cellLoad", cells) })
     else if string.equal op "%cellStore" then (case v of
       { VPair(k, x) -> (case (unbox k, unbox x) of
-          { (VInt(wk, i), VInt(wx, y)) -> Val(VUnit, array.set cells i y)
+          { (VInt(wk, i), VInt(wx, y)) -> Val(VUnit, withCells cells (array.set (cellsOf cells) i y))
           | _ -> Bad("stuck: %cellStore", cells) })
       | _ -> Bad("stuck: %cellStore", cells) })
+    else if checker.elem op (fileOps ()) then fileOp op v cells
+    else if checker.elem op (netOps ()) then netOp op v cells
     else Bad(append "unhandled operation " (append op " (no device memory in the evaluator)"), cells)
 
 -- Builtins: array operations, float functions and arena, applied to all their arguments ----
@@ -224,9 +226,9 @@ def builtinNamed : G -> List (List u8, Value) -> List u8 -> List Term ->{Diverge
 
 def isNil : List Term -> Bool = \ts. case ts of { Nil -> true | Cons(t, r) -> false }
 
-def outOfBounds : Array i64 -> Out = \cells. Bad("array index out of bounds", cells)
+def outOfBounds : World -> Out = \cells. Bad("array index out of bounds", cells)
 
-def builtin : G -> List H -> List u8 -> List Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+def builtin : G -> List H -> List u8 -> List Value -> World ->{Diverge, Panic, IO, Input} Out =
   \g hs name vs cells. case vs of
     { Cons(a, r1) -> (case unbox r1 of
         { Nil -> builtin1 g hs name a cells -- tail
@@ -235,7 +237,7 @@ def builtin : G -> List H -> List u8 -> List Value -> Array i64 ->{Diverge, Pani
             | Cons(c, r3) -> builtin3 name a b c cells }) })
     | Nil -> Bad("stuck: builtin without arguments", cells) }
 
-def builtin1 : G -> List H -> List u8 -> Value -> Array i64 ->{Diverge, Panic, IO, Input} Out =
+def builtin1 : G -> List H -> List u8 -> Value -> World ->{Diverge, Panic, IO, Input} Out =
   \g hs name a cells.
     if string.equal name "arena" then (case a of
       { VClo(cenv, x, body) -> eval g hs (Cons((x, VUnit), cenv)) body cells -- tail
@@ -257,7 +259,7 @@ def builtin1 : G -> List H -> List u8 -> Value -> Array i64 ->{Diverge, Panic, I
       | VInt(w, x) -> if string.equal name "floatFromBits" then Val(VFloat(floatFromBits (x as u64)), cells) else Bad("stuck: builtin", cells)
       | _ -> Bad("stuck: builtin", cells) }
 
-def builtin2 : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
+def builtin2 : List u8 -> Value -> Value -> World ->{Diverge, Panic} Out =
   \name a b cells. case (a, b) of
     { (VFloat(x), VFloat(y)) -> if string.equal name "floatPow" then Val(VFloat(floatPow x y), cells) else Bad("stuck: float builtin", cells)
     | (VInt(w, n), x) -> if string.equal name "arrayNew" then (if n < 0 then outOfBounds cells else Val(VArray(box (array.make n x)), cells)) else Bad("stuck: builtin", cells)
@@ -268,7 +270,7 @@ def builtin2 : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
     | (VArray(xs), x) -> if string.equal name "arrayPush" then Val(VArray(box (array.push (unbox xs) x)), cells) else Bad("stuck: array builtin", cells)
     | _ -> Bad("stuck: builtin", cells) }
 
-def builtin3 : List u8 -> Value -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
+def builtin3 : List u8 -> Value -> Value -> Value -> World ->{Diverge, Panic} Out =
   \name a b c cells. case (a, (b, c)) of
     { (VArray(xs), (VInt(w, i), x)) ->
         if string.equal name "arraySet" then (if i < 0 || i >= array.length (unbox xs) then outOfBounds cells else Val(VArray(box (array.set (unbox xs) i x)), cells))
@@ -277,7 +279,7 @@ def builtin3 : List u8 -> Value -> Value -> Value -> Array i64 ->{Diverge, Panic
 
 -- Primitives ----------------------------------------------------------------------------------
 
-def prim : List u8 -> Value -> Value -> Array i64 ->{Diverge, Panic} Out =
+def prim : List u8 -> Value -> Value -> World ->{Diverge, Panic} Out =
   \op a b cells. case (a, b) of
     { (VInt(w, x), VInt(w2, y)) ->
         if string.equal op "==" then Val(VBool(x == y), cells)
@@ -308,7 +310,7 @@ def intToFloat : W -> i64 -> f64 =
 
 -- Integer arithmetic, as Eval.hs: the exact result, range-checked against the width, then the
 -- operator's mode: checked (panic), % (wrap), | (saturate) or ? (Option).
-def arith : u8 -> List u8 -> W -> i64 -> i64 -> Array i64 ->{Diverge, Panic} Out =
+def arith : u8 -> List u8 -> W -> i64 -> i64 -> World ->{Diverge, Panic} Out =
   \base suffix w x y cells.
     if (base == '/' || base == '%') && y == 0 then Bad("division by zero", cells)
     else
@@ -405,5 +407,241 @@ def globalsOf : List Decl -> G =
   \ds. G(prelude.foldl (\m d. case d of { DDef(f, t, e) -> map.insert string.compare f e m | _ -> m }) map.Tip ds)
 
 -- main's value, or the panic message.
-def runMain : List Decl -> Term ->{Diverge, Panic, IO, Input} Out =
-  \ds m. eval (globalsOf ds) Nil Nil m (cellInits ds)
+def runMain : List (List u8, List u8) -> List Decl -> Term ->{Diverge, Panic, IO, Input} Out =
+  \disk ds m. eval (globalsOf ds) Nil Nil m (World(cellInits ds, Fs(disk, Nil, Nil, Nil), Net(Nil, Nil, 3, 49152, 0)))
+
+-- The world --------------------------------------------------------------------------------
+-- What a program changes besides its output, as Eval.hs's World: the cell words, the files
+-- and the loopback network.
+
+data World = World(Array i64, Fs, Net)
+
+-- Fs(the files on disk the program can read, path ↦ bytes; the open files' unread bytes by
+-- handle; the files written, path ↦ bytes; the handles writing them ↦ path).
+data Fs = Fs(List (List u8, List u8), List (i64, List u8), List (List u8, List u8), List (i64, List u8))
+
+-- Net(listeners fd ↦ (port, connections waiting); sockets; next fd; next free port; clock).
+data Net = Net(List (i64, (i64, List i64)), List (i64, Sock), i64, i64, i64)
+
+-- A connected socket: its peer, the bytes that arrived, and whether the peer has closed.
+data Sock = Sock(i64, List u8, Bool)
+
+def cellsOf : World -> Array i64 = \w. case w of { World(c, f, n) -> c }
+def withCells : World -> Array i64 -> World = \w c. case w of { World(c0, f, n) -> World(c, f, n) }
+
+-- The files written, in path order, for run.kl to print.
+def writtenFiles : World ->{Diverge} List (List u8, List u8) =
+  \w. case w of { World(c, f, n) -> case f of { Fs(disk, open, written, writing) -> sortByKey written } }
+
+def sortByKey : forall (v : Free). List (List u8, v) ->{Diverge} List (List u8, v) =
+  \kvs. prelude.foldl (\acc kv. insertByKey kv acc) Nil kvs
+
+def insertByKey : forall (v : Free). (List u8, v) -> List (List u8, v) -> List (List u8, v) =
+  \kv acc. case acc of
+    { Nil -> Cons(kv, box Nil)
+    | Cons(x, rest) -> let (k, v) = kv in let (k2, v2) = x in
+        case string.compare k k2 of { Greater -> Cons(x, box (insertByKey kv (unbox rest))) | _ -> Cons(kv, box acc) } }
+
+-- Association lists keyed by fd or path. put replaces in place, or appends.
+def lookupI : forall (v : Free). i64 -> List (i64, v) -> Option v =
+  \k kvs. case kvs of { Nil -> None | Cons(kv, rest) -> let (k2, v) = kv in if k == k2 then Some(v) else lookupI k (unbox rest) }
+
+def putI : forall (v : Free). i64 -> v -> List (i64, v) -> List (i64, v) =
+  \k v kvs. case kvs of
+    { Nil -> Cons((k, v), box Nil)
+    | Cons(kv, rest) -> let (k2, v2) = kv in if k == k2 then Cons((k, v), rest) else Cons(kv, box (putI k v (unbox rest))) }
+
+def delI : forall (v : Free). i64 -> List (i64, v) -> List (i64, v) =
+  \k kvs. case kvs of { Nil -> Nil | Cons(kv, rest) -> let (k2, v) = kv in if k == k2 then unbox rest else Cons(kv, box (delI k (unbox rest))) }
+
+def lookupS : forall (v : Free). List u8 -> List (List u8, v) -> Option v =
+  \k kvs. case kvs of { Nil -> None | Cons(kv, rest) -> let (k2, v) = kv in if string.equal k k2 then Some(v) else lookupS k (unbox rest) }
+
+def putS : forall (v : Free). List u8 -> v -> List (List u8, v) -> List (List u8, v) =
+  \k v kvs. case kvs of
+    { Nil -> Cons((k, v), box Nil)
+    | Cons(kv, rest) -> let (k2, v2) = kv in if string.equal k k2 then Cons((k, v), rest) else Cons(kv, box (putS k v (unbox rest))) }
+
+def maxKey : forall (v : Free). i64 -> List (i64, v) -> i64 =
+  \m kvs. case kvs of { Nil -> m | Cons(kv, rest) -> let (k, v) = kv in maxKey (if k > m then k else m) (unbox rest) }
+
+-- Bytes in and out of Values.
+def bytesOf : Value ->{Diverge, Panic} List u8 =
+  \v. case v of { VArray(xs) -> map (\x. case x of { VInt(w, b) -> b as u8 | _ -> 0 }) (array.toList (unbox xs)) | _ -> Nil }
+
+def byteArray : List u8 -> Value =
+  \bs. VArray(box (prelude.foldl (\arr b. array.push arr (VInt(i64W (), b as i64))) array.empty bs))
+
+def i64V : i64 -> Value = \n. VInt(i64W (), n)
+
+-- Files (Eval.hs's machine) ----------------------------------------------------------------
+
+def fileOps : Unit ->{Diverge} List (List u8) = \u. string.split ' ' "openFile createFile appendFile readByte writeBytes closeFile"
+
+-- Handles count up from 3. A file the program wrote is read as it wrote it.
+def nextHandle : Fs -> i64 =
+  \f. case f of { Fs(disk, open, written, writing) -> let a = maxKey 2 open in let b = maxKey 2 writing in (if a > b then a else b) +% 1 }
+
+def contentsOf : Fs -> List u8 -> Option (List u8) =
+  \f name. case f of { Fs(disk, open, written, writing) -> case lookupS name written of { Some(t) -> Some(t) | None -> lookupS name disk } }
+
+def fileOp : List u8 -> Value -> World ->{Diverge, Panic} Out =
+  \op v w. case w of { World(c, f, n) -> case f of { Fs(disk, open, written, writing) ->
+    let h = nextHandle f in
+    if string.equal op "openFile" then
+      (case contentsOf f (bytesOf v) of
+        { Some(bytes) -> Val(i64V h, World(c, Fs(disk, putI h bytes open, written, writing), n))
+        | None -> Val(i64V (0 -% 1), w) })
+    else if string.equal op "createFile" || string.equal op "appendFile" then
+      (let name = bytesOf v in
+       let start = if string.equal op "createFile" then Nil else (case contentsOf f name of { Some(t) -> t | None -> Nil }) in
+       Val(i64V h, World(c, Fs(disk, open, putS name start written, putI h name writing), n)))
+    else if string.equal op "writeBytes" then
+      (case v of
+        { VPair(hv, bv) -> (case unbox hv of
+            { VInt(hw, k) -> (case lookupI k writing of
+                { Some(name) ->
+                    let text = bytesOf (unbox bv) in
+                    let old = case lookupS name written of { Some(t) -> t | None -> Nil } in
+                    Val(i64V (prelude.length text), World(c, Fs(disk, open, putS name (append old text) written, writing), n))
+                | None -> Bad("writeBytes on a handle that isn't open for writing", w) })
+            | _ -> Bad("stuck: writeBytes", w) })
+        | _ -> Bad("stuck: writeBytes", w) })
+    else if string.equal op "readByte" then
+      (case v of
+        { VInt(hw, k) -> (case lookupI k open of
+            { Some(bytes) -> (case bytes of
+                { Cons(b, rest) -> Val(i64V (b as i64), World(c, Fs(disk, putI k (unbox rest) open, written, writing), n))
+                | Nil -> Val(i64V (0 -% 1), w) })
+            | None -> Bad("readByte on a handle that isn't open", w) })
+        | _ -> Bad("stuck: readByte", w) })
+    else (case v of
+      { VInt(hw, k) -> Val(VUnit, World(c, Fs(disk, delI k open, written, delI k writing), n))
+      | _ -> Bad("stuck: closeFile", w) }) } }
+
+-- The loopback network (Eval.hs's network) -------------------------------------------------
+
+def netOps : Unit ->{Diverge} List (List u8) =
+  \u. string.split ' ' "tcpListen tcpAccept tcpConnect sockPort sockSend sockRecv sockClose pollWait clockMs"
+
+-- Each socket receives into a buffer this size: a sender to a full one waits.
+def buffer : Unit -> i64 = \u. 65536
+
+def netOp : List u8 -> Value -> World ->{Diverge, Panic} Out =
+  \op v w. case w of { World(c, f, n) -> case n of { Net(ls, socks, next, port, clock) ->
+    let ok = \r n2. Val(i64V r, World(c, f, n2)) in
+    let bad = Bad(append "bad Net operation " op, w) in
+    if string.equal op "tcpListen" then
+      (case v of
+        { VPair(a, pv) -> (case unbox pv of
+            { VInt(pw, p) ->
+                if p != 0 && any (\l. let (fd, pw2) = l in let (lp, wt) = pw2 in lp == p) ls then ok (0 -% 1) n
+                else ok next (Net(putI next ((if p == 0 then port else p), Nil) ls, socks, next + 1, (if p == 0 then port + 1 else port), clock))
+            | _ -> bad })
+        | _ -> bad })
+    else if string.equal op "sockPort" then
+      (case v of { VInt(fw, fd) -> ok (case lookupI fd ls of { Some(pw2) -> let (lp, wt) = pw2 in lp | None -> 0 -% 1 }) n | _ -> bad })
+    else if string.equal op "tcpAccept" then
+      (case v of
+        { VInt(fw, fd) -> (case lookupI fd ls of
+            { Some(pw2) -> let (lp, wt) = pw2 in (case wt of
+                { Cons(k, rest) -> ok k (Net(putI fd (lp, unbox rest) ls, socks, next, port, clock))
+                | Nil -> ok (0 -% 1) n })
+            | None -> ok (0 -% 1) n })
+        | _ -> bad })
+    else if string.equal op "tcpConnect" then
+      (case v of
+        { VPair(a, pv) -> (case unbox pv of
+            { VInt(pw, p) -> (case listenerOn p ls of
+                { Some(l) -> let a2 = next in let b2 = next + 1 in
+                    (case lookupI l ls of
+                      { Some(pw2) -> let (lp, wt) = pw2 in
+                          ok a2 (Net(putI l (lp, append wt (Cons(b2, box Nil))) ls, putI b2 (Sock(a2, Nil, false)) (putI a2 (Sock(b2, Nil, false)) socks), b2 + 1, port, clock))
+                      | None -> bad })
+                | None -> ok (0 -% 1) n })
+            | _ -> bad })
+        | _ -> bad })
+    else if string.equal op "sockSend" then
+      (case v of
+        { VPair(fv, rest) -> (case (unbox fv, unbox rest) of
+            { (VInt(fw, fd), VPair(bv, fromv)) -> (case unbox fromv of
+                { VInt(xw, from) -> (case lookupI fd socks of
+                    { Some(s) -> (case s of
+                        { Sock(peer, inbox, closed) -> if closed then ok (0 -% 1) n else (case lookupI peer socks of
+                            { Some(ps) -> (case ps of
+                                { Sock(pp, pin, pc) ->
+                                    let room = buffer () - prelude.length pin in
+                                    let text = takeN (if room > 0 then room else 0) (dropN from (bytesOf (unbox bv))) in
+                                    ok (prelude.length text) (Net(ls, putI peer (Sock(pp, append pin text, pc)) socks, next, port, clock)) })
+                            | None -> ok (0 -% 1) n }) })
+                    | None -> ok (0 -% 1) n })
+                | _ -> bad })
+            | _ -> bad })
+        | _ -> bad })
+    else if string.equal op "sockRecv" then
+      (case v of
+        { VInt(fw, fd) -> (case lookupI fd socks of
+            { Some(s) -> (case s of { Sock(peer, inbox, closed) -> Val(byteArray inbox, World(c, f, Net(ls, putI fd (Sock(peer, Nil, closed)) socks, next, port, clock))) })
+            | None -> Val(byteArray Nil, w) })
+        | _ -> bad })
+    else if string.equal op "sockClose" then
+      (case v of
+        { VInt(fw, fd) ->
+            let socks2 = case lookupI fd socks of
+              { Some(s) -> (case s of { Sock(peer, inbox, closed) -> (case lookupI peer socks of
+                  { Some(ps) -> (case ps of { Sock(pp, pin, pc) -> putI peer (Sock(pp, pin, true)) (delI fd socks) })
+                  | None -> delI fd socks }) })
+              | None -> socks } in
+            Val(VUnit, World(c, f, Net(delI fd ls, socks2, next, port, clock)))
+        | _ -> bad })
+    else if string.equal op "pollWait" then
+      (case v of
+        { VPair(fv, tv) -> (case unbox tv of
+            { VInt(tw, timeout) ->
+                let fds = case unbox fv of { VArray(xs) -> array.toList (unbox xs) | _ -> Nil } in
+                (case firstReady n 0 fds of
+                  { Some(r) -> ok r n
+                  | None -> if timeout < 0 then Bad("pollWait would wait forever (no socket can become ready)", w)
+                            else ok (0 -% 1) (Net(ls, socks, next, port, clock + timeout)) })
+            | _ -> bad })
+        | _ -> bad })
+    else if string.equal op "clockMs" then ok clock n
+    else bad } }
+
+def listenerOn : i64 -> List (i64, (i64, List i64)) -> Option i64 =
+  \p ls. case ls of
+    { Nil -> None
+    | Cons(l, rest) -> let (fd, pw) = l in let (lp, wt) = pw in if lp == p then Some(fd) else listenerOn p (unbox rest) }
+
+-- The first fd poll would report, as index * 4 + readiness.
+def firstReady : Net -> i64 -> List Value ->{Panic} Option i64 =
+  \n i fds. case fds of
+    { Nil -> None
+    | Cons(x, rest) -> case x of
+        { VInt(xw, e) -> let r = readiness n (e / 4) (e % 2 == 1) ((e / 2) % 2 == 1) in
+            if r != 0 then Some(i * 4 + r) else firstReady n (i + 1) (unbox rest)
+        | _ -> firstReady n (i + 1) (unbox rest) } }
+
+-- As poll: readable (1) is a listener with a connection waiting or a socket with bytes, if
+-- asked, and always a closed peer (POLLHUP) or an fd that isn't open (POLLNVAL); writable (2),
+-- if asked, is room in the peer's buffer.
+def readiness : Net -> i64 -> Bool -> Bool ->{Panic} i64 =
+  \n fd wantsRead wantsWrite. case n of { Net(ls, socks, next, port, clock) ->
+    case lookupI fd ls of
+      { Some(pw) -> let (lp, wt) = pw in if wantsRead && not (isEmpty wt) then 1 else 0
+      | None -> case lookupI fd socks of
+          { Some(s) -> (case s of { Sock(peer, inbox, closed) ->
+              (if (wantsRead && not (isEmpty inbox)) || closed then 1 else 0)
+                + (if wantsWrite && (case lookupI peer socks of { Some(ps) -> (case ps of { Sock(pp, pin, pc) -> prelude.length pin < buffer () }) | None -> false }) then 2 else 0) })
+          | None -> 1 } } }
+
+def isEmpty : forall (a : Free). List a -> Bool = \xs. case xs of { Nil -> true | Cons(x, r) -> false }
+
+def takeN : forall (a : Free). i64 -> List a ->{Diverge} List a =
+  \k xs. if k <= 0 then Nil else (case xs of { Nil -> Nil | Cons(x, rest) -> Cons(x, box (takeN (k -% 1) (unbox rest))) })
+
+def dropN : forall (a : Free). i64 -> List a ->{Diverge} List a =
+  \k xs. if k <= 0 then xs else (case xs of { Nil -> Nil | Cons(x, rest) -> dropN (k -% 1) (unbox rest) })
+
+def any : forall (a : Free) 'e. (a ->{'e} Bool) -> List a ->{'e} Bool =
+  \p xs. case xs of { Nil -> false | Cons(x, rest) -> if p x then true else any p (unbox rest) }

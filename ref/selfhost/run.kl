@@ -1,31 +1,33 @@
 -- Run a Keel program as `keelc run` does, with the self-hosted front end and evaluator: its
--- output, then `result: <value>` or `panic: <message>`. stdin is the entry file's path on the
+-- output, then `result: <value>` or `panic: <message>`, then each file it wrote as a
+-- `file <path> <length>` line, its bytes and a newline. stdin is the entry file's path on the
 -- first line, then the program's own stdin:
 --
 --   printf 'examples/fact.kl\n' | keelc run selfhost/run.kl
 --
--- `unsupported: …` (printed before anything runs) means the evaluator doesn't handle the
--- program yet.
+-- Files and the network are mocked as Eval.hs's machine does: the program can read the files
+-- of the test suite's machineFor, writes stay in memory, and sockets connect in a loopback.
 
 import std.string
+import std.file
 import load
 import checker
-import parser
 import eval
 
 -- The first line of stdin, read byte by byte so the rest stays for the program.
 def readLine : List u8 ->{Input, Diverge} List u8 =
   \acc. let c = getc () in if c < 0 || c == 10 then reverse acc else readLine (Cons(c as u8, box acc))
 
--- What the evaluator doesn't do yet: files and the network.
-def unsupportedIn : List Decl -> Term ->{Diverge} Option (List u8) =
-  \ds m.
-    let terms = Cons(m, box (checker.concatMap (\d. case d of { DDef(f, t, e) -> Cons(e, box Nil) | _ -> Nil }) ds)) in
-    let names = string.split ' ' "openFile createFile appendFile readByte writeBytes closeFile tcpListen tcpAccept tcpConnect sockPort sockSend sockRecv sockClose pollWait clockMs" in
-    checker.firstOf (\t. case t of
-      { EVar(x) -> if checker.elem x names then Some(x) else None
-      | ETyApp(x, tys) -> if checker.elem x names then Some(x) else None
-      | _ -> None }) (checker.concatMap checker.universe terms)
+-- The files a program may read (ref/test/Native.hs's machineFor).
+def disk : Unit ->{Files, Diverge} List (List u8, List u8) =
+  \u. case file.read "examples/fact.kl" of { Some(t) -> Cons(("examples/fact.kl", t), box Nil) | None -> Nil }
+
+def printFiles : List (List u8, List u8) ->{IO, Diverge, Panic} Unit =
+  \fs. case fs of
+    { Nil -> ()
+    | Cons(pt, rest) -> let (path, text) = pt in
+        print "file "; print path; putc(' '); printInt (length text); putc('\n'); print text; putc('\n');
+        printFiles (unbox rest) }
 
 main =
   case programOf (readLine Nil) of
@@ -35,8 +37,6 @@ main =
           { None -> println "unsupported: no main"; 0
           | Some(prog) -> case checker.program lib decls prog of
               { Rejected(msg) -> println msg; -1
-              | Core(ds, m, t, eff) -> case unsupportedIn ds m of
-                  { Some(what) -> print "unsupported: "; println what; 0
-                  | None -> case runMain ds m of
-                      { Val(v, cells) -> print "result: "; println (show v); 0
-                      | Bad(msg, cells) -> print "panic: "; println msg; 0 } } } } }
+              | Core(ds, m, t, eff) -> case runMain (disk ()) ds m of
+                  { Val(v, w) -> print "result: "; println (show v); printFiles (writtenFiles w); 0
+                  | Bad(msg, w) -> print "panic: "; println msg; printFiles (writtenFiles w); 0 } } } }
