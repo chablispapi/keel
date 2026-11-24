@@ -142,7 +142,7 @@ walk fs0 e0 = runState (go fs0 e0) ([], [])
         BindIf x c <$> go ft a <*> go ff b <*> go fs rest
       BindCase x s bs rest -> BindCase x s <$> mapM (\(t, n, b) -> (,,) t n <$> go fs b) bs <*> go fs rest
       Dup v rest -> Dup v <$> go fs rest
-      Drop v rest -> Drop v <$> go fs rest
+      Drop v m rest -> Drop v m <$> go fs rest
       DropReuse v m t rest -> DropReuse v m t <$> go fs rest
 
 -- | The facts in the then and else branches of a comparison.

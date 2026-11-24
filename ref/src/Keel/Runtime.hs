@@ -1,7 +1,7 @@
 -- | The runtime routines the three back ends share, written once against "Keel.Asm"
 -- (spec/backends.md). Each back end's @emitRuntime@ calls these with its own emitters; what
 -- only one target has (host I/O, sockets, RISC-V printing and traps) stays there.
-module Keel.Runtime (alloc, dropBlock, dropReuse, freeBlock, arenaOpen, arenaClose, arrays) where
+module Keel.Runtime (alloc, dropBlock, dropFields, dropReuse, freeBlock, arenaOpen, arenaClose, arrays) where
 
 import Control.Monad (unless, when)
 import Keel.Asm
@@ -560,6 +560,96 @@ dropBlock a = do
     array = local a "drop_array"
     elems = local a "drop_elems"
 
+-- | _keel_drop_fields: A 0 = block (data constructor or pair), A 1 = fields taken over (a mask
+-- of words or packed slots). When unique (count reaches 0), drops only the pointer children not
+-- in the mask and frees the block (tail-calling _keel_free_block with no frame when all pointer
+-- fields are taken over, or tail-calling _keel_drop on the last remaining child). When shared
+-- or immortal, decrements (unless immortal) and duplicates the fields taken over, frameless.
+dropFields :: Monad m => Asm m -> m ()
+dropFields a = do
+  fn a "_keel_drop_fields"
+  load a (Half32 True) (T 0) (A 0) (-8)
+  branch a Lts (T 0) (I 0) dupMask -- immortal
+  op a Shr (T 1) (T 0) (I 10)
+  branch a Eq (T 1) (I 0) "_keel_panic_rc"
+  op a Sub (T 0) (T 0) (I 1024)
+  store a (Half32 False) (T 0) (A 0) (-8)
+  op a Shr (T 1) (T 0) (I 10)
+  branch a Ne (T 1) (I 0) dupMask -- shared
+  -- Unique (count reached 0).
+  loadSym a (T 1) "_keel_arena_base"
+  branch a Geu (A 0) (R (T 1)) fastRet -- in an open arena: freed when it closes
+  stat a 24 (T 1) (T 2)
+  rawMap a (T 0) (A 0)
+  op a Shr (T 5) (T 0) (I 16) -- packed bit
+  op a Shl (T 0) (T 0) (I (xlen a - 16))
+  op a Shr (T 0) (T 0) (I (xlen a - 16)) -- 16-bit pointer map
+  op a And (T 1) (T 0) (R (A 1)) -- the fields taken over stay alive: they are the caller's now
+  op a Xor (T 0) (T 0) (R (T 1))
+  branch a Ne (T 0) (I 0) partial
+  jump a "_keel_free_block" -- all pointer fields transferred: frameless tail-call
+  -- Partial transfer: drop remaining children, tail-calling _keel_drop on the last one.
+  label a partial
+  frame a 3
+  store a Word (A 0) Sp (slot a 0)
+  store a Word (T 5) Sp (slot a 2)
+  label a loop
+  op a Sub (T 1) (T 0) (I 1)
+  op a And (T 1) (T 1) (R (T 0)) -- the map without its lowest bit
+  branch a Eq (T 1) (I 0) lastChild
+  lowBit a (T 2) (T 0) (T 3)
+  store a Word (T 1) Sp (slot a 1)
+  load a Word (T 4) Sp (slot a 0)
+  child a (A 0) (T 4) (T 2) (T 3)
+  call a "_keel_drop"
+  load a Word (T 0) Sp (slot a 1)
+  jump a loop
+  label a lastChild
+  lowBit a (T 2) (T 0) (T 3)
+  load a Word (T 4) Sp (slot a 0)
+  child a (T 5) (T 4) (T 2) (T 3)
+  store a Word (T 5) Sp (slot a 1)
+  mov a (A 0) (R (T 4))
+  call a "_keel_free_block"
+  load a Word (A 0) Sp (slot a 1)
+  unframe a 3
+  jump a "_keel_drop"
+  -- Shared or immortal: duplicate the fields taken over, frameless.
+  label a dupMask
+  branch a Eq (A 1) (I 0) fastRet
+  rawMap a (T 0) (A 0)
+  op a Shr (T 5) (T 0) (I 16) -- packed bit
+  label a dupLoop
+  lowBit a (T 2) (A 1) (T 3)
+  op a Sub (T 1) (A 1) (I 1)
+  op a And (A 1) (A 1) (R (T 1))
+  branch a Ne (T 5) (I 0) dupPacked
+  loadIx a (T 4) (A 0) (T 2) (wordShift a)
+  jump a dupInc
+  label a dupPacked
+  addScaled a (T 3) (A 0) (T 2) 2
+  load a (Half32 True) (T 4) (T 3) 0
+  addScaled a (T 4) (A 0) (T 4) 3
+  label a dupInc
+  load a (Half32 True) (T 0) (T 4) (-8)
+  branch a Lts (T 0) (I 0) dupNext
+  op a Add (T 0) (T 0) (I 1024)
+  store a (Half32 False) (T 0) (T 4) (-8)
+  label a dupNext
+  branch a Ne (A 1) (I 0) dupLoop
+  label a fastRet
+  ret a
+  where
+    partial = local a "df_partial"
+    loop = local a "df_loop"
+    lastChild = local a "df_last"
+    dupMask = local a "df_dup_mask"
+    dupLoop = local a "df_dup"
+    dupPacked = local a "df_packed"
+    dupInc = local a "df_inc"
+    dupNext = local a "df_next"
+    fastRet = local a "df_ret"
+
 -- | _keel_drop_reuse: A 0 = block, A 1 = the fields taken over (a mask of words) → A 0 = the
 -- block if it was unique (its other children dropped, count 0 until reused), or 0 after an
 -- ordinary decrement and duplicating the fields taken over. Slots as in 'dropBlock'.
@@ -628,10 +718,10 @@ dropReuse a = do
     zero = local a "reuse_zero"
     done = local a "reuse_ret"
 
--- | The map of the block in @b@ into @d@ (from the layout table when its header holds a
--- field), its packed bit to slot 2. Uses T 1–3.
-reuseMap :: Monad m => Asm m -> Reg -> Reg -> m ()
-reuseMap a d b = do
+-- | The 17-bit map (bit 16 = packed, bits 0–15 = pointer map) of the block in @b@ into @d@
+-- (from the layout table when its header holds a field). Frameless; uses T 1–3.
+rawMap :: Monad m => Asm m -> Reg -> Reg -> m ()
+rawMap a d b = do
   lMap <- newLabel a
   headerMap a d b
   load a (Half32 False) (T 1) b (-8)
@@ -642,7 +732,11 @@ reuseMap a d b = do
   load a (Half32 False) d (T 3) 0
   op a Shr d d (I 8)
   label a lMap
-  splitPacked a d (T 1)
+
+-- | The map of the block in @b@ into @d@ (from the layout table when its header holds a
+-- field), its packed bit to slot 2. Uses T 1–3.
+reuseMap :: Monad m => Asm m -> Reg -> Reg -> m ()
+reuseMap a d b = rawMap a d b >> splitPacked a d (T 1)
 
 -- | fieldLayouts = 2 ^ fieldBit: the header bit that says it holds a field.
 fieldBit :: Int

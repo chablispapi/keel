@@ -1,0 +1,78 @@
+-- Plain-drop field ownership transfer (_keel_drop_fields): unique full-field and partial-field
+-- transfers, shared and immortal parents, packed layouts, narrow header fields after pointers,
+-- pair destructuring, and arenas.
+
+data Tree = Leaf(i64) | Node(Box Tree, Box Tree)
+data Tok = Tok(List i64, i32)
+
+def mkList : i64 -> List i64 ->{Panic, Diverge} List i64 =
+  \n acc. if n == 0 then acc else mkList (n - 1) (Cons(n, box acc))
+
+def mkNested : i64 -> List (List i64) ->{Panic, Diverge} List (List i64) =
+  \n acc. if n == 0 then acc else mkNested (n - 1) (Cons(Cons(n, box Nil), box acc))
+
+def sumList : List i64 -> i64 ->{Panic} i64 =
+  \xs acc. case xs of { Nil -> acc | Cons(x, rest) -> sumList (unbox rest) (acc + x) }
+
+-- Owns both lists in the pair and transfers both fields on Drop (LetPair, mask = 3).
+def swapPairs : (List i64, List i64) -> (List i64, List i64) =
+  \p. let (a, b) = p in (b, a)
+
+-- Owns Tok (returns xs), narrow header field appears after the pointer field: fuseFields
+-- must pass through RHeader to fuse Dup xs into Drop t.
+def untok : Tok ->{Panic} (List i64, i64) =
+  \t. case t of { Tok(xs, n) -> (xs, (n as i64) + 1) }
+
+-- Owns a packed 2-pointer Node without reusing it: full-field transfer on packed slots.
+def mkTree : i64 ->{Panic, Diverge} Tree =
+  \d. if d == 0 then Leaf(1) else Node(box (mkTree (d - 1)), box (mkTree (d - 1)))
+
+def flatten : Tree -> List i64 -> List i64 =
+  \t acc. case t of {
+    Leaf(v) -> Cons(v, box acc)
+  | Node(l, r) -> flatten (unbox l) (flatten (unbox r) acc)
+  }
+
+-- Partial transfer: returns the head (transferred) and drops the tail via tail-call _keel_drop.
+def headOwned : List (List i64) -> List i64 =
+  \xs. case xs of { Nil -> Nil | Cons(x, _) -> x }
+
+-- Immortal parent transfer: consumes a static constant string/list tail.
+def tailOwned : List u8 -> List u8 =
+  \xs. case xs of { Nil -> Nil | Cons(_, rest) -> unbox rest }
+
+def sumBytes : List u8 -> i64 ->{Panic} i64 =
+  \xs acc. case xs of { Nil -> acc | Cons(b, rest) -> sumBytes (unbox rest) (acc + (b as i64)) }
+
+def work : i64 ->{IO, Panic, Diverge} i64 =
+  \n.
+    -- Unique and shared Pair transfers
+    let p1 = (mkList 10 Nil, mkList 5 Nil) in
+    let (b1, a1) = swapPairs p1 in
+    let pShared = (mkList 6 Nil, mkList 4 Nil) in
+    let (bs, as_) = swapPairs pShared in
+    let (ps1, ps2) = pShared in
+    let pairRes = sumList a1 0 + sumList b1 0 + sumList as_ 0 + sumList bs 0 + sumList ps1 0 + sumList ps2 0 in
+    -- Unique and shared Tok (pointer + narrow header field)
+    let tokShared = Tok(mkList 7 Nil, 41) in
+    let (u1, k1) = untok (Tok(mkList 8 Nil, 9)) in
+    let (u2, k2) = untok tokShared in
+    let (u3, k3) = untok tokShared in
+    let tokRes = sumList u1 0 + k1 + sumList u2 0 + k2 + sumList u3 0 + k3 in
+    -- Unique and shared packed Tree
+    let tShared = mkTree 4 in
+    let treeRes = sumList (flatten (mkTree 5) Nil) 0 + sumList (flatten tShared Nil) 0 + sumList (flatten tShared Nil) 0 in
+    -- Unique and shared partial transfer (deep tail dropped on unique)
+    let deep = mkNested n Nil in
+    let h1 = headOwned deep in
+    let nestedShared = mkNested 12 Nil in
+    let h2 = headOwned nestedShared in
+    let h3 = headOwned nestedShared in
+    let partialRes = sumList h1 0 + sumList h2 0 + sumList h3 0 in
+    -- Immortal static block transfer
+    let immRes = sumBytes (tailOwned "keel") 0 in
+    let total = pairRes + tokRes + treeRes + partialRes + immRes in
+    out(total);
+    total
+
+main = work 2000 + arena (\u. work 40)

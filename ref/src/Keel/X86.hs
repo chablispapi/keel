@@ -293,9 +293,14 @@ expr slots join e = case e of
       line (lJoin ++ ":")
       expr slots join rest
   Dup v rest -> dup slots v >> expr slots join rest
-  Drop v rest -> do
+  Drop v 0 rest -> do
     load' slots "rax" v
     ins "call _keel_drop"
+    expr slots join rest
+  Drop v mask rest -> do
+    load' slots "rax" v
+    li "rdi" mask
+    ins "call _keel_drop_fields"
     expr slots join rest
   DropReuse v mask tok rest -> do
     load' slots "rax" v
@@ -1248,6 +1253,7 @@ emitRuntime used = do
   R.arenaClose asmX86
 
   R.dropBlock asmX86
+  R.dropFields asmX86
   R.freeBlock asmX86 (toInteger maxSmall)
 
   R.dropReuse asmX86

@@ -289,6 +289,28 @@ median of 7, sources unchanged: parser −66%, REPL −35%, checker −24%, inte
 unchanged. Build time is within noise. `test/opt/constant-calls.kl` checks that the program
 makes no allocation.
 
+**Plain-drop field transfer and borrowing fixes** (2026-11-20, `spec/m4.md` Track B item 2).
+Two conservative checks in `Lower.borrowSigs` had kept `std.map.lookup`, `lookupEnv` and `plain`
+from borrowing their inputs: `tailCalls` used `subExprs`, treating non-tail `if`/`case` branches
+ending in `Ret` as tail calls (poisoning `map.lookup` through inlined `global`), and
+`reusedScrutinees` checked `any (allocs w)` instead of `useToken` (poisoning `lookupEnv` because
+packed 1-word `Cons` matched 1-word `Some` in one branch of an `if` that never reuses). In
+addition, `Lower.fieldReads` now skips unused pattern fields, `Lower.fuseFields` passes through
+`RHeader` and `RJoin` and fuses field `Dup`s into plain `Drop`s (covering `case` without reuse
+and every `LetPair` / `&mut` return), and `Keel.Runtime.dropFields` (`_keel_drop_fields`, shared
+by all back ends) handles all-transferred unique drops and shared/immortal dup-masks framelessly,
+tail-calling `_keel_free_block` or `_keel_drop`. `Keel.Fold` includes the drop mask in `KDrop`.
+A/B, interleaved, median (best) of 7:
+
+- Borrowing fixes + dead field reads alone: interp −22.6%, selfcheck −10.8%, repl −8.0%, parse −0.6%.
+- Adding `_keel_drop_fields` on top: interp −8.5% more, repl −6.9%, selfcheck −5.0%, parse −3.1%.
+- Combined vs pre-change: interp 1,057 → 747 ms (−29.4%, best −29.0%), selfcheck 381 → 321 ms
+  (−15.6%, best −16.0%), repl 431 → 368 ms (−14.8%, best −14.7%), parse 34.9 → 33.6 ms (−3.7%,
+  best −3.2%); `bench/` microbenchmarks unchanged within noise.
+- Assembly lines shrink 14–15%: `repl.s` 460,066 → 395,121 (−14.1%), `selfcheck.s` 402,319 →
+  343,444 (−14.6%), `interp.s` 450,892 → 386,547 (−14.3%), `parse.s` 88,249 → 74,764 (−15.3%).
+  Tested in `test/memory/drop-transfer.kl`.
+
 ## Not done from the M4 roadmap
 
 SSA form and our own Mach-O/ELF writers (`cc`, `clang` and

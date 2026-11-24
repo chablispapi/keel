@@ -107,7 +107,8 @@ data Expr
   | BindIf String Atom Expr Expr Expr         -- ^ let x = (if a then e₁ else e₂) in e
   | BindCase String Atom [(Integer, Int, Expr)] Expr -- ^ case on the layout; each branch knows its block's words
   | Dup String Expr                           -- ^ increment a reference count
-  | Drop String Expr                          -- ^ decrement it, freeing the block at zero
+  | Drop String Integer Expr                  -- ^ decrement it, freeing at zero; fields in the mask
+                                              -- (by word or packed slot) are taken over
   | DropReuse String Integer String Expr      -- ^ drop, keeping the block as a reuse token if unique;
                                               -- the fields in the mask (by word) are taken over
   deriving (Show)
@@ -630,17 +631,23 @@ expr info env tm k = case tm of
       Bind c (RClosure i fvs lid) <$> kk (AVar c)
 
 -- | Bind each variable to its field, given how to read word i: in order, a word each, except
--- that on a 32-bit target a 64-bit integer is two (its halves, joined).
+-- that on a 32-bit target a 64-bit integer is two (its halves, joined). Fields unused in
+-- @rest@ are skipped (avoiding dead loads and redundant dup/drop pairs).
 fieldReads :: Info -> (Int -> Rhs) -> [(String, Ty)] -> Expr -> M Expr
 fieldReads info read' vts rest = go 0 vts
   where
+    used = allVars rest
     go _ [] = pure rest
     go p ((y, t) : more)
-      | wideAt (iWord info) t = do
-          lo <- newVar "lo" (TInt u32)
-          hi <- newVar "hi" (TInt u32)
-          e <- go (p + 2) more
-          pure (Bind lo (read' p) (Bind hi (read' (p + 1)) (Bind y (RJoin (AVar lo) (AVar hi)) e)))
+      | wideAt (iWord info) t =
+          if y `S.notMember` used
+            then go (p + 2) more
+            else do
+              lo <- newVar "lo" (TInt u32)
+              hi <- newVar "hi" (TInt u32)
+              e <- go (p + 2) more
+              pure (Bind lo (read' p) (Bind hi (read' (p + 1)) (Bind y (RJoin (AVar lo) (AVar hi)) e)))
+      | y `S.notMember` used = go (p + 1) more
       | otherwise = Bind y (read' p) <$> go (p + 1) more
 
 -- | The type of a well-typed term (effects omitted: lowering doesn't need them).
@@ -734,7 +741,7 @@ refcount blockWords ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.
         let used = filter isP (atomVars a)
             drops = [v | v <- S.toList scope, v `S.notMember` keep, v `notElem` used]
             dups = [v | v <- used, v `S.member` keep]
-        pure (foldr Drop (foldr Dup (Ret a) dups) drops)
+        pure (foldr (`Drop` 0) (foldr Dup (Ret a) dups) drops)
       Bind x rhs rest -> do
         let cons = filter isP (consumed rhs)
             bor = filter isP (borrowed rhs)
@@ -790,36 +797,45 @@ refcount blockWords ptrs sigs sig f = f {funBody = evalState (go owned0 keep0 M.
         let tok = "%tok" ++ show n
         pure $ case useToken blockWords tok w e of
           Just e' -> DropReuse v 0 tok e'
-          Nothing -> Drop v e
-      Nothing -> pure (Drop v e)
+          Nothing -> Drop v 0 e
+      Nothing -> pure (Drop v 0 e)
 
--- | Fields read from a block and duplicated just before the block is dropped for reuse: when
--- the block turns out to be unique, its references to them become ours, so the duplicate and
--- the drop of those children cancel (Perceus' drop specialization). The fields' duplicates
--- move into the DropReuse as a mask of their words; the runtime duplicates them only when the
--- block is shared. Only across field reads and duplicates, which the moved duplicates can pass.
+-- | Fields read from a block and duplicated just before the block is dropped (with or without
+-- reuse): when the block turns out to be unique, its references to them become ours, so the
+-- duplicate and the drop of those children cancel (Perceus' drop specialization). The fields'
+-- duplicates move into the Drop or DropReuse as a mask of their words/slots; the runtime
+-- duplicates them only when the block is shared or immortal. Only across field reads, header
+-- reads, 32-bit word joins and duplicates, which the moved duplicates can pass.
 fuseFields :: Expr -> Expr
 fuseFields = go M.empty []
   where
-    -- fs: variables holding a field (block, word) in this straight-line run; dups: the
+    -- fs: variables holding a field (block, word/slot) in this straight-line run; dups: the
     -- duplicates of such fields not yet emitted, in order.
     go fs dups e = case e of
       Bind x rhs@(RField (AVar v) i) rest -> Bind x rhs (go (M.insert x (v, i) fs) dups rest)
       Bind x rhs@(RRel (AVar v) i) rest -> Bind x rhs (go (M.insert x (v, i) fs) dups rest)
+      Bind x rhs@(RHeader _ _) rest -> Bind x rhs (go fs dups rest)
+      Bind x rhs@(RJoin _ _) rest -> Bind x rhs (go fs dups rest)
       Dup f rest | f `M.member` fs -> go fs (dups ++ [f]) rest
+      Drop v m rest ->
+        let (others, mask) = takeFields fs dups v m
+         in foldr Dup (Drop v mask (go M.empty [] rest)) others
       DropReuse v m tok rest ->
-        let own = nub [f | f <- dups, Just (v', _) <- [M.lookup f fs], v' == v]
-            others = foldl (flip delete) dups own
-            mask = foldl setBit m [i | f <- own, Just (_, i) <- [M.lookup f fs]]
+        let (others, mask) = takeFields fs dups v m
          in foldr Dup (DropReuse v mask tok (go M.empty [] rest)) others
       _ -> foldr Dup (inside e) dups
+    takeFields fs dups v m =
+      let own = nub [f | f <- dups, Just (v', _) <- [M.lookup f fs], v' == v]
+          others = foldl (flip delete) dups own
+          mask = foldl setBit m [i | f <- own, Just (_, i) <- [M.lookup f fs]]
+       in (others, mask)
     inside e = case e of
       Ret _ -> e
       Bind x rhs rest -> Bind x rhs (go M.empty [] rest)
       BindIf x c a b rest -> BindIf x c (go M.empty [] a) (go M.empty [] b) (go M.empty [] rest)
       BindCase x s bs rest -> BindCase x s [(t, n, go M.empty [] b) | (t, n, b) <- bs] (go M.empty [] rest)
       Dup v rest -> Dup v (go M.empty [] rest)
-      Drop v rest -> Drop v (go M.empty [] rest)
+      Drop v m rest -> Drop v m (go M.empty [] rest)
       DropReuse v m t rest -> DropReuse v m t (go M.empty [] rest)
 
 -- | Rewrite the first allocation of @w@ words on every path through an expression to use the
@@ -838,7 +854,7 @@ useToken blockWords tok w e = case e of
          | all isNothing used -> BindCase x s bs <$> useToken blockWords tok w rest
          | otherwise -> Nothing
   Dup v rest -> Dup v <$> useToken blockWords tok w rest
-  Drop v rest -> Drop v <$> useToken blockWords tok w rest
+  Drop v m rest -> Drop v m <$> useToken blockWords tok w rest
   DropReuse v m t rest -> DropReuse v m t <$> useToken blockWords tok w rest
   _ -> Nothing
 
@@ -920,7 +936,7 @@ rhss e = case e of
   BindIf _ _ a b rest -> rhss a ++ rhss b ++ rhss rest
   BindCase _ _ bs rest -> concat [rhss b | (_, _, b) <- bs] ++ rhss rest
   Dup _ rest -> rhss rest
-  Drop _ rest -> rhss rest
+  Drop _ _ rest -> rhss rest
   DropReuse _ _ _ rest -> rhss rest
 
 -- | Every atom in an expression.
@@ -931,33 +947,51 @@ exprAtoms e = case e of
   BindIf _ c a b rest -> c : exprAtoms a ++ exprAtoms b ++ exprAtoms rest
   BindCase _ s bs rest -> s : concat [exprAtoms b | (_, _, b) <- bs] ++ exprAtoms rest
   Dup _ rest -> exprAtoms rest
-  Drop _ rest -> exprAtoms rest
+  Drop _ _ rest -> exprAtoms rest
   DropReuse _ _ _ rest -> exprAtoms rest
+
+rhsAtoms :: Rhs -> [Atom]
+rhsAtoms rhs = case rhs of
+  RAtom a -> [a]
+  RPrim _ _ a b -> [a, b]
+  RCall f a -> [f, a]
+  RCallKnown _ as -> as
+  RProj a _ -> [a]
+  RAlloc _ h as -> maybe [] pure h ++ as
+  RAllocAt _ _ h as -> maybe [] pure h ++ as
+  RField a _ -> [a]
+  RRel a _ -> [a]
+  RHeader a _ -> [a]
+  RPushHandler cs _ -> map snd cs
+  RPopHandler a -> [a]
+  RPerform _ a -> [a]
+  RPerform2 _ _ a b -> [a, b]
+  RCell k v -> k : maybe [] pure v
+  RConv _ a -> [a]
+  RFPrim _ a b -> [a, b]
+  RFOfInt _ a -> [a]
+  RFloat _ as -> as
+  RArray _ _ as -> as
+  RIndex a i _ -> [a, i]
+  RJoin a b -> [a, b]
+  _ -> []
+
+-- | Every variable referenced anywhere in an expression (pointers and non-pointers alike).
+allVars :: Expr -> S.Set String
+allVars e = case e of
+  Ret a -> S.fromList (atomVars a)
+  Bind _ rhs rest -> S.fromList (rhsVars rhs) <> allVars rest
+  BindIf _ c a b rest -> S.fromList (atomVars c) <> allVars a <> allVars b <> allVars rest
+  BindCase _ s bs rest -> S.fromList (atomVars s) <> S.unions [allVars b | (_, _, b) <- bs] <> allVars rest
+  Dup v rest -> S.insert v (allVars rest)
+  Drop v _ rest -> S.insert v (allVars rest)
+  DropReuse v _ _ rest -> S.insert v (allVars rest)
   where
-    rhsAtoms rhs = case rhs of
-      RAtom a -> [a]
-      RPrim _ _ a b -> [a, b]
-      RCall f a -> [f, a]
-      RCallKnown _ as -> as
-      RProj a _ -> [a]
-      RAlloc _ h as -> maybe [] pure h ++ as
-      RAllocAt _ _ h as -> maybe [] pure h ++ as
-      RField a _ -> [a]
-      RRel a _ -> [a]
-      RHeader a _ -> [a]
-      RPushHandler cs _ -> map snd cs
-      RPopHandler a -> [a]
-      RPerform _ a -> [a]
-      RPerform2 _ _ a b -> [a, b]
-      RCell k v -> k : maybe [] pure v
-      RConv _ a -> [a]
-      RFPrim _ a b -> [a, b]
-      RFOfInt _ a -> [a]
-      RFloat _ as -> as
-      RArray _ _ as -> as
-      RIndex a i _ -> [a, i]
-      RJoin a b -> [a, b]
-      _ -> []
+    rhsVars rhs = case rhs of
+      RClosure _ fvs _ -> fvs
+      RCodata _ fvs _ -> fvs
+      RAllocAt tok _ h as -> tok : concatMap atomVars (maybe [] pure h ++ as)
+      _ -> concatMap atomVars (rhsAtoms rhs)
 
 -- | Variables returned (Ret consumes its atom).
 rets :: Expr -> [String]
@@ -967,15 +1001,14 @@ rets e = case e of
   BindIf _ _ a b rest -> rets a ++ rets b ++ rets rest
   BindCase _ _ bs rest -> concat [rets b | (_, _, b) <- bs] ++ rets rest
   Dup _ rest -> rets rest
-  Drop _ rest -> rets rest
+  Drop _ _ rest -> rets rest
   DropReuse _ _ _ rest -> rets rest
 
--- | Case scrutinees whose block a branch could reuse (a branch allocates a block its size).
+-- | Case scrutinees whose block a branch could actually reuse (a reuse token reaches a
+-- same-size allocation on every path through the branch, matching 'useToken').
 reusedScrutinees :: (Integer -> [Atom] -> Int) -> Expr -> S.Set String
-reusedScrutinees blockWords e = S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> any (allocs w) (rhss b)) bs]
-  where
-    allocs w (RAlloc lid _ as) = blockWords lid as == w
-    allocs _ _ = False
+reusedScrutinees blockWords e =
+  S.fromList [v | BindCase _ (AVar v) bs _ <- subExprs e, any (\(_, w, b) -> w >= 0 && isJust (useToken blockWords "" w b)) bs]
 
 subExprs :: Expr -> [Expr]
 subExprs e = e : case e of
@@ -984,12 +1017,25 @@ subExprs e = e : case e of
   BindIf _ _ a b rest -> subExprs a ++ subExprs b ++ subExprs rest
   BindCase _ _ bs rest -> concat [subExprs b | (_, _, b) <- bs] ++ subExprs rest
   Dup _ rest -> subExprs rest
-  Drop _ rest -> subExprs rest
+  Drop _ _ rest -> subExprs rest
   DropReuse _ _ _ rest -> subExprs rest
 
--- | Direct calls in tail position (let x = f as in x), with their arguments.
+-- | Direct calls in true tail position (matching the back ends' tail-call rule: a branch of
+-- BindIf or BindCase is in tail position only when the join returns its result directly).
 tailCalls :: Expr -> [(Int, [Atom])]
-tailCalls e = [(j, as) | Bind x (RCallKnown j as) (Ret (AVar y)) <- subExprs e, x == y]
+tailCalls = go
+  where
+    go e = case e of
+      Bind x (RCallKnown j as) (Ret (AVar y)) | x == y -> [(j, as)]
+      Bind _ _ rest -> go rest
+      BindIf x _ a b (Ret (AVar y)) | x == y -> go a ++ go b
+      BindIf _ _ _ _ rest -> go rest
+      BindCase x _ bs (Ret (AVar y)) | x == y -> concat [go b | (_, _, b) <- bs]
+      BindCase _ _ _ rest -> go rest
+      Dup _ rest -> go rest
+      Drop _ _ rest -> go rest
+      DropReuse _ _ _ rest -> go rest
+      Ret _ -> []
 
 -- | Variables whose reference a right-hand side takes over.
 consumedIn :: Sigs -> Rhs -> [String]
@@ -1027,5 +1073,5 @@ fv e = case e of
   BindIf _ c a b rest -> S.fromList (atomVars c) <> fv a <> fv b <> fv rest
   BindCase _ s brs rest -> S.fromList (atomVars s) <> S.unions [fv b | (_, _, b) <- brs] <> fv rest
   Dup v rest -> S.insert v (fv rest)
-  Drop v rest -> S.insert v (fv rest)
+  Drop v _ rest -> S.insert v (fv rest)
   DropReuse v _ _ rest -> S.insert v (fv rest)

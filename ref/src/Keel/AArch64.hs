@@ -294,7 +294,7 @@ interference entry body = M.fromListWith S.union (concat [(x, ys) : [(y, S.singl
         _ <- def x after
         pure (atomSet sc <> mconcat ls)
       Dup v rest -> S.insert v <$> live join rest
-      Drop v rest -> S.insert v <$> live join rest
+      Drop v _ rest -> S.insert v <$> live join rest
       DropReuse v _ t rest -> live join rest >>= def t . S.insert v >>= pure . S.insert v
     atomSet a = S.fromList [v | AVar v <- [a]]
     rhsUses rhs = drop 1 (uses (Bind "" rhs (Ret (AInt 0))))
@@ -321,7 +321,7 @@ fullFieldReuse layouts = go M.empty
       BindCase _ s bs rest ->
         S.unions [go (inBranch known s tag) b | (tag, _, b) <- bs] <> go known rest
       Dup _ rest -> go known rest
-      Drop v rest -> go (M.delete v known) rest
+      Drop v _ rest -> go (M.delete v known) rest
       DropReuse v mask tok rest ->
         (if M.lookup v known == Just mask then S.singleton tok else S.empty) <> go (M.delete v known) rest
       Ret _ -> S.empty
@@ -391,7 +391,7 @@ uses e = case e of
   BindIf x c a b rest -> x : av c ++ uses a ++ uses b ++ uses rest
   BindCase x s bs rest -> x : av s ++ concat [uses b | (_, _, b) <- bs] ++ uses rest
   Dup v rest -> v : uses rest
-  Drop v rest -> v : uses rest
+  Drop v _ rest -> v : uses rest
   DropReuse v _ t rest -> v : t : uses rest
   where
     av (AVar v) = [v]
@@ -431,7 +431,7 @@ bound e = case e of
   BindIf x _ a b rest -> x : bound a ++ bound b ++ bound rest
   BindCase x _ bs rest -> x : concat [bound b | (_, _, b) <- bs] ++ bound rest
   Dup _ rest -> bound rest
-  Drop _ rest -> bound rest
+  Drop _ _ rest -> bound rest
   DropReuse _ _ tok rest -> tok : bound rest
 
 store, load' :: Slots -> String -> String -> G ()
@@ -638,9 +638,14 @@ expr slots join e = case e of
       line (lJoin ++ ":")
       expr slots join rest
   Dup v rest -> dup slots v >> expr slots join rest
-  Drop v rest -> do
+  Drop v 0 rest -> do
     load' slots "x0" v
     ins "bl _keel_drop"
+    expr slots join rest
+  Drop v mask rest -> do
+    load' slots "x0" v
+    movImm "x1" mask
+    ins "bl _keel_drop_fields"
     expr slots join rest
   DropReuse v mask tok rest -> do
     load' slots "x0" v
@@ -1684,6 +1689,7 @@ emitRuntime used = do
   R.arenaClose asmArm
 
   R.dropBlock asmArm
+  R.dropFields asmArm
   R.freeBlock asmArm (toInteger maxSmall)
 
   R.dropReuse asmArm

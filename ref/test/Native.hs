@@ -24,6 +24,7 @@ import Keel.AArch64 (compileNative, compileNativeWith, compileNativeWithReuse, e
 import Keel.Check (TypeError (..), checkProgram)
 import Keel.Elab (elaborate)
 import Keel.Eval (Machine (..), Outcome (..), evalProgram, evalProgramOn, runProgramAt)
+import Keel.Fold qualified as F
 import Keel.Infer (inferProgram)
 import Keel.Lsp (Diag (..), definition, diagnose, hover, parseJson, renderJson)
 import Keel.Modules (loadModules)
@@ -222,6 +223,7 @@ exampleFiles =
   , ("examples/bulk.kl", (Just "(1048576, true)", ""))
   , ("test/std/map.kl", (Just "4976", "100\n8\n2\n99\n8\n"))
   , ("test/memory/borrow-params.kl", (Just "3034000003", ""))
+  , ("test/memory/drop-transfer.kl", (Just "1390", "695\n695\n"))
   , ("test/memory/reuse-branches.kl", (Just "89829149613", ""))
   , ("test/memory/reuse-fast.kl", (Just "374", ""))
   , ("test/opt/capture.kl", (Just "10354", "10\n20\n30\n"))
@@ -775,7 +777,7 @@ reuseChecks dir = do
             || (name == "zero" && not ("panic: reference count error" `isInfixOf` stderr))
             || (name == "immortal" && (output /= "result: 42\n" || fmap live (parseStats stderr) /= expectedLive))
         ]
-  pure (assemblyFailures ++ comparisons ++ headers)
+  pure (assemblyFailures ++ dropTransferFailures ++ comparisons ++ headers)
   where
     runAsm base asm = do
       writeFile (base ++ ".s") asm
@@ -783,7 +785,7 @@ reuseChecks dir = do
       if cc /= ExitSuccess then pure (Left err) else do
         environment <- getEnvironment
         Right <$> readCreateProcessWithExitCode ((proc base []) {env = Just (("KEEL_STATS", "1") : environment)}) ""
-    paths = ["examples/reuse.kl", "test/memory/reuse-branches.kl", "test/memory/narrow.kl", "test/memory/arena.kl", "test/memory/reuse-fast.kl", "test/memory/reuse-fast-panic.kl"]
+    paths = ["examples/reuse.kl", "test/memory/reuse-branches.kl", "test/memory/drop-transfer.kl", "test/memory/narrow.kl", "test/memory/arena.kl", "test/memory/reuse-fast.kl", "test/memory/reuse-fast-panic.kl"]
     layouts = M.fromList [((0, 2, 3), 1), ((1, 2, 3), 512)]
     reuse mask = L.DropReuse "p" mask "token" (L.Ret (L.AInt 0))
     branch tag b = L.BindCase "r" (L.AVar "p") [(tag, 2, b)] (L.Ret (L.AInt 0))
@@ -797,7 +799,7 @@ reuseChecks dir = do
         mainF = L.Fun "main" [] 1 [] [] False $
           L.Bind "p" (L.RAlloc 1 Nothing [L.AInt 7]) $
             L.Bind "q" (L.RCallKnown 0 [L.AVar "p"]) $
-              L.Bind "x" (L.RField (L.AVar "q") 0) (L.Drop "q" (L.Ret (L.AVar "x")))
+              L.Bind "x" (L.RField (L.AVar "q") 0) (L.Drop "q" 0 (L.Ret (L.AVar "x")))
     callFreeFastPath asm = case dropWhile (/= "\tcmp w10, #1") (lines asm) of
       _ : guard : rest | Just slow <- stripPrefix "\tb.ne " guard ->
         let fast = takeWhile (/= slow ++ ":") rest
@@ -812,13 +814,21 @@ reuseChecks dir = do
           , ("unknown layout", branch 7 (reuse 3), False)
           , ("no case fact", reuse 3, False)
           , ("branch fact does not escape", L.BindCase "r" (L.AVar "p") [(1, 2, L.Ret (L.AInt 0))] (reuse 3), False)
-          , ("consumed parent loses fact", branch 1 (L.Drop "p" (reuse 3)), False)
+          , ("consumed parent loses fact", branch 1 (L.Drop "p" 0 (reuse 3)), False)
           ]
       , let asm = body e
       , ("\tlsr w10, w9, #10" `isInfixOf` asm) /= expected
           || not ("\tbl _keel_drop_reuse" `isInfixOf` asm)
           || (expected && not (callFreeFastPath asm))
       ]
+    dropTransferFailures =
+      [ "FAIL drop-transfer assembly: mask=3" | not ("\tbl _keel_drop_fields" `isInfixOf` body (L.Drop "p" 3 (L.Ret (L.AInt 0)))) ]
+        ++ [ "FAIL drop-transfer assembly: mask=0" | not ("\tbl _keel_drop\n" `isInfixOf` body (L.Drop "p" 0 (L.Ret (L.AInt 0)))) ]
+        ++ [ "FAIL fold distinct drop masks"
+           | let mk m = L.Fun ("f" ++ show m) ["p"] 1 [] [] False (L.Drop "p" m (L.Ret (L.AInt 0)))
+                 lp = L.LProg (M.fromList [(0, mk 1), (1, mk 2), (2, mk 1)]) [] (L.Fun "main" [] 1 [] [] False (L.Ret (L.AInt 0))) M.empty M.empty [] S.empty
+              in M.size (L.lFuns (F.fold lp)) /= 2
+           ]
 
 -- | Whether main's code calls anything.
 mainCalls :: String -> Bool

@@ -53,7 +53,7 @@ data KExpr
   | KBindIf VarKey KAtom KExpr KExpr KExpr
   | KBindCase VarKey KAtom [(Integer, Int, KExpr)] KExpr
   | KDup VarKey KExpr
-  | KDrop VarKey KExpr
+  | KDrop VarKey Integer KExpr
   | KDropReuse VarKey Integer VarKey KExpr
   deriving (Eq, Ord)
 
@@ -199,7 +199,7 @@ normFun wide f =
           <*> mapM (\(tag, n, b) -> (tag,n,) <$> normExpr b) bs
           <*> normExpr rest
       Dup v rest -> KDup <$> normVar v <*> normExpr rest
-      Drop v rest -> KDrop <$> normVar v <*> normExpr rest
+      Drop v mask rest -> KDrop <$> normVar v <*> pure mask <*> normExpr rest
       DropReuse v mask tok rest -> KDropReuse <$> normVar v <*> pure mask <*> normVar tok <*> normExpr rest
 
 -- | Assign dense class numbers 0, 1, ... to items grouped by key.
@@ -287,5 +287,5 @@ fold lp
       BindIf x c a b rest -> BindIf x c (rewriteExpr a) (rewriteExpr b) (rewriteExpr rest)
       BindCase x sc bs rest -> BindCase x sc [(tag, n, rewriteExpr b) | (tag, n, b) <- bs] (rewriteExpr rest)
       Dup v rest -> Dup v (rewriteExpr rest)
-      Drop v rest -> Drop v (rewriteExpr rest)
+      Drop v mask rest -> Drop v mask (rewriteExpr rest)
       DropReuse v mask tok rest -> DropReuse v mask tok (rewriteExpr rest)
